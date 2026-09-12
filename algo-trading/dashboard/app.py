@@ -1,0 +1,3816 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, time as datetime_time, timedelta
+import json
+from html import escape
+from pathlib import Path
+import re
+import sys
+import time
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import streamlit as st
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) in sys.path:
+    sys.path.remove(str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.config.constants import Side, SignalAction, TradingMode
+from app.broker.authentication import AccessToken, AuthenticationError, exchange_request_token
+from app.broker.kite_client import KiteClient
+from app.broker.market_data import MarketData
+from app.broker.positions_api import PositionsAPI
+from app.config.settings import get_settings
+from app.database.database import Database
+from app.database.models import DynamicWatchlistRecord, NotificationRecord, SignalRecord, WatchlistRecord
+from app.database.repository import Repository
+from app.execution.position_manager import Position, PositionManager
+from app.execution.reconciliation import reconcile
+from app.execution.swing_auto_trader import SwingAutoTrader
+from app.market.candles import validate_ohlcv
+from app.market.dynamic_watchlist import (
+    DYNAMIC_AUTO_REFRESH_CANDLES,
+    DYNAMIC_INTERVAL,
+    DYNAMIC_LOOKBACK_DAYS,
+    DYNAMIC_MAX_WORKERS,
+    DYNAMIC_WATCHLIST_NAME,
+    auto_refresh_slot,
+    first_session_candles,
+    filter_dynamic_watchlist,
+)
+from app.market.historical_scan import HistoricalScanResult, scan_historical_watchlist
+from app.market.scanner import Nifty500Scanner
+from app.market.signal_scanner import StrategySignalScanner
+from app.market.universe import SUPPORTED_INDEXES, load_nifty_index_universe_from_api
+from app.monitoring.notifications import Notifier, save_signal_notifications
+from app.monitoring.signal_engine import build_signal_engine
+from app.strategy.crossover import CrossoverStrategy
+from app.risk.position_sizing import calculate_quantity
+from app.execution.trading_pipeline import TradingPipeline
+from app.strategy.atr_momentum import AtrMomentumStrategy
+from app.strategy.ema_200_close import Ema200CloseStrategy
+from app.strategy.ema_9_200_swing import Ema9200SwingStrategy
+from app.strategy.swing_trend_breakout import SwingTrendBreakoutStrategy
+from app.strategy.ema_trend import EmaTrendStrategy
+from app.strategy.high_conviction_long import HighConvictionLongStrategy
+from app.strategy.opening_range_breakout import OpeningRangeBreakoutStrategy
+from app.strategy.previous_day_high_breakout import PreviousDayHighBreakoutStrategy
+from app.strategy.pre_spike_momentum import PreSpikeMomentumConfig, PreSpikeMomentumStrategy
+from app.strategy.preset_builder import (
+    CURRENT_STRATEGY_TYPE,
+    DEFAULT_PARAMETERS,
+    EMA_ONLY_DEFAULT_PARAMETERS,
+    EMA_ONLY_STRATEGY_LABEL,
+    EMA_ONLY_STRATEGY_TYPE,
+    build_ema_preset_strategy,
+    build_preset_strategy,
+    current_strategy,
+)
+from app.strategy.signal import Signal
+from app.strategy.vwap_momentum import VwapMomentumStrategy
+from app.strategy.vwap_ema_breakout import MarketRegimeContext, TimeframeConfirmation, VwapEmaBreakoutStrategy
+from backtest.engine import BacktestEngine
+from backtest.metrics import calculate_metrics
+
+
+EDITABLE_SETTINGS = (
+    "trading_mode",
+    "initial_capital",
+    "risk_per_trade",
+    "max_daily_loss",
+    "max_open_positions",
+    "max_trades_per_day",
+    "max_capital_deployment",
+    "market_open",
+    "entry_start",
+    "entry_end",
+    "force_exit",
+    "trailing_atr_multiplier",
+)
+
+SWING_LOOKBACK_DAYS = 600
+
+
+def settings_values(settings) -> dict:
+    return {name: getattr(settings, name) for name in EDITABLE_SETTINGS}
+
+
+def serialize_frontend_settings(values: dict) -> dict:
+    serialized = {}
+    for name, value in values.items():
+        if isinstance(value, TradingMode):
+            serialized[name] = value.value
+        elif isinstance(value, datetime_time):
+            serialized[name] = value.isoformat()
+        else:
+            serialized[name] = value
+    return serialized
+
+
+def deserialize_frontend_settings(values: dict) -> dict:
+    overrides = {}
+    for name, value in values.items():
+        if name not in EDITABLE_SETTINGS:
+            continue
+        if name == "trading_mode":
+            value = TradingMode(value)
+        elif name in {"market_open", "entry_start", "entry_end", "force_exit"}:
+            value = datetime_time.fromisoformat(value)
+        overrides[name] = value
+    return overrides
+
+
+def apply_frontend_settings(base_settings, overrides: dict):
+    if not overrides:
+        return base_settings
+    values = base_settings.model_dump() if hasattr(base_settings, "model_dump") else base_settings.dict()
+    values.update(overrides)
+    return type(base_settings)(**values)
+
+
+def get_frontend_settings(st, base_settings):
+    if "frontend_settings" not in st.session_state:
+        persisted = get_dashboard_repository(st).load_dashboard_settings(base_settings.user_id)
+        try:
+            persisted_settings = apply_frontend_settings(base_settings, deserialize_frontend_settings(persisted))
+        except (TypeError, ValueError):
+            persisted_settings = base_settings
+        st.session_state.frontend_settings = settings_values(persisted_settings)
+    return apply_frontend_settings(base_settings, st.session_state.frontend_settings)
+
+
+def broker_credentials_configured(settings) -> bool:
+    api_secret = settings.kite_api_secret.get_secret_value()
+    return bool(settings.kite_api_key.strip() and api_secret.strip())
+
+
+def broker_access_token_configured(settings, runtime_access_token: str = "") -> bool:
+    return bool(runtime_access_token.strip() or settings.kite_access_token.get_secret_value().strip())
+
+
+def load_activity(database_path: str = "data/trading.sqlite3") -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    database = Database(database_path)
+    database.initialize()
+    try:
+        orders = pd.read_sql_query("SELECT * FROM orders ORDER BY created_at DESC", database.connection)
+        trades = pd.read_sql_query("SELECT * FROM trades ORDER BY exit_time DESC", database.connection)
+        activity = pd.read_sql_query("SELECT * FROM activity ORDER BY timestamp DESC, id DESC", database.connection)
+    finally:
+        database.close()
+    return orders, trades, activity
+
+
+def build_strategy(name: str, fast: int, slow: int, opening_bars: int, atr_period: int):
+    if name == "VWAP EMA breakout":
+        return VwapEmaBreakoutStrategy(atr_period=atr_period)
+    if name == "EMA trend":
+        return EmaTrendStrategy(fast=fast, slow=slow, atr_period=atr_period)
+    if name == "VWAP momentum":
+        return VwapMomentumStrategy(atr_period=atr_period)
+    if name == "Opening range breakout":
+        return OpeningRangeBreakoutStrategy(opening_bars=opening_bars)
+    return AtrMomentumStrategy(period=atr_period)
+
+
+CURRENT_STRATEGY_LABEL = "VWAP EMA breakout (current)"
+EMA_PROGRESSIVE_LIVE_LABEL = "EMA 9/200 progressive"
+PRE_SPIKE_LIVE_LABEL = "Pre-Spike Momentum"
+PREVIOUS_DAY_HIGH_LABEL = "Previous day high breakout"
+EMA_200_CLOSE_LIVE_LABEL = "EMA 200 close-above"
+HIGH_CONVICTION_LIVE_LABEL = "High-conviction long"
+DAILY_SCAN_STRATEGIES = {
+    "EMA 9/200 swing": Ema9200SwingStrategy,
+    "EMA 200 close-above": Ema200CloseStrategy,
+    "Previous day high breakout": PreviousDayHighBreakoutStrategy,
+}
+SWING_STRATEGIES = {
+    "EMA 9/200 swing": "EMA 9/200 swing",
+    "Trend breakout (next-session confirmation)": "SWING_TREND_BREAKOUT",
+}
+WORKSPACE_PAGES = [
+    "Overview",
+    "Watchlists",
+    "Scanner & signals",
+    "Swing auto trading",
+    "Historical day scan",
+    "Automatic trading",
+    "Risk & settings",
+    "Kite authentication",
+]
+
+
+def load_dashboard_strategy_options(
+    repository: Repository,
+    include_pre_spike: bool = False,
+    include_previous_day_high: bool = False,
+) -> dict[str, tuple[str, dict]]:
+    options = {
+        CURRENT_STRATEGY_LABEL: (CURRENT_STRATEGY_TYPE, dict(DEFAULT_PARAMETERS)),
+        EMA_ONLY_STRATEGY_LABEL: (EMA_ONLY_STRATEGY_TYPE, dict(EMA_ONLY_DEFAULT_PARAMETERS)),
+        HIGH_CONVICTION_LIVE_LABEL: (HighConvictionLongStrategy.name, {}),
+    }
+    if include_pre_spike:
+        options[PRE_SPIKE_LIVE_LABEL] = (PreSpikeMomentumStrategy.name, {})
+    if include_previous_day_high:
+        options[PREVIOUS_DAY_HIGH_LABEL] = (PreviousDayHighBreakoutStrategy.name, {})
+    for preset in repository.load_strategy_presets():
+        options[f"Custom: {preset.name}"] = (preset.strategy_type, dict(preset.parameters))
+    return options
+
+
+def build_dashboard_strategy(repository: Repository, selected_label: str, pre_spike_config: PreSpikeMomentumConfig | None = None):
+    if selected_label == CURRENT_STRATEGY_LABEL:
+        return current_strategy()
+    if selected_label == EMA_ONLY_STRATEGY_LABEL:
+        return EmaTrendStrategy(**EMA_ONLY_DEFAULT_PARAMETERS)
+    if selected_label == PRE_SPIKE_LIVE_LABEL:
+        return PreSpikeMomentumStrategy(config=pre_spike_config)
+    if selected_label == PREVIOUS_DAY_HIGH_LABEL:
+        return PreviousDayHighBreakoutStrategy()
+    if selected_label == HIGH_CONVICTION_LIVE_LABEL:
+        return HighConvictionLongStrategy()
+    prefix, name = selected_label.split(": ", 1)
+    if prefix != "Custom":
+        raise ValueError("unknown strategy selection")
+    preset = next((item for item in repository.load_strategy_presets() if item.name == name), None)
+    if preset is None:
+        raise ValueError("selected custom strategy no longer exists")
+    if preset.strategy_type == EMA_ONLY_STRATEGY_TYPE:
+        return build_ema_preset_strategy(preset.name, preset.parameters)
+    return build_preset_strategy(preset.name, preset.parameters)
+
+
+def build_live_signal_strategy(selected_label: str, timeframe: str, pre_spike_config: PreSpikeMomentumConfig | None = None):
+    if selected_label == PRE_SPIKE_LIVE_LABEL:
+        strategy = PreSpikeMomentumStrategy(config=pre_spike_config)
+        strategy.timeframe = timeframe
+        return strategy
+    if selected_label == PREVIOUS_DAY_HIGH_LABEL:
+        return PreviousDayHighBreakoutStrategy()
+    if selected_label == EMA_200_CLOSE_LIVE_LABEL:
+        return Ema200CloseStrategy()
+    if selected_label == HIGH_CONVICTION_LIVE_LABEL:
+        return HighConvictionLongStrategy()
+    if selected_label == EMA_PROGRESSIVE_LIVE_LABEL:
+        return None
+    raise ValueError(f"unknown live signal strategy: {selected_label}")
+
+
+def render_pre_spike_config(st, key_prefix: str) -> PreSpikeMomentumConfig:
+    defaults = PreSpikeMomentumConfig()
+    with st.expander("Pre-Spike Momentum filters", expanded=True):
+        st.caption("Signals use the latest completed 5-minute candle. Set a confirmation toggle to make that condition mandatory.")
+        score_column, demand_column, move_column = st.columns(3)
+        minimum_score = score_column.number_input(
+            "Minimum score",
+            min_value=0,
+            max_value=100,
+            value=defaults.minimum_score,
+            step=1,
+            key=f"{key_prefix}_minimum_score",
+            help="The weighted setup score required before a signal can be generated.",
+        )
+        minimum_rvol = demand_column.number_input(
+            "Minimum RVOL (x)",
+            min_value=0.0,
+            max_value=20.0,
+            value=defaults.minimum_rvol,
+            step=0.1,
+            key=f"{key_prefix}_minimum_rvol",
+            help="Current candle volume divided by the average volume for the same time slot.",
+        )
+        minimum_price_change_pct = move_column.number_input(
+            "Minimum 5-minute move (%)",
+            min_value=0.0,
+            max_value=20.0,
+            value=defaults.minimum_price_change_pct,
+            step=0.05,
+            key=f"{key_prefix}_minimum_price_change_pct",
+            help="Minimum price expansion when no breakout confirmation is required.",
+        )
+
+        volume_column, compression_column, close_column = st.columns(3)
+        minimum_volume_buildup_ratio = volume_column.number_input(
+            "Minimum volume buildup (x)",
+            min_value=0.0,
+            max_value=20.0,
+            value=1.5,
+            step=0.1,
+            key=f"{key_prefix}_minimum_volume_buildup_ratio",
+            help="Recent three-candle average volume divided by the earlier baseline average.",
+        )
+        maximum_compression_pct = compression_column.number_input(
+            "Maximum compression range (%)",
+            min_value=0.0,
+            max_value=20.0,
+            value=defaults.maximum_compression_pct,
+            step=0.1,
+            key=f"{key_prefix}_maximum_compression_pct",
+            help="The previous 12 candles must stay within this high-to-low percentage range when compression is required.",
+        )
+        minimum_close_location = close_column.number_input(
+            "Minimum close location",
+            min_value=0.0,
+            max_value=1.0,
+            value=defaults.minimum_close_location,
+            step=0.05,
+            key=f"{key_prefix}_minimum_close_location",
+            help="Where the close must sit inside the candle range. 0.70 means the top 30% of the range.",
+        )
+
+        st.markdown("**Required confirmations**")
+        confirmation_columns = st.columns(4)
+        require_vwap_rising = confirmation_columns[0].toggle(
+            "Rising VWAP",
+            value=defaults.require_vwap_rising,
+            key=f"{key_prefix}_require_vwap_rising",
+        )
+        require_price_above_ema20 = confirmation_columns[1].toggle(
+            "Price > EMA20",
+            value=defaults.require_price_above_ema20,
+            key=f"{key_prefix}_require_price_above_ema20",
+        )
+        require_ema9_above_ema20 = confirmation_columns[2].toggle(
+            "EMA9 > EMA20",
+            value=defaults.require_ema9_above_ema20,
+            key=f"{key_prefix}_require_ema9_above_ema20",
+        )
+        require_ema20_above_ema50 = confirmation_columns[3].toggle(
+            "EMA20 > EMA50",
+            value=defaults.require_ema20_above_ema50,
+            key=f"{key_prefix}_require_ema20_above_ema50",
+        )
+        confirmation_columns = st.columns(5)
+        require_previous_day_breakout = confirmation_columns[0].toggle(
+            "Previous-day high breakout",
+            value=defaults.require_previous_day_breakout,
+            key=f"{key_prefix}_require_previous_day_breakout",
+        )
+        require_twenty_day_breakout = confirmation_columns[1].toggle(
+            "20-day high breakout",
+            value=defaults.require_twenty_day_breakout,
+            key=f"{key_prefix}_require_twenty_day_breakout",
+        )
+        require_bullish_quality = confirmation_columns[2].toggle(
+            "Strong bullish close",
+            value=defaults.require_bullish_quality,
+            key=f"{key_prefix}_require_bullish_quality",
+        )
+        require_volume_buildup = confirmation_columns[3].toggle(
+            "Volume buildup",
+            value=defaults.require_volume_buildup,
+            key=f"{key_prefix}_require_volume_buildup",
+        )
+        require_range_compression = confirmation_columns[4].toggle(
+            "Range compression",
+            value=defaults.require_range_compression,
+            key=f"{key_prefix}_require_range_compression",
+        )
+
+    return PreSpikeMomentumConfig(
+        minimum_score=int(minimum_score),
+        minimum_rvol=float(minimum_rvol),
+        minimum_price_change_pct=float(minimum_price_change_pct),
+        minimum_volume_buildup_ratio=float(minimum_volume_buildup_ratio),
+        maximum_compression_pct=float(maximum_compression_pct),
+        minimum_close_location=float(minimum_close_location),
+        require_vwap_rising=require_vwap_rising,
+        require_price_above_ema20=require_price_above_ema20,
+        require_ema9_above_ema20=require_ema9_above_ema20,
+        require_ema20_above_ema50=require_ema20_above_ema50,
+        require_previous_day_breakout=require_previous_day_breakout,
+        require_twenty_day_breakout=require_twenty_day_breakout,
+        require_bullish_quality=require_bullish_quality,
+        require_volume_buildup=require_volume_buildup,
+        require_range_compression=require_range_compression,
+    )
+
+
+def inject_styles(st) -> None:
+    st.markdown(
+        """
+        <style>
+        :root { --ink: #17211b; --muted: #66736a; --paper: #f4f6ef; --line: #d8dfd3; --mint: #b9e8cf; }
+        html, body, .stApp { font-family: "Segoe UI Variable", "Segoe UI", sans-serif; color: var(--ink) !important; }
+        .stApp { background: var(--paper); }
+        [data-testid="stMainBlockContainer"] { padding-top: 3rem; }
+        [data-testid="stSidebar"] { background: #e6efe5; border-right: 1px solid var(--line); }
+        [data-testid="stSidebar"] * { color: var(--ink) !important; opacity: 1 !important; }
+        [data-testid="stSidebar"] [data-testid="stRadio"] { width: 100%; }
+        [data-testid="stSidebar"] [data-testid="stRadio"] > div[role="radiogroup"] { width: 100%; gap: 7px; }
+        [data-testid="stSidebar"] [data-testid="stRadio"] label {
+            width: 100%;
+            box-sizing: border-box;
+            min-height: 44px;
+            padding: 10px 12px;
+            border: 1px solid transparent;
+            border-radius: 7px;
+            background: rgba(255,255,255,.38);
+            cursor: pointer;
+            transition: background .15s ease, border-color .15s ease;
+        }
+        [data-testid="stSidebar"] [data-testid="stRadio"] label:hover { background: rgba(255,255,255,.78); border-color: #9aa89a; }
+        [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) { background: #176b4d; border-color: #176b4d; }
+        [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) * { color: #ffffff !important; }
+        [data-testid="stSidebar"] [data-testid="stRadio"] label p { font-size: .94rem; font-weight: 600; }
+        [data-testid="stSidebar"] [data-testid="stButton"] button { min-height: 44px; font-weight: 650; }
+        [data-testid="stSidebar"] [data-testid="stCaption"] { font-size: .8rem; }
+        [data-testid="stMetric"] { background: rgba(255,255,255,.72); border: 1px solid var(--line); padding: 15px 17px; border-radius: 7px; }
+        [data-testid="stMetric"] * { color: var(--ink) !important; opacity: 1 !important; }
+        [data-testid="stMetricDelta"] svg { fill: currentColor; }
+        .stApp [data-testid="stWidgetLabel"], .stApp [data-testid="stWidgetLabel"] * { color: var(--ink) !important; opacity: 1 !important; }
+        .stApp input:not([type="range"]), .stApp textarea { color: var(--ink) !important; background: #ffffff !important; caret-color: var(--ink) !important; }
+        .stApp input:not([type="range"])::placeholder, .stApp textarea::placeholder { color: var(--muted) !important; opacity: 1 !important; }
+        .stApp [data-testid="stButton"] button { color: var(--ink) !important; background: #ffffff !important; border-color: #9aa89a !important; }
+        .stApp [data-testid="stButton"] button:hover { color: var(--ink) !important; background: #edf4ed !important; border-color: #176b4d !important; }
+        .stApp [data-testid="stFormSubmitButton"] button { color: #ffffff !important; background: #176b4d !important; border-color: #176b4d !important; }
+        .stApp [data-testid="stFormSubmitButton"] button:hover { color: #ffffff !important; background: #0f553b !important; border-color: #0f553b !important; }
+        .stApp [data-testid="stButtonGroup"] button { color: var(--ink) !important; background: #ffffff !important; border-color: #9aa89a !important; }
+        .stApp [data-testid="stButtonGroup"] button[data-selected="true"] { color: #ffffff !important; background: #176b4d !important; border-color: #176b4d !important; }
+        [data-testid="stAppDeployButton"] button { color: #ffffff !important; }
+        [data-testid="stAppDeployButton"] button:hover { color: #ffffff !important; background: rgba(255,255,255,.12) !important; }
+        h1, h2, h3 { color: var(--ink) !important; letter-spacing: 0; }
+        .eyebrow { color: #4b745d; font-size: .72rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+        .status { display: inline-flex; align-items: center; gap: 8px; border: 1px solid #9bc9ac; background: var(--mint); color: #1d5434; border-radius: 999px; padding: 5px 10px; font-size: .78rem; font-weight: 700; }
+        .status-dot { width: 7px; height: 7px; background: #20844b; border-radius: 50%; }
+        .empty { border: 1px dashed #b6c4b7; padding: 22px; border-radius: 7px; color: var(--muted); background: rgba(255,255,255,.38); }
+        .watchlist-card { min-height: 220px; }
+        .watchlist-card h3 { margin: 0; font-size: 1.15rem; }
+        .watchlist-count { color: var(--muted); font-size: .86rem; margin: 4px 0 14px; }
+        .symbol-preview { color: #315543; font-size: .86rem; min-height: 42px; line-height: 1.7; }
+        .engine-panel { border: 1px solid #b9d2c1; border-left: 4px solid #176b4d; background: #edf7ef; padding: 16px 18px; border-radius: 7px; }
+        .engine-panel strong { color: #176b4d; }
+        .scan-activity { display: flex; align-items: center; gap: 14px; margin: 14px 0; padding: 14px 17px; border: 1px solid #8fc7a4; border-radius: 9px; background: linear-gradient(105deg, #e2f6e7, #f7fbf4 62%, #e8f5ed); box-shadow: 0 5px 18px rgba(23,107,77,.09); }
+        .scan-activity-mark { position: relative; display: grid; place-items: center; width: 38px; height: 38px; flex: 0 0 38px; border: 1px solid #65ad82; border-radius: 50%; background: #d5f0dc; }
+        .scan-activity-mark::before, .scan-activity-mark::after { content: ""; position: absolute; border: 1px solid #4aab70; border-radius: 50%; animation: scan-pulse 1.8s ease-out infinite; }
+        .scan-activity-mark::before { inset: 6px; }
+        .scan-activity-mark::after { inset: 1px; animation-delay: .6s; }
+        .scan-activity-dot { width: 9px; height: 9px; border-radius: 50%; background: #176b4d; box-shadow: 0 0 0 4px rgba(23,107,77,.12); }
+        .scan-activity-copy { min-width: 0; flex: 1; }
+        .scan-activity-copy strong { display: block; color: #176b4d; font-size: .96rem; }
+        .scan-activity-copy span { color: #53645a; font-size: .82rem; }
+        .scan-activity-beam { display: flex; gap: 4px; height: 5px; margin-top: 9px; overflow: hidden; border-radius: 99px; background: #cce5d2; }
+        .scan-activity-beam span { width: 24%; border-radius: inherit; background: #20844b; animation: scan-beam 1.5s ease-in-out infinite; }
+        .scan-activity-beam span:nth-child(2) { animation-delay: .18s; }
+        .scan-activity-beam span:nth-child(3) { animation-delay: .36s; }
+        .scan-activity-beam span:nth-child(4) { animation-delay: .54s; }
+        .scan-activity-live { align-self: flex-start; color: #176b4d; border: 1px solid #8fc7a4; border-radius: 999px; padding: 4px 8px; font-size: .68rem; font-weight: 800; letter-spacing: .08em; }
+        .scan-activity.stalled { border-color: #d4a84e; background: #fff8e7; }
+        .scan-activity.stalled .scan-activity-mark { border-color: #d4a84e; background: #fff0c4; }
+        .scan-activity.stalled .scan-activity-dot { background: #b7791f; }
+        .scan-activity.error { border-color: #d68c8c; background: #fff1f1; }
+        .scan-activity.error .scan-activity-mark { border-color: #d68c8c; background: #ffe1e1; }
+        .scan-activity.error .scan-activity-dot { background: #b42318; }
+        .scan-activity.stalled .scan-activity-beam span, .scan-activity.error .scan-activity-beam span { animation-play-state: paused; opacity: .35; }
+        @keyframes scan-pulse { 0% { opacity: .8; transform: scale(.7); } 70%, 100% { opacity: 0; transform: scale(1.55); } }
+        @keyframes scan-beam { 0%, 100% { opacity: .35; transform: translateX(-18%); } 50% { opacity: 1; transform: translateX(300%); } }
+        .search-result { padding: 10px 0; border-bottom: 1px solid var(--line); }
+        .search-result:last-child { border-bottom: 0; }
+        .search-symbol { font-weight: 750; color: var(--ink); }
+        .search-name { color: var(--muted); font-size: .88rem; }
+        .selection-tray { border: 1px solid #a9cbb4; background: #f2faf3; padding: 14px 16px; border-radius: 7px; margin: 12px 0; }
+        .selection-tray strong { color: #176b4d; }
+        .result-meta { color: var(--muted); font-size: .82rem; padding-top: 2px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def runtime_access_token(st, settings) -> str:
+    session_token = st.session_state.get("kite_access_token", "")
+    if session_token.strip():
+        return session_token.strip()
+    entered_token = st.session_state.get("kite_access_token_input", "")
+    if entered_token.strip():
+        return entered_token.strip()
+    return settings.kite_access_token.get_secret_value().strip()
+
+
+def connect_kite(settings, access_token: str) -> KiteClient:
+    client = KiteClient(settings.kite_api_key, settings.kite_api_secret.get_secret_value())
+    client.connect(AccessToken(access_token))
+    return client
+
+
+def load_watchlist_instruments(settings, access_token: str) -> pd.DataFrame:
+    client = connect_kite(settings, access_token)
+    instruments = pd.DataFrame(client.client.instruments())
+    required = {"tradingsymbol", "instrument_token", "exchange"}
+    missing = required - set(instruments.columns)
+    if missing:
+        raise ValueError(f"Kite instrument response missing columns: {sorted(missing)}")
+    if "name" not in instruments.columns:
+        instruments["name"] = ""
+    for column in ("instrument_type", "segment", "expiry"):
+        if column not in instruments.columns:
+            instruments[column] = ""
+    instruments["tradingsymbol"] = instruments["tradingsymbol"].astype(str).str.strip().str.upper()
+    instruments["exchange"] = instruments["exchange"].astype(str).str.strip().str.upper()
+    instruments["name"] = instruments["name"].fillna("").astype(str).str.strip()
+    instruments["instrument_type"] = instruments["instrument_type"].fillna("").astype(str).str.strip().replace("", "Equity")
+    instruments["segment"] = instruments["segment"].fillna("").astype(str).str.strip()
+    instruments["expiry"] = instruments["expiry"].fillna("").astype(str).str.strip()
+    instruments = instruments.loc[
+        instruments["exchange"].isin(["NSE", "BSE"]) & instruments["tradingsymbol"].ne(""),
+        ["tradingsymbol", "instrument_token", "name", "exchange", "instrument_type", "segment", "expiry"],
+    ].copy()
+    instruments["instrument_key"] = instruments["exchange"] + ":" + instruments["tradingsymbol"]
+    return instruments.drop_duplicates("instrument_key").sort_values(["tradingsymbol", "exchange"]).reset_index(drop=True)
+
+
+def add_instruments_to_watchlists(repository: Repository, user_id: str, watchlists: list[WatchlistRecord], instrument_rows: list[dict], destinations: list[str]) -> int:
+    selected_by_name = {watchlist.name: watchlist for watchlist in watchlists}
+    additions = 0
+    for destination in destinations:
+        watchlist = selected_by_name.get(destination)
+        if watchlist is None:
+            continue
+        symbols = dict(watchlist.symbols)
+        before = len(symbols)
+        symbols.update({row["instrument_key"]: int(row["instrument_token"]) for row in instrument_rows})
+        repository.update_watchlist_symbols(user_id, destination, symbols)
+        additions += len(symbols) - before
+    return additions
+
+
+def parse_bulk_symbols(text: str) -> list[str]:
+    symbols = re.split(r"[,;\s]+", text.upper())
+    return list(dict.fromkeys(symbol.strip() for symbol in symbols if symbol.strip()))
+
+
+def resolve_bulk_stock_instruments(instruments: pd.DataFrame, text: str, exchange: str) -> tuple[list[dict], list[str]]:
+    symbols = parse_bulk_symbols(text)
+    if not symbols or instruments.empty:
+        return [], symbols
+    exchange_instruments = instruments.loc[
+        (instruments["exchange"] == exchange)
+        & instruments["tradingsymbol"].isin(symbols)
+        & instruments["instrument_type"].isin(["EQ", "Equity"])
+    ].copy()
+    exchange_instruments["symbol_rank"] = exchange_instruments["tradingsymbol"].map({symbol: index for index, symbol in enumerate(symbols)})
+    exchange_instruments = exchange_instruments.sort_values("symbol_rank").drop_duplicates("tradingsymbol")
+    rows = [
+        {
+            "instrument_key": row.instrument_key,
+            "symbol": row.tradingsymbol,
+            "exchange": row.exchange,
+            "name": row.name,
+            "instrument_token": int(row.instrument_token),
+        }
+        for row in exchange_instruments.itertuples()
+    ]
+    found = set(exchange_instruments["tradingsymbol"])
+    return rows, [symbol for symbol in symbols if symbol not in found]
+
+
+def split_watchlist_symbol(symbol: str) -> tuple[str, str]:
+    if ":" in symbol:
+        exchange, tradingsymbol = symbol.split(":", 1)
+        return exchange, tradingsymbol
+    return "NSE", symbol
+
+
+def reconcile_selected_watchlist_symbols(
+    selected_symbols: dict[str, int],
+    instruments: pd.DataFrame,
+) -> tuple[dict[str, int], list[str]]:
+    """Resolve persisted watchlist entries against the current equity catalog."""
+    if instruments.empty:
+        return {}, list(selected_symbols)
+
+    catalog = instruments.copy()
+    if "instrument_key" not in catalog.columns:
+        catalog["instrument_key"] = (
+            catalog["exchange"].astype(str).str.strip().str.upper()
+            + ":"
+            + catalog["tradingsymbol"].astype(str).str.strip().str.upper()
+        )
+    if "instrument_type" in catalog.columns:
+        catalog = catalog.loc[catalog["instrument_type"].isin(["EQ", "Equity"])]
+    catalog = catalog.drop_duplicates("instrument_key")
+    current_by_key = {
+        str(row.instrument_key).upper(): int(row.instrument_token)
+        for row in catalog.itertuples()
+    }
+
+    resolved: dict[str, int] = {}
+    skipped: list[str] = []
+    used_tokens: set[int] = set()
+    for stored_symbol in selected_symbols:
+        exchange, tradingsymbol = split_watchlist_symbol(str(stored_symbol))
+        key = f"{exchange.strip().upper()}:{tradingsymbol.strip().upper()}"
+        token = current_by_key.get(key)
+        if not key.split(":", 1)[1] or token is None or token in used_tokens:
+            skipped.append(key)
+            continue
+        resolved[key] = token
+        used_tokens.add(token)
+    return resolved, skipped
+
+
+def load_watchlist_prices(settings, access_token: str, rows: pd.DataFrame) -> dict[int, float]:
+    if rows.empty:
+        return {}
+    client = connect_kite(settings, access_token)
+    instruments = [f"{row.exchange}:{row.tradingsymbol}" for row in rows.itertuples()]
+    quotes = client.client.quote(instruments)
+    prices = {}
+    for quote in quotes.values():
+        token = int(quote.get("instrument_token", 0))
+        if token and quote.get("last_price") is not None:
+            prices[token] = float(quote["last_price"])
+    return prices
+
+
+def load_live_candles_from_client(kite_client, instrument_token: int, interval: str, lookback_days: int, include_current: bool = False) -> pd.DataFrame:
+    end = datetime.now()
+    rows = MarketData(kite_client).historical(instrument_token, end - timedelta(days=lookback_days), end, interval)
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    frame = validate_ohlcv(pd.DataFrame(rows).rename(columns={"date": "timestamp"}))
+    interval_minutes = {"minute": 1, "3minute": 3, "5minute": 5, "10minute": 10, "15minute": 15, "30minute": 30, "60minute": 60}
+    if interval == "day":
+        current_period_start = pd.Timestamp.now(tz=frame["timestamp"].dt.tz).floor("D") if frame["timestamp"].dt.tz else pd.Timestamp.now().floor("D")
+    elif interval in interval_minutes:
+        floor_frequency = f"{interval_minutes[interval]}min"
+        current_period_start = pd.Timestamp.now(tz=frame["timestamp"].dt.tz).floor(floor_frequency) if frame["timestamp"].dt.tz else pd.Timestamp.now().floor(floor_frequency)
+    else:
+        return frame
+    if include_current:
+        return frame.reset_index(drop=True)
+    return frame.loc[frame["timestamp"] < current_period_start].reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, max_entries=2000, show_spinner=False)
+def load_swing_daily_candles_cached(
+    _kite_client,
+    cache_identity: str,
+    instrument_token: int,
+    scan_day: str,
+) -> pd.DataFrame:
+    """Reuse daily history across swing fragment reruns without caching the broker client."""
+    del cache_identity, scan_day
+    for attempt in range(3):
+        try:
+            return load_live_candles_from_client(_kite_client, instrument_token, "day", SWING_LOOKBACK_DAYS)
+        except Exception as error:
+            if "too many requests" not in str(error).lower() or attempt == 2:
+                raise
+            time.sleep(float(attempt + 1))
+    raise RuntimeError("daily candle request failed after retries")
+
+
+@st.cache_data(ttl=86400, max_entries=10, show_spinner=False)
+def load_swing_tick_sizes_cached(_kite_client, cache_identity: str) -> dict[int, float]:
+    del cache_identity
+    instruments = pd.DataFrame(_kite_client.instruments())
+    if "instrument_token" not in instruments.columns or "tick_size" not in instruments.columns:
+        return {}
+    instruments = instruments.loc[:, ["instrument_token", "tick_size"]].dropna()
+    return {
+        int(row.instrument_token): float(row.tick_size)
+        for row in instruments.itertuples()
+        if float(row.tick_size) > 0
+    }
+
+
+def load_historical_daily_candles_from_client(
+    kite_client,
+    instrument_token: int,
+    selected_date: date,
+    lookback_days: int = 600,
+) -> pd.DataFrame:
+    end = datetime.combine(selected_date + timedelta(days=1), datetime_time.min)
+    start = end - timedelta(days=lookback_days)
+    rows = MarketData(kite_client).historical(instrument_token, start, end, "day")
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    frame = validate_ohlcv(pd.DataFrame(rows).rename(columns={"date": "timestamp"}))
+    timestamps = pd.to_datetime(frame["timestamp"], errors="raise")
+    local_timestamps = timestamps.dt.tz_convert("Asia/Kolkata") if timestamps.dt.tz is not None else timestamps
+    return frame.loc[local_timestamps.dt.date <= selected_date].reset_index(drop=True)
+
+
+def load_dynamic_watchlist_rows(
+    settings,
+    access_token: str,
+    source: WatchlistRecord,
+    evaluation_date: date,
+    require_breakout: bool = False,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    if not source.symbols:
+        return filter_dynamic_watchlist({}, {}), []
+    client = connect_kite(settings, access_token)
+    current_date = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    candles_by_symbol: dict[str, pd.DataFrame] = {}
+    current_prices: dict[str, float] = {}
+    errors: list[str] = []
+    if evaluation_date == current_date:
+        try:
+            instruments = [f"{split_watchlist_symbol(symbol)[0]}:{split_watchlist_symbol(symbol)[1]}" for symbol in source.symbols]
+            quotes = client.client.quote(instruments)
+            for symbol, quote in quotes.items():
+                if quote.get("last_price") is not None:
+                    current_prices[symbol] = float(quote["last_price"])
+            for symbol, quote in quotes.items():
+                token = int(quote.get("instrument_token", 0))
+                if token and quote.get("last_price") is not None:
+                    matching_symbol = next((stored for stored, value in source.symbols.items() if value == token), None)
+                    if matching_symbol:
+                        current_prices[matching_symbol] = float(quote["last_price"])
+        except Exception as error:
+            errors.append(f"quotes: {error}")
+        for symbol in source.symbols:
+            current_prices.setdefault(symbol, float("nan"))
+    def load_symbol_candles(symbol: str, instrument_token: int) -> tuple[pd.DataFrame | None, str | None]:
+        try:
+            if evaluation_date == current_date:
+                candles = load_live_candles_from_client(client.client, instrument_token, DYNAMIC_INTERVAL, DYNAMIC_LOOKBACK_DAYS, include_current=True)
+            else:
+                end = datetime.combine(evaluation_date + timedelta(days=1), datetime_time.min)
+                start = end - timedelta(days=DYNAMIC_LOOKBACK_DAYS)
+                rows = MarketData(client.client).historical(instrument_token, start, end, DYNAMIC_INTERVAL)
+                candles = validate_ohlcv(pd.DataFrame(rows).rename(columns={"date": "timestamp"})) if rows else pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+            return first_session_candles(candles, evaluation_date, settings.market_open), None
+        except Exception as error:
+            return None, f"{symbol}: {error}"
+
+    total_symbols = len(source.symbols)
+    worker_count = min(DYNAMIC_MAX_WORKERS, total_symbols)
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="dynamic-watchlist") as executor:
+        futures = {
+            executor.submit(load_symbol_candles, symbol, instrument_token): symbol
+            for symbol, instrument_token in source.symbols.items()
+        }
+        for completed_symbols, future in enumerate(as_completed(futures), start=1):
+            symbol = futures[future]
+            candles, error = future.result()
+            if candles is not None:
+                candles_by_symbol[symbol] = candles
+            if error:
+                errors.append(error)
+            if progress_callback:
+                progress_callback(completed_symbols, total_symbols, symbol)
+    return filter_dynamic_watchlist(source.symbols, candles_by_symbol, current_prices, require_breakout), errors
+
+
+def load_live_nifty_regime(kite_client, lookback_days: int = 5) -> MarketRegimeContext:
+    quotes = kite_client.quote(["NSE:NIFTY 50"])
+    quote = next(iter(quotes.values()), {})
+    token = int(quote.get("instrument_token", 0))
+    if not token:
+        raise ValueError("Kite quote response did not contain a NIFTY 50 index token")
+    candles = load_live_candles_from_client(kite_client, token, "5minute", lookback_days)
+    return MarketRegimeContext.from_candles(candles)
+
+
+def select_sector_universe(st, universe: pd.DataFrame, key: str) -> tuple[pd.DataFrame, str]:
+    sectors = sorted(universe["sector"].dropna().astype(str).unique())
+    selected_sector = st.selectbox("Sector", ["All sectors", *sectors], key=key)
+    if selected_sector == "All sectors":
+        return universe, selected_sector
+    return universe[universe["sector"] == selected_sector].reset_index(drop=True), selected_sector
+
+
+def load_manual_stock_universe(uploaded_file, kite_client) -> pd.DataFrame:
+    """Resolve an uploaded symbol list against the current NSE instrument master."""
+    try:
+        uploaded = pd.read_csv(uploaded_file)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as error:
+        raise ValueError("manual universe CSV could not be read") from error
+    columns = {str(column).strip().lower(): column for column in uploaded.columns}
+    symbol_column = next((columns[name] for name in ("symbol", "tradingsymbol") if name in columns), None)
+    if symbol_column is None:
+        raise ValueError("manual universe CSV must contain a symbol or tradingsymbol column")
+    sector_column = next((columns[name] for name in ("sector", "industry") if name in columns), None)
+    manual = pd.DataFrame({"symbol": uploaded[symbol_column].astype(str).str.strip().str.upper()})
+    manual["sector"] = uploaded[sector_column].astype(str).str.strip() if sector_column else "Unknown"
+    manual["sector"] = manual["sector"].replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"})
+    manual = manual.loc[manual["symbol"].ne("") & manual["symbol"].ne("NAN")].drop_duplicates("symbol")
+    if manual.empty:
+        raise ValueError("manual universe CSV did not contain any symbols")
+    instruments = pd.DataFrame(kite_client.instruments("NSE"))
+    required = {"tradingsymbol", "instrument_token", "exchange"}
+    missing = required - set(instruments.columns)
+    if missing:
+        raise ValueError(f"Kite instruments response missing columns: {sorted(missing)}")
+    instruments = instruments.loc[instruments["exchange"] == "NSE", ["tradingsymbol", "instrument_token"]].copy()
+    instruments["symbol"] = instruments["tradingsymbol"].astype(str).str.strip().str.upper()
+    universe = instruments.loc[:, ["instrument_token", "symbol"]].merge(manual, on="symbol", how="inner")
+    missing_symbols = sorted(set(manual["symbol"]) - set(universe["symbol"]))
+    if missing_symbols:
+        preview = ", ".join(missing_symbols[:10])
+        suffix = " ..." if len(missing_symbols) > 10 else ""
+        raise ValueError(f"manual universe contains symbols not found in NSE instruments: {preview}{suffix}")
+    return universe.drop_duplicates("instrument_token").reset_index(drop=True)
+
+
+class ScanProgress:
+    def __init__(self, st, title: str) -> None:
+        self.started_at = datetime.now()
+        self.status = st.status(f"{title} · 0.0s", expanded=True)
+
+    def update(self, message: str) -> None:
+        elapsed = (datetime.now() - self.started_at).total_seconds()
+        self.status.update(label=f"{message} · {elapsed:.1f}s", state="running", expanded=True)
+
+    def complete(self, message: str) -> None:
+        elapsed = (datetime.now() - self.started_at).total_seconds()
+        self.status.update(label=f"{message} · completed in {elapsed:.1f}s", state="complete", expanded=False)
+
+    def error(self, message: str) -> None:
+        elapsed = (datetime.now() - self.started_at).total_seconds()
+        self.status.update(label=f"{message} · failed after {elapsed:.1f}s", state="error", expanded=True)
+
+
+def load_live_scanner_snapshot(settings, access_token: str, token_to_symbol: dict[int, str], scanner_limit: int = 20) -> pd.DataFrame:
+    client = connect_kite(settings, access_token)
+    return Nifty500Scanner(token_to_symbol, max_candidates=scanner_limit).rank_ticks(load_live_quote_ticks(client.client, token_to_symbol))
+
+
+def load_live_quote_ticks(kite_client, token_to_symbol: dict[int, str]) -> list[dict]:
+    instruments = [f"NSE:{symbol}" for symbol in token_to_symbol.values()]
+    quotes = kite_client.quote(instruments)
+    ticks = []
+    for quote in quotes.values():
+        token = int(quote.get("instrument_token", 0))
+        if "last_price" not in quote:
+            continue
+        ticks.append(
+            {
+                "instrument_token": token,
+                "last_price": quote["last_price"],
+                "ohlc": quote.get("ohlc", {}),
+                "volume": quote.get("volume", 0),
+                "timestamp": datetime.now(),
+            }
+        )
+    return ticks
+
+
+def get_dashboard_pipeline(st, settings, access_token: str, token_to_symbol: dict[int, str], strategy=None) -> TradingPipeline:
+    pipeline = st.session_state.get("dashboard_pipeline")
+    if pipeline is not None and pipeline.settings.trading_mode != settings.trading_mode:
+        if pipeline.managed_positions:
+            raise RuntimeError("close all open positions before changing trading mode")
+        st.session_state.pop("dashboard_pipeline", None)
+        st.session_state.pop("dashboard_kite_client", None)
+        pipeline = None
+    repository = get_dashboard_repository(st)
+    if pipeline is None:
+        client = connect_kite(settings, access_token)
+        broker_client = client.client if settings.trading_mode == TradingMode.LIVE else None
+        pipeline = TradingPipeline(settings, token_to_symbol, strategy or VwapEmaBreakoutStrategy(), broker_client, repository)
+        st.session_state.dashboard_kite_client = client
+        st.session_state.dashboard_pipeline = pipeline
+    else:
+        if getattr(pipeline, "activity_repository", None) is None:
+            pipeline.activity_repository = repository
+        if strategy is not None:
+            pipeline.strategy = strategy
+        pipeline.extend_universe(token_to_symbol)
+    return pipeline
+
+
+def record_dashboard_events(st, events) -> None:
+    history = st.session_state.get("dashboard_events", [])
+    st.session_state.dashboard_events = (history + list(events))[-12:]
+
+
+def record_signal_notifications(st, signals: pd.DataFrame, strategy_label: str, universe_label: str, sector: str, settings) -> list[NotificationRecord]:
+    if signals.empty:
+        return []
+    notifier = Notifier(
+        bool(getattr(settings, "enable_telegram", False)),
+        getattr(settings, "telegram_bot_token", "").get_secret_value() if hasattr(getattr(settings, "telegram_bot_token", ""), "get_secret_value") else str(getattr(settings, "telegram_bot_token", "")),
+        str(getattr(settings, "telegram_chat_id", "")),
+    )
+    new_notifications = save_signal_notifications(
+        get_dashboard_repository(st),
+        signals,
+        strategy_label,
+        universe_label,
+        sector,
+        notifier,
+    )
+    if new_notifications:
+        st.toast(f"{len(new_notifications)} new signal notification{'s' if len(new_notifications) != 1 else ''}", icon=":material/notifications:")
+    return new_notifications
+
+
+def get_dashboard_repository(st) -> Repository:
+    repository = st.session_state.get("dashboard_repository")
+    if repository is not None and (
+        not getattr(repository.database, "thread_safe", False)
+        or not hasattr(repository, "save_dashboard_settings")
+    ):
+        stale_pipeline = st.session_state.get("dashboard_pipeline")
+        st.session_state.pop("dashboard_repository", None)
+        st.session_state.pop("dashboard_database", None)
+        repository = None
+        if stale_pipeline is not None:
+            stale_pipeline.activity_repository = None
+    if repository is None:
+        database = Database()
+        database.initialize()
+        repository = Repository(database)
+        st.session_state.dashboard_database = database
+        st.session_state.dashboard_repository = repository
+        stale_pipeline = st.session_state.get("dashboard_pipeline")
+        if stale_pipeline is not None:
+            stale_pipeline.activity_repository = repository
+    return repository
+
+
+def save_dashboard_settings(repository: Repository, user_id: str, settings: dict) -> None:
+    with repository.database.lock:
+        repository.database.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dashboard_settings (
+                user_id TEXT PRIMARY KEY,
+                settings TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        repository.database.connection.commit()
+    save_method = getattr(repository, "save_dashboard_settings", None)
+    if callable(save_method):
+        save_method(user_id, settings)
+        return
+    with repository.database.lock:
+        repository.database.connection.execute(
+            """
+            INSERT INTO dashboard_settings (user_id, settings, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                settings=excluded.settings,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, json.dumps(settings, sort_keys=True), datetime.now().isoformat()),
+        )
+        repository.database.connection.commit()
+
+
+def local_position_manager(st) -> PositionManager:
+    pipeline = st.session_state.get("dashboard_pipeline")
+    if pipeline is not None:
+        return pipeline.positions
+    manager = PositionManager()
+    for record in get_dashboard_repository(st).load_positions():
+        manager.add(
+            Position(
+                record.symbol,
+                Side(record.side),
+                record.quantity,
+                record.entry_price,
+                record.stop_loss,
+                record.entry_time,
+                record.target_1,
+                record.target_2,
+            )
+        )
+    return manager
+
+
+def broker_connection_state(st, settings, access_token: str) -> tuple[str, str]:
+    if not broker_credentials_configured(settings):
+        return "Not configured", "Add Kite API credentials in .env."
+    if not access_token:
+        return "Token required", "Authenticate with Kite to enable broker checks."
+    checked = st.session_state.get("broker_connection_check")
+    if checked:
+        return checked["status"], checked["detail"]
+    if st.session_state.get("dashboard_kite_client") is not None:
+        return "Session connected", "Kite client is available in this dashboard session."
+    return "Ready to connect", "Run a broker check before sending live orders."
+
+
+def render_broker_reconciliation(st, settings, access_token: str) -> None:
+    with st.expander("Broker reconciliation", expanded=False):
+        if settings.trading_mode != TradingMode.LIVE:
+            st.info("Broker reconciliation is available in LIVE mode. PAPER positions are maintained in the local ledger.", icon=":material/science:")
+            return
+        if not broker_credentials_configured(settings) or not access_token:
+            st.warning("Connect Kite before checking broker positions.", icon=":material/lock:")
+            return
+        st.caption("Compare the local managed ledger with Kite net positions before resuming live entries after a restart or disconnect.")
+        if st.button("Refresh broker positions", key="refresh_broker_positions", icon=":material/refresh:"):
+            try:
+                client = st.session_state.get("dashboard_kite_client") or connect_kite(settings, access_token)
+                st.session_state.dashboard_kite_client = client
+                broker_positions = [position for position in PositionsAPI(client.client).list() if int(position.get("quantity", 0) or 0) != 0]
+                local = local_position_manager(st)
+                missing_symbols = reconcile(local, broker_positions)
+                broker_by_symbol = {str(position.get("tradingsymbol")): position for position in broker_positions}
+                quantity_mismatches = []
+                for symbol, position in local.positions.items():
+                    broker_position = broker_by_symbol.get(symbol)
+                    if broker_position is None:
+                        continue
+                    broker_quantity = int(broker_position.get("quantity", 0) or 0)
+                    broker_side = "BUY" if broker_quantity > 0 else "SELL"
+                    if abs(broker_quantity) != position.quantity or broker_side != position.side.value:
+                        quantity_mismatches.append(symbol)
+                st.session_state.broker_reconciliation = {
+                    "checked_at": datetime.now(),
+                    "broker_positions": broker_positions,
+                    "missing_symbols": missing_symbols,
+                    "quantity_mismatches": quantity_mismatches,
+                }
+            except Exception as error:
+                st.error(f"Broker positions could not be loaded: {error}")
+        reconciliation = st.session_state.get("broker_reconciliation")
+        if reconciliation is None:
+            st.caption("No broker comparison has been run in this session.")
+            return
+        missing_symbols = reconciliation["missing_symbols"]
+        quantity_mismatches = reconciliation["quantity_mismatches"]
+        broker_positions = reconciliation["broker_positions"]
+        if not missing_symbols and not quantity_mismatches:
+            st.success("Local and broker positions match by symbol, side, and quantity.", icon=":material/check_circle:")
+        else:
+            st.error("Reconciliation found differences. Keep automatic entries halted until they are resolved.", icon=":material/error:")
+            if missing_symbols:
+                st.write(f"Symbol differences: {', '.join(missing_symbols)}")
+            if quantity_mismatches:
+                st.write(f"Side or quantity differences: {', '.join(quantity_mismatches)}")
+        broker_display = [
+            {
+                "Symbol": position.get("tradingsymbol", ""),
+                "Quantity": int(position.get("quantity", 0) or 0),
+                "Average price": float(position.get("average_price", 0) or 0),
+                "Last price": float(position.get("last_price", 0) or 0),
+                "P&L": float(position.get("pnl", 0) or 0),
+            }
+            for position in broker_positions
+        ]
+        if broker_display:
+            st.dataframe(
+                pd.DataFrame(broker_display),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Average price": st.column_config.NumberColumn(format="₹%.2f"),
+                    "Last price": st.column_config.NumberColumn(format="₹%.2f"),
+                    "P&L": st.column_config.NumberColumn(format="₹%.2f"),
+                },
+            )
+        st.caption(f"Last checked {reconciliation['checked_at'].strftime('%H:%M:%S')}")
+
+
+def render_control_center(st, settings, activity: pd.DataFrame, day_pnl: float) -> None:
+    st.subheader("Trading control center")
+    access_token = runtime_access_token(st, settings)
+    connection_status, connection_detail = broker_connection_state(st, settings, access_token)
+    pipeline = st.session_state.get("dashboard_pipeline")
+    managed_positions = local_position_manager(st).positions
+    open_exposure = sum(position.entry_price * position.quantity for position in managed_positions.values())
+    daily_loss_limit = settings.initial_capital * settings.max_daily_loss
+    loss_remaining = max(0.0, daily_loss_limit + day_pnl)
+    trades_today = int(activity.loc[activity["timestamp"].astype(str).str.startswith(date.today().isoformat()), "event_kind"].eq("exit_submitted").sum()) if not activity.empty else 0
+    selected_watchlists = get_dashboard_repository(st).load_watchlists(dashboard_user_id(settings), selected_only=True)
+    signal_engine_status = "Monitoring" if selected_watchlists else "Waiting"
+    if st.session_state.get("emergency_halt") or (pipeline is not None and pipeline.halted):
+        signal_engine_status = "Halted"
+    checked = st.session_state.get("broker_connection_check")
+    checked_time = checked["checked_at"].strftime("%H:%M:%S") if checked else "not checked"
+    last_market_data = st.session_state.get("last_market_data_at")
+    last_market_data_label = last_market_data.strftime("%H:%M:%S") if isinstance(last_market_data, datetime) else "not available"
+    status_columns = st.columns(4)
+    status_columns[0].metric("Broker", connection_status)
+    status_columns[1].metric("Signal engine", signal_engine_status)
+    status_columns[2].metric("Open positions", f"{len(managed_positions)} / {settings.max_open_positions}")
+    status_columns[3].metric("Daily loss remaining", f"₹{loss_remaining:,.0f}", f"limit ₹{daily_loss_limit:,.0f}")
+    st.caption(f"{connection_detail} Last check: {checked_time} · Last market data: {last_market_data_label}")
+    action_columns = st.columns(3)
+    if action_columns[0].button("Check broker connection", key="check_broker_connection", icon=":material/cloud_done:"):
+        try:
+            client = st.session_state.get("dashboard_kite_client") or connect_kite(settings, access_token)
+            client.client.profile()
+            st.session_state.dashboard_kite_client = client
+            st.session_state.broker_connection_check = {
+                "status": "Connected",
+                "detail": "Kite authentication and API request succeeded.",
+                "checked_at": datetime.now(),
+            }
+        except Exception as error:
+            st.session_state.broker_connection_check = {
+                "status": "Disconnected",
+                "detail": str(error),
+                "checked_at": datetime.now(),
+            }
+        st.rerun()
+    action_columns[1].metric("Selected stocks", sum(len(item.symbols) for item in selected_watchlists))
+    action_columns[2].metric("Trades today", f"{trades_today} / {settings.max_trades_per_day}", f"Exposure ₹{open_exposure:,.0f}")
+    st.caption("The backend signal engine evaluates selected watchlists during market hours, whether this dashboard is open or not.")
+    if st.session_state.get("emergency_halt"):
+        st.warning("New entries are halted. Existing positions remain monitored.", icon=":material/pause_circle:")
+        if st.button("Resume new entries", key="overview_resume_entries", icon=":material/play_arrow:"):
+            if pipeline is not None:
+                pipeline.resume_entries()
+            st.session_state.emergency_halt = False
+            st.rerun()
+    else:
+        with st.form("overview_emergency_halt_form"):
+            halt_confirmed = st.checkbox("Confirm that new BUY/SELL entries should be halted.", key="overview_halt_confirmation")
+            halt_submitted = st.form_submit_button("Emergency stop: halt new entries", type="secondary", width="stretch", icon=":material/stop_circle:")
+        if halt_submitted:
+            if not halt_confirmed:
+                st.warning("Confirm the emergency halt before submitting it.")
+            else:
+                if pipeline is not None:
+                    pipeline.halt_entries()
+                st.session_state.automatic_enabled = False
+                st.session_state.emergency_halt = True
+                st.rerun()
+    render_broker_reconciliation(st, settings, access_token)
+
+
+def render_position_monitor(st, settings, access_token: str) -> None:
+    pipeline = st.session_state.get("dashboard_pipeline")
+    if pipeline is None:
+        st.caption("No open positions. Positions are monitored automatically while this dashboard session is open.")
+        return
+
+    if pipeline.managed_positions:
+        try:
+            client = st.session_state.get("dashboard_kite_client") or connect_kite(settings, access_token)
+            st.session_state.dashboard_kite_client = client
+            events = pipeline.sync_broker_positions()
+            position_symbols = set(pipeline.managed_positions)
+            position_tokens = {token: symbol for token, symbol in pipeline.scanner.token_to_symbol.items() if symbol in position_symbols}
+            live_ticks = load_live_quote_ticks(client.client, position_tokens) if position_tokens else []
+            st.session_state.last_market_data_at = datetime.now()
+            events.extend(pipeline.monitor_ticks(live_ticks))
+            ema9_positions = {
+                symbol: token
+                for token, symbol in position_tokens.items()
+                if pipeline.managed_positions.get(symbol) is not None
+                and pipeline.managed_positions[symbol].exit_on_ema9_close
+            }
+            if ema9_positions:
+                completed_candles = {
+                    symbol: load_live_candles_from_client(client.client, token, "5minute", 5)
+                    for symbol, token in ema9_positions.items()
+                }
+                events.extend(pipeline.monitor_candle_closes(completed_candles))
+            record_dashboard_events(st, events)
+        except Exception as error:
+            st.warning(f"Position monitoring paused: {error}")
+
+    positions = []
+    for symbol, managed in pipeline.managed_positions.items():
+        current_price = pipeline.last_prices.get(symbol, managed.position.entry_price)
+        positions.append(
+            {
+                "Symbol": symbol,
+                "Side": managed.position.side.value,
+                "Quantity": managed.position.quantity,
+                "Entry": managed.position.entry_price,
+                "Last": current_price,
+                "Stop": managed.trailing_stop.stop,
+                "P&L": managed.position.unrealized_pnl(current_price),
+            }
+        )
+    if positions:
+        st.dataframe(
+            pd.DataFrame(positions),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Entry": st.column_config.NumberColumn(format="₹%.2f"),
+                "Last": st.column_config.NumberColumn(format="₹%.2f"),
+                "Stop": st.column_config.NumberColumn(format="₹%.2f"),
+                "P&L": st.column_config.NumberColumn(format="₹%.2f"),
+            },
+        )
+        st.caption("Exit controls")
+        for row_number, (symbol, managed) in enumerate(list(pipeline.managed_positions.items())):
+            current_price = pipeline.last_prices.get(symbol, managed.position.entry_price)
+            with st.container(border=True):
+                st.markdown(
+                    f"**{symbol}** · {managed.position.side.value} · {managed.position.quantity} shares · "
+                    f"entry ₹{managed.position.entry_price:,.2f} · stop ₹{managed.trailing_stop.stop:,.2f}"
+                )
+                with st.form(f"overview_exit_form_{symbol}_{row_number}"):
+                    exit_price = st.number_input(
+                        "Exit value",
+                        min_value=0.05,
+                        value=round(float(current_price), 2),
+                        step=0.05,
+                        format="%.2f",
+                        key=f"overview_exit_price_{symbol}_{row_number}",
+                    )
+                    confirmation_label = (
+                        "I understand this will send a live MARKET exit order."
+                        if settings.trading_mode == TradingMode.LIVE
+                        else "I confirm this PAPER exit order."
+                    )
+                    confirmed = st.checkbox(confirmation_label, key=f"overview_exit_confirm_{symbol}_{row_number}")
+                    submit_exit = st.form_submit_button(f"Exit {symbol}", type="primary", width="stretch")
+                if submit_exit:
+                    if not confirmed:
+                        st.warning("Confirm the exit before submitting it.")
+                    else:
+                        event = pipeline.submit_manual_exit(symbol, float(exit_price))
+                        record_dashboard_events(st, [event])
+                        if event.kind == "exit_submitted":
+                            st.success(f"{event.order_id}: {symbol} exit submitted.")
+                        else:
+                            st.error(f"Exit rejected: {event.reason}")
+    else:
+        st.success("All monitored positions are closed.")
+    if pipeline.recent_closed_positions:
+        st.subheader("Recently closed")
+        st.caption("Closed trades are kept here after Zerodha confirms the broker-side exit.")
+        closed_rows = [
+            {
+                "Symbol": closed.symbol,
+                "Side": closed.side.value,
+                "Quantity": closed.quantity,
+                "Entry": closed.entry_price,
+                "Exit": closed.exit_price,
+                "Realized P&L": closed.pnl,
+                "Closed at": closed.closed_at,
+                "Exit order": closed.order_id or "Unavailable",
+                "Reason": closed.reason,
+            }
+            for closed in pipeline.recent_closed_positions
+        ]
+        st.dataframe(
+            pd.DataFrame(closed_rows),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Entry": st.column_config.NumberColumn(format="₹%.2f"),
+                "Exit": st.column_config.NumberColumn(format="₹%.2f"),
+                "Realized P&L": st.column_config.NumberColumn(format="₹%.2f"),
+                "Closed at": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
+            },
+        )
+    recent_events = st.session_state.get("dashboard_events", [])[-5:]
+    if recent_events:
+        st.caption(" · ".join(f"{event.kind}: {event.symbol}" for event in recent_events))
+
+
+def render_kite_authentication(st, settings) -> None:
+    st.markdown('<div class="eyebrow">Broker connection</div>', unsafe_allow_html=True)
+    st.title("Kite authentication")
+    if notice := st.session_state.pop("kite_auth_notice", ""):
+        st.success(notice, icon=":material/check_circle:")
+    runtime_token = runtime_access_token(st, settings)
+    st.subheader("Connect Zerodha Kite")
+    if broker_credentials_configured(settings):
+        login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={quote(settings.kite_api_key)}"
+        st.link_button("Open Kite login", login_url, icon=":material/login:")
+        access_token_input = st.text_input(
+            "Kite access token",
+            type="password",
+            key="kite_access_token_input",
+            help="Paste an access token you already generated, or use the request-token exchange below.",
+        )
+        if access_token_input.strip():
+            runtime_token = access_token_input.strip()
+            st.session_state.kite_access_token = runtime_token
+        request_token_from_url = st.query_params.get("request_token", "")
+        request_token = st.text_input(
+            "Kite request token",
+            value=request_token_from_url,
+            type="password",
+            help="After Kite login, the request_token appears in the redirected URL.",
+        )
+        if st.button("Generate access token", type="primary", width="stretch"):
+            try:
+                access_token = exchange_request_token(
+                    settings.kite_api_key,
+                    settings.kite_api_secret.get_secret_value(),
+                    request_token,
+                )
+            except AuthenticationError as error:
+                st.error(str(error), icon=":material/error:")
+            else:
+                st.session_state.kite_access_token = access_token.value
+                st.session_state.kite_auth_notice = "Access token generated. Workspace navigation is now enabled."
+                st.query_params.clear()
+                st.rerun()
+        if runtime_token:
+            st.success("Kite authenticated. Workspace navigation is enabled.", icon=":material/check_circle:")
+        else:
+            st.info("Complete Kite login and provide a daily access token to unlock the workspace.", icon=":material/lock:")
+    else:
+        st.info("Add KITE_API_KEY and KITE_API_SECRET to .env before starting Kite login.", icon=":material/key:")
+
+
+def dashboard_user_id(settings) -> str:
+    return str(getattr(settings, "user_id", "default"))
+
+
+def selected_watchlist_symbols(repository: Repository, user_id: str) -> dict[str, int]:
+    symbols: dict[str, int] = {}
+    tokens: set[int] = set()
+    for watchlist in repository.load_watchlists(user_id, selected_only=True):
+        for symbol, token in watchlist.symbols.items():
+            if token not in tokens:
+                symbols[symbol] = token
+                tokens.add(token)
+    dynamic_watchlist = repository.load_dynamic_watchlist(user_id)
+    if dynamic_watchlist and dynamic_watchlist.selected:
+        for symbol, token in dynamic_watchlist.symbols.items():
+            if token not in tokens:
+                symbols[symbol] = token
+                tokens.add(token)
+    return symbols
+
+
+def render_dynamic_watchlist(st, settings, repository: Repository, user_id: str, source_watchlists: list[WatchlistRecord]) -> None:
+    @st.fragment(run_every=60)
+    def render_dynamic_section() -> None:
+        st.divider()
+        st.subheader(DYNAMIC_WATCHLIST_NAME)
+        st.caption(
+            "The scan starts at the first tick of the 09:15 candle and keeps symbols where LOW >= OPEN * 0.999 "
+            "and CURRENT_PRICE > OPEN."
+        )
+        dynamic_watchlist = repository.load_dynamic_watchlist(user_id)
+        source_names = [watchlist.name for watchlist in source_watchlists]
+        if not source_names:
+            st.info("Create a source watchlist before configuring the dynamic list.", icon=":material/info:")
+            return
+
+        default_source = dynamic_watchlist.source_name if dynamic_watchlist and dynamic_watchlist.source_name in source_names else source_names[0]
+        source_index = source_names.index(default_source)
+        today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+        with st.form("dynamic_watchlist_source_form"):
+            source_name = st.selectbox("Source watchlist", source_names, index=source_index, key="dynamic_watchlist_source")
+            evaluation_date = st.date_input("Evaluation date", value=today, max_value=today, key="dynamic_watchlist_date")
+            apply_selection = st.form_submit_button("Apply selection", type="primary", icon=":material/check:")
+        if apply_selection:
+            current = repository.load_dynamic_watchlist(user_id)
+            same_selection = current and current.source_name == source_name and current.session_date == evaluation_date.isoformat()
+            repository.save_dynamic_watchlist(
+                DynamicWatchlistRecord(
+                    user_id=user_id,
+                    source_name=source_name,
+                    symbols=current.symbols if same_selection else {},
+                    selected=current.selected if current else True,
+                    require_breakout=current.require_breakout if current else False,
+                    refreshed_at=current.refreshed_at if same_selection else None,
+                    session_date=evaluation_date.isoformat(),
+                )
+            )
+            st.session_state.pop("dynamic_watchlist_rows", None)
+            dynamic_watchlist = repository.load_dynamic_watchlist(user_id)
+
+        if dynamic_watchlist is None:
+            st.info("Apply a source watchlist to initialize the dynamic list.", icon=":material/tune:")
+            return
+
+        selected_source = next(item for item in source_watchlists if item.name == dynamic_watchlist.source_name)
+        if dynamic_watchlist.source_name == "Nifty 500" and len(selected_source.symbols) < 500:
+            st.warning(
+                f"This Nifty 500 source has only {len(selected_source.symbols)} symbols and may be stale. "
+                "Sync the current constituents before comparing with Zerodha."
+            )
+            if st.button("Sync Nifty 500 constituents", icon=":material/sync:", key="dynamic_watchlist_sync_nifty500"):
+                if not broker_credentials_configured(settings) or not runtime_access_token(st, settings):
+                    st.error("Connect Kite before syncing Nifty 500 constituents.")
+                else:
+                    try:
+                        with st.spinner("Loading current Nifty 500 constituents..."):
+                            sync_client = connect_kite(settings, runtime_access_token(st, settings))
+                            universe = load_nifty_index_universe_from_api(sync_client.client, "NIFTY 500")
+                        synced_symbols = {
+                            f"NSE:{row.symbol}": int(row.instrument_token)
+                            for row in universe.itertuples()
+                        }
+                        repository.update_watchlist_symbols(user_id, selected_source.name, synced_symbols)
+                        st.session_state.pop("dynamic_watchlist_rows", None)
+                        st.session_state.dynamic_watchlist_refresh_requested = True
+                        st.success(f"Synced {len(synced_symbols)} current Nifty 500 constituents.")
+                        st.rerun()
+                    except (OSError, RuntimeError, ValueError) as error:
+                        st.error(f"Nifty 500 sync failed: {error}")
+
+        selected = st.checkbox(
+            "Use for Signals",
+            value=dynamic_watchlist.selected,
+            key="dynamic_watchlist_selected",
+            help="Include the current filtered symbols in the backend signal engine.",
+        )
+        if selected != dynamic_watchlist.selected:
+            repository.set_dynamic_watchlist_selection(user_id, selected)
+            dynamic_watchlist = repository.load_dynamic_watchlist(user_id)
+
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        selected_date = evaluation_date
+        current_slot = auto_refresh_slot(now, settings.market_open) if selected_date == today else None
+        stored_slot = dynamic_watchlist.refresh_slot if dynamic_watchlist.session_date == selected_date.isoformat() else None
+        auto_refresh_due = current_slot is not None and current_slot != stored_slot
+        refresh_column, status_column = st.columns([1, 3])
+        with refresh_column:
+            manual_refresh = st.button("Refresh list", icon=":material/refresh:", key="dynamic_watchlist_refresh", width="stretch")
+        with status_column:
+            if selected_date != today:
+                st.caption("Historical date selected. Use Refresh list to load its completed candles.")
+            elif current_slot is not None:
+                st.caption(f"Auto-refresh active from the first tick; evaluating candle window {current_slot + 1} of {DYNAMIC_AUTO_REFRESH_CANDLES}.")
+            else:
+                st.caption("Automatic scanning runs during the first three 5-minute candle windows from 09:15 IST.")
+
+        rows = st.session_state.get("dynamic_watchlist_rows")
+        rows_source = st.session_state.get("dynamic_watchlist_rows_source")
+        refresh_requested = st.session_state.pop("dynamic_watchlist_refresh_requested", False)
+        if manual_refresh or auto_refresh_due or refresh_requested:
+            if not broker_credentials_configured(settings) or not runtime_access_token(st, settings):
+                if manual_refresh:
+                    st.warning("Connect Kite before refreshing the dynamic list.", icon=":material/key:")
+            else:
+                try:
+                    source_watchlist = next(item for item in source_watchlists if item.name == dynamic_watchlist.source_name)
+                    progress_bar = st.progress(
+                        0.0,
+                        text=f"Refreshing dynamic watchlist: 0/{len(source_watchlist.symbols)} complete · {len(source_watchlist.symbols)} remaining",
+                    )
+
+                    def update_refresh_progress(completed: int, total: int, symbol: str) -> None:
+                        remaining = total - completed
+                        progress_bar.progress(
+                            completed / total if total else 1.0,
+                            text=f"Refreshing {split_watchlist_symbol(symbol)[1]}: {completed}/{total} complete · {remaining} remaining",
+                        )
+
+                    with st.spinner("Refreshing dynamic watchlist..."):
+                        rows, errors = load_dynamic_watchlist_rows(
+                            settings,
+                            runtime_access_token(st, settings),
+                            source_watchlist,
+                            selected_date,
+                            progress_callback=update_refresh_progress,
+                        )
+                    progress_bar.progress(
+                        1.0,
+                        text=f"Dynamic watchlist refresh complete: {len(source_watchlist.symbols)}/{len(source_watchlist.symbols)} complete · 0 remaining",
+                    )
+                    refreshed_at = datetime.now()
+                    repository.save_dynamic_watchlist(
+                        DynamicWatchlistRecord(
+                            user_id=user_id,
+                            source_name=dynamic_watchlist.source_name,
+                            symbols={row["symbol"]: int(row["instrument_token"]) for row in rows.to_dict("records")},
+                            selected=dynamic_watchlist.selected,
+                            require_breakout=dynamic_watchlist.require_breakout,
+                            updated_at=refreshed_at,
+                            refreshed_at=refreshed_at,
+                            session_date=selected_date.isoformat(),
+                            refresh_slot=current_slot,
+                        )
+                    )
+                    dynamic_watchlist = repository.load_dynamic_watchlist(user_id)
+                    st.session_state.dynamic_watchlist_rows = rows
+                    st.session_state.dynamic_watchlist_rows_source = dynamic_watchlist.source_name
+                    rows_source = dynamic_watchlist.source_name
+                    if errors:
+                        st.warning(f"Some source instruments could not be loaded ({len(errors)}).")
+                except (OSError, RuntimeError, ValueError) as error:
+                    st.error(f"Dynamic watchlist refresh failed: {error}")
+
+        if rows is None or rows_source != dynamic_watchlist.source_name:
+            rows = pd.DataFrame()
+        if dynamic_watchlist.symbols and rows.empty:
+            rows = pd.DataFrame(
+                [{"symbol": symbol, "instrument_token": token} for symbol, token in dynamic_watchlist.symbols.items()]
+            )
+        if dynamic_watchlist.refreshed_at:
+            st.caption(f"Source: {dynamic_watchlist.source_name} · Date: {dynamic_watchlist.session_date} · Last refresh: {dynamic_watchlist.refreshed_at:%d %b %Y, %I:%M:%S %p}")
+        metric_column, _ = st.columns([1, 4])
+        metric_column.metric("Matching stocks", len(rows))
+        if rows.empty:
+            st.info("No source instruments currently meet all first-candle filters.", icon=":material/search_off:")
+            return
+
+        display = rows.copy()
+        display["Symbol"] = display["symbol"].map(lambda value: split_watchlist_symbol(value)[1])
+        display["TradingView"] = display["symbol"].map(tradingview_chart_url)
+        display = display.rename(
+            columns={
+                "candle_time": "Candle time",
+                "open": "Open",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
+                "avg_volume_20": "Avg volume 20",
+                "vwap": "VWAP",
+                "first_candle_high": "First candle high",
+                "current_price": "Current price",
+            }
+        )
+        st.dataframe(
+            display.reindex(
+                columns=[
+                    "Symbol",
+                    "TradingView",
+                    "Candle time",
+                    "Open",
+                    "Low",
+                    "Close",
+                    "Volume",
+                    "Avg volume 20",
+                    "VWAP",
+                    "First candle high",
+                    "Current price",
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "TradingView": st.column_config.LinkColumn("TradingView", display_text="Open chart"),
+                "Open": st.column_config.NumberColumn(format="₹%.2f"),
+                "Low": st.column_config.NumberColumn(format="₹%.2f"),
+                "Close": st.column_config.NumberColumn(format="₹%.2f"),
+                "Volume": st.column_config.NumberColumn(format="%.0f"),
+                "Avg volume 20": st.column_config.NumberColumn(format="%.0f"),
+                "VWAP": st.column_config.NumberColumn(format="₹%.2f"),
+                "First candle high": st.column_config.NumberColumn(format="₹%.2f"),
+                "Current price": st.column_config.NumberColumn(format="₹%.2f"),
+            },
+        )
+
+    render_dynamic_section()
+
+
+def render_watchlist_stock_view(st, settings, repository: Repository, user_id: str, watchlist: WatchlistRecord, instruments: pd.DataFrame) -> None:
+    st.divider()
+    header, close = st.columns([5, 1])
+    with header:
+        st.subheader(f"{watchlist.name} stocks")
+        st.caption(f"{len(watchlist.symbols)} instruments in this watchlist")
+    with close:
+        if st.button("Close", key=f"watchlist_close_{watchlist.name}", width="stretch"):
+            st.session_state.pop("open_watchlist", None)
+            st.rerun()
+
+    search_filter = st.text_input("Filter stocks", placeholder="Filter by symbol or company", key=f"watchlist_filter_{watchlist.name}")
+    rows = []
+    for stored_symbol, token in sorted(watchlist.symbols.items()):
+        exchange, tradingsymbol = split_watchlist_symbol(stored_symbol)
+        match = instruments.loc[
+            (instruments["exchange"] == exchange) & (instruments["tradingsymbol"] == tradingsymbol)
+        ]
+        company = str(match.iloc[0]["name"]) if not match.empty else ""
+        if search_filter.strip() and search_filter.strip().upper() not in f"{tradingsymbol} {company}".upper():
+            continue
+        rows.append({"stored_symbol": stored_symbol, "token": int(token), "Symbol": tradingsymbol, "Company": company, "Exchange": exchange})
+
+    page_size = 50
+    page_count = max(1, (len(rows) + page_size - 1) // page_size)
+    page = st.selectbox("Page", range(1, page_count + 1), format_func=lambda value: f"Page {value} of {page_count}", key=f"watchlist_page_{watchlist.name}")
+    visible_rows = rows[(page - 1) * page_size : page * page_size]
+    visible_frame = pd.DataFrame(visible_rows)
+    prices = {}
+    if not visible_frame.empty:
+        try:
+            quote_rows = visible_frame.rename(columns={"Symbol": "tradingsymbol", "Exchange": "exchange", "token": "instrument_token"})
+            prices = load_watchlist_prices(settings, runtime_access_token(st, settings), quote_rows)
+        except Exception:
+            st.caption("Live prices are unavailable. The instrument list is still editable.")
+    if visible_rows:
+        display = pd.DataFrame(
+            [
+                {
+                    "Symbol": row["Symbol"],
+                    "Company": row["Company"],
+                    "Exchange": row["Exchange"],
+                    "Current Price": prices.get(row["token"]),
+                    "Added On": (watchlist.updated_at or datetime.now()).strftime("%d %b %Y"),
+                }
+                for row in visible_rows
+            ]
+        )
+        st.dataframe(
+            display,
+            width="stretch",
+            hide_index=True,
+            column_config={"Current Price": st.column_config.NumberColumn(format="₹%.2f")},
+        )
+    else:
+        st.markdown('<div class="empty">No instruments match this filter.</div>', unsafe_allow_html=True)
+
+    actions, add = st.columns([3, 1])
+    with actions:
+        if rows:
+            remove_options = [row["stored_symbol"] for row in rows]
+            remove_symbols = st.multiselect(
+                "Remove stocks",
+                remove_options,
+                format_func=lambda value: f"{split_watchlist_symbol(value)[1]} · {split_watchlist_symbol(value)[0]}",
+                key=f"watchlist_remove_select_{watchlist.name}",
+            )
+            if st.button("Remove selected", key=f"watchlist_remove_{watchlist.name}", icon=":material/delete:", disabled=not remove_symbols):
+                updated_symbols = dict(watchlist.symbols)
+                for symbol in remove_symbols:
+                    updated_symbols.pop(symbol, None)
+                repository.update_watchlist_symbols(user_id, watchlist.name, updated_symbols)
+                st.rerun()
+    with add:
+        if st.button("Add Stock", key=f"watchlist_detail_add_{watchlist.name}", type="primary", icon=":material/add:"):
+            st.session_state.add_target_watchlist = watchlist.name
+            st.session_state.watchlist_batch_destinations = [watchlist.name]
+            st.rerun()
+
+
+def render_watchlists(st, settings) -> None:
+    st.markdown('<div class="eyebrow">Backend signal scope</div>', unsafe_allow_html=True)
+    header, create = st.columns([5, 1])
+    with header:
+        st.title("Watchlists")
+        st.caption("Manage the stocks you want the signal engine to monitor.")
+    with create:
+        if st.button("Create Watchlist", type="primary", icon=":material/add:", width="stretch"):
+            st.session_state.create_watchlist_open = True
+
+    repository = get_dashboard_repository(st)
+    user_id = dashboard_user_id(settings)
+    watchlists = repository.load_watchlists(user_id)
+    selected_watchlists = [watchlist for watchlist in watchlists if watchlist.selected]
+    selected_symbols = selected_watchlist_symbols(repository, user_id)
+    engine_status = repository.load_signal_engine_status(user_id)
+    now = datetime.now()
+    heartbeat_age = (now - engine_status.last_run_at).total_seconds() if engine_status else None
+    engine_running = heartbeat_age is not None and heartbeat_age <= max(120, settings.signal_poll_seconds * 3)
+    engine_label = "Running" if engine_running else "Ready to start from Scanner & signals"
+    last_scan = engine_status.last_run_at.strftime("%I:%M:%S %p") if engine_status else "No scan recorded"
+    status_color = "#20844b" if engine_running else "#b7791f"
+    status_text = f"<strong style='color:{status_color}'>{engine_label}</strong>"
+    st.markdown(
+        f"""
+        <div class="engine-panel">
+            <div class="eyebrow">Signal engine</div>
+            <div style="font-size:1.1rem; margin:5px 0 9px"><span style="color:{status_color}">●</span> {status_text}</div>
+            <div style="color:#53645a; font-size:.9rem">Monitoring: {len(selected_watchlists)} watchlists · {len(selected_symbols)} stocks &nbsp;|&nbsp; Last scan: {last_scan}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    total_memberships = sum(len(item.symbols) for item in selected_watchlists)
+    overlap_count = max(0, total_memberships - len(selected_symbols))
+    metric_one, metric_two, metric_three, metric_four = st.columns(4)
+    metric_one.metric("Watchlists", len(watchlists))
+    metric_two.metric("Active lists", len(selected_watchlists))
+    metric_three.metric("Unique monitored", len(selected_symbols))
+    metric_four.metric("Overlapping entries", overlap_count)
+    if overlap_count:
+        memberships: dict[int, list[str]] = {}
+        labels: dict[int, str] = {}
+        for watchlist in selected_watchlists:
+            for symbol, token in watchlist.symbols.items():
+                memberships.setdefault(token, []).append(watchlist.name)
+                labels[token] = split_watchlist_symbol(symbol)[1]
+        with st.expander(f"View {overlap_count} overlapping instrument{'s' if overlap_count != 1 else ''}"):
+            st.dataframe(
+                pd.DataFrame(
+                    [{"Symbol": labels[token], "Selected watchlists": ", ".join(names)} for token, names in memberships.items() if len(names) > 1]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+    if engine_status and engine_status.last_error:
+        st.warning(f"The backend reported an error on its last cycle: {engine_status.last_error}")
+
+    if st.session_state.get("create_watchlist_open", False):
+        with st.form("create_watchlist_form"):
+            name = st.text_input("Watchlist name", placeholder="e.g. Momentum Stocks")
+            form_actions = st.columns([1, 1, 4])
+            with form_actions[0]:
+                submitted = st.form_submit_button("Create watchlist", type="primary", icon=":material/check:")
+            with form_actions[1]:
+                cancelled = st.form_submit_button("Cancel", icon=":material/close:")
+        if cancelled:
+            st.session_state.create_watchlist_open = False
+            st.rerun()
+        if submitted:
+            normalized_name = " ".join(name.strip().split())
+            if not normalized_name:
+                st.error("Watchlist name is required.")
+            elif any(item.name.casefold() == normalized_name.casefold() for item in watchlists):
+                st.error("A watchlist with that name already exists.")
+            else:
+                repository.save_watchlist(WatchlistRecord(user_id, normalized_name, {}, selected=False))
+                st.session_state.create_watchlist_open = False
+                st.session_state.add_target_watchlist = normalized_name
+                st.session_state.watchlist_batch_destinations = [normalized_name]
+                st.session_state.watchlist_created_notice = f"Watchlist '{normalized_name}' created. Search for a stock below to add it."
+                st.rerun()
+
+    if notice := st.session_state.pop("watchlist_created_notice", ""):
+        st.success(notice)
+
+    access_token = runtime_access_token(st, settings)
+    instruments = st.session_state.get("watchlist_instruments")
+    st.divider()
+    st.subheader("Add stocks to your watchlists")
+    st.caption("Search the full NSE and BSE instrument catalog by company name or trading symbol.")
+    if not broker_credentials_configured(settings) or not access_token:
+        st.info("Connect Kite to search market instruments. You can create empty watchlists before connecting.", icon=":material/lock:")
+    else:
+        if instruments is None:
+            try:
+                with st.spinner("Loading market instruments..."):
+                    instruments = load_watchlist_instruments(settings, access_token)
+                st.session_state.watchlist_instruments = instruments
+            except Exception as error:
+                st.error(f"Market instrument search is unavailable: {error}")
+                instruments = pd.DataFrame()
+        elif "instrument_type" not in instruments.columns or "instrument_key" not in instruments.columns:
+            st.session_state.pop("watchlist_instruments", None)
+            st.rerun()
+        search_column, exchange_column, type_column = st.columns([3, 1, 1])
+        with search_column:
+            query = st.text_input("Search stocks", placeholder="Search company name or symbol...", key="watchlist_search")
+        with exchange_column:
+            exchange_filter = st.selectbox("Exchange", ["All exchanges", "NSE", "BSE"], key="watchlist_search_exchange")
+        with type_column:
+            type_options = ["All types", *sorted(instruments["instrument_type"].unique())] if instruments is not None and not instruments.empty else ["All types"]
+            instrument_type_filter = st.selectbox("Instrument type", type_options, key="watchlist_search_type")
+        selected_keys = set(st.session_state.get("watchlist_selected_instruments", []))
+        if instruments is not None and not instruments.empty and len(query.strip()) >= 2:
+            normalized_query = query.strip().upper()
+            results = instruments.loc[
+                instruments["tradingsymbol"].str.contains(normalized_query, na=False, regex=False)
+                | instruments["name"].str.upper().str.contains(normalized_query, na=False, regex=False)
+            ].copy()
+            if exchange_filter != "All exchanges":
+                results = results.loc[results["exchange"] == exchange_filter]
+            if instrument_type_filter != "All types":
+                results = results.loc[results["instrument_type"] == instrument_type_filter]
+            results["rank"] = results["tradingsymbol"].str.startswith(normalized_query).map({True: 0, False: 1})
+            results = results.sort_values(["rank", "tradingsymbol", "exchange"]).head(25)
+            if results.empty:
+                st.markdown('<div class="empty">No market instruments matched that search.</div>', unsafe_allow_html=True)
+            else:
+                st.caption(f"Showing {len(results)} of the matching market instruments")
+                result_rows = [
+                    {
+                        "instrument_key": row.instrument_key,
+                        "symbol": row.tradingsymbol,
+                        "exchange": row.exchange,
+                        "name": row.name,
+                        "instrument_type": row.instrument_type,
+                        "instrument_token": int(row.instrument_token),
+                    }
+                    for row in results.itertuples()
+                ]
+                visible_keys = {row["instrument_key"] for row in result_rows}
+                select_all_column, clear_visible_column = st.columns([1, 1])
+                with select_all_column:
+                    if st.button("Select all visible", key="watchlist_select_all_visible", icon=":material/done_all:"):
+                        st.session_state.watchlist_selected_instruments = sorted(selected_keys | visible_keys)
+                        st.rerun()
+                with clear_visible_column:
+                    if st.button("Clear visible", key="watchlist_clear_visible", icon=":material/remove_done:", disabled=not selected_keys.intersection(visible_keys)):
+                        st.session_state.watchlist_selected_instruments = sorted(selected_keys - visible_keys)
+                        st.rerun()
+                for row in result_rows:
+                    pick_column, info_column = st.columns([0.35, 5])
+                    with pick_column:
+                        checked = st.checkbox(
+                            "Select",
+                            value=row["instrument_key"] in selected_keys,
+                            key=f"watchlist_pick_{row['instrument_key']}",
+                            label_visibility="collapsed",
+                        )
+                    if checked:
+                        selected_keys.add(row["instrument_key"])
+                    else:
+                        selected_keys.discard(row["instrument_key"])
+                    with info_column:
+                        st.markdown(
+                            f'<div class="search-result"><span class="search-symbol">{row["symbol"]}</span> <span class="search-name">{row["name"] or "Market instrument"} · {row["exchange"]}</span><div class="result-meta">{row["instrument_type"]} · Instrument token {row["instrument_token"]}</div></div>',
+                            unsafe_allow_html=True,
+                        )
+                st.session_state.watchlist_selected_instruments = sorted(selected_keys)
+                toolbar_left, toolbar_right = st.columns([4, 1])
+                with toolbar_left:
+                    st.caption(f"{len(selected_keys)} instrument{'s' if len(selected_keys) != 1 else ''} selected")
+                with toolbar_right:
+                    if st.button("Clear", key="watchlist_clear_selection", icon=":material/close:", disabled=not selected_keys):
+                        st.session_state.watchlist_selected_instruments = []
+                        st.rerun()
+
+        selected_rows = [
+            {
+                "instrument_key": row.instrument_key,
+                "symbol": row.tradingsymbol,
+                "exchange": row.exchange,
+                "name": row.name,
+                "instrument_token": int(row.instrument_token),
+            }
+            for row in instruments.loc[instruments["instrument_key"].isin(selected_keys)].itertuples()
+        ] if instruments is not None and not instruments.empty else []
+        if selected_rows:
+            destination_names = [item.name for item in watchlists]
+            default_destination = st.session_state.get("add_target_watchlist")
+            if "watchlist_batch_destinations" not in st.session_state:
+                st.session_state.watchlist_batch_destinations = [default_destination] if default_destination in destination_names else []
+            with st.container(border=True):
+                st.markdown(f'<div class="selection-tray"><strong>{len(selected_rows)} instrument{"s" if len(selected_rows) != 1 else ""} ready to add</strong><br><span class="result-meta">{", ".join(row["symbol"] for row in selected_rows[:6])}{" · …" if len(selected_rows) > 6 else ""}</span></div>', unsafe_allow_html=True)
+                destinations = st.multiselect(
+                    "Add selected instruments to",
+                    destination_names,
+                    key="watchlist_batch_destinations",
+                    disabled=not destination_names,
+                )
+                if st.button("Add selected to watchlists", type="primary", icon=":material/library_add:", key="watchlist_batch_add", disabled=not destinations):
+                    additions = add_instruments_to_watchlists(repository, user_id, watchlists, selected_rows, destinations)
+                    st.session_state.watchlist_selected_instruments = []
+                    st.session_state.pop("watchlist_batch_destinations", None)
+                    st.session_state.pop("add_target_watchlist", None)
+                    st.success(f"Added {additions} new instrument{'s' if additions != 1 else ''} to {len(destinations)} watchlist{'s' if len(destinations) != 1 else ''}.")
+                    st.rerun()
+
+    with st.expander("Bulk add stocks", expanded=False):
+        st.caption("Paste symbols separated by commas, spaces, or new lines. Only equity instruments from the selected exchange are added.")
+        if st.session_state.pop("watchlist_bulk_clear", False):
+            st.session_state.watchlist_bulk_symbols = ""
+        bulk_text = st.text_area(
+            "Stock symbols",
+            placeholder="HFCL, INDUSTOWER, SAGILITY\nAFFLE, COFORGE, CYIENT",
+            height=120,
+            key="watchlist_bulk_symbols",
+        )
+        bulk_exchange_column, bulk_destination_column = st.columns(2)
+        with bulk_exchange_column:
+            bulk_exchange = st.selectbox("Exchange", ["NSE", "BSE"], key="watchlist_bulk_exchange")
+        with bulk_destination_column:
+            bulk_destinations = [item.name for item in watchlists]
+            bulk_default = st.session_state.get("add_target_watchlist")
+            bulk_default_index = bulk_destinations.index(bulk_default) if bulk_default in bulk_destinations else 0
+            bulk_destination = st.selectbox(
+                "Add to watchlist",
+                bulk_destinations or ["Create a watchlist first"],
+                index=bulk_default_index if bulk_destinations else 0,
+                disabled=not bulk_destinations,
+                key="watchlist_bulk_destination",
+            )
+        parsed_bulk_symbols = parse_bulk_symbols(bulk_text)
+        bulk_rows, missing_bulk_symbols = resolve_bulk_stock_instruments(
+            instruments if instruments is not None else pd.DataFrame(),
+            bulk_text,
+            bulk_exchange,
+        )
+        if parsed_bulk_symbols:
+            found_count = len(bulk_rows)
+            st.caption(f"{len(parsed_bulk_symbols)} unique symbols pasted · {found_count} ready to add")
+        if bulk_rows:
+            st.dataframe(
+                pd.DataFrame(
+                    [{"Symbol": row["symbol"], "Company": row["name"] or "Market instrument", "Exchange": row["exchange"]} for row in bulk_rows]
+                ),
+                width="stretch",
+                hide_index=True,
+                height=min(280, 38 * len(bulk_rows) + 38),
+            )
+        if missing_bulk_symbols:
+            with st.expander(f"Not found on {bulk_exchange} ({len(missing_bulk_symbols)})"):
+                st.caption(", ".join(missing_bulk_symbols))
+        if not parsed_bulk_symbols:
+            st.info("Paste stock symbols above to preview the instruments before adding them.")
+        elif instruments is None or instruments.empty:
+            st.warning("Connect Kite to load the market instrument catalog before using bulk add.")
+        elif not bulk_rows:
+            st.warning(f"None of the pasted symbols matched equity instruments on {bulk_exchange}.")
+        if st.button(
+            f"Add {len(bulk_rows)} stock{'s' if len(bulk_rows) != 1 else ''} to watchlist",
+            type="primary",
+            icon=":material/library_add:",
+            key="watchlist_bulk_add",
+            disabled=not bulk_rows or not bulk_destinations,
+        ):
+            additions = add_instruments_to_watchlists(repository, user_id, watchlists, bulk_rows, [bulk_destination])
+            st.session_state.watchlist_bulk_clear = True
+            st.session_state.add_target_watchlist = bulk_destination
+            st.success(f"Added {additions} new stock{'s' if additions != 1 else ''} to {bulk_destination}.")
+            st.rerun()
+
+    with st.expander("Optional: bulk import an index", expanded=False):
+        st.caption("Useful for starting a list quickly. This is an import shortcut, not the signal universe.")
+        import_index = st.selectbox("Index", SUPPORTED_INDEXES, index=0, key="watchlist_import_index")
+        if st.button("Load constituents", icon=":material/download:", key="watchlist_import_load"):
+            if not broker_credentials_configured(settings) or not access_token:
+                st.error("Connect Kite before importing index constituents.")
+            else:
+                try:
+                    client = connect_kite(settings, access_token)
+                    st.session_state.watchlist_import_universe = load_nifty_index_universe_from_api(client.client, import_index)
+                except (OSError, RuntimeError, ValueError) as error:
+                    st.error(f"Index import could not be loaded: {error}")
+        import_universe = st.session_state.get("watchlist_import_universe")
+        if import_universe is not None:
+            destination_options = [item.name for item in watchlists] + ["Create new watchlist"]
+            destination = st.selectbox("Add imported stocks to", destination_options, key="watchlist_import_destination")
+            if st.button("Add imported stocks", type="primary", icon=":material/add:", key="watchlist_import_add"):
+                if destination == "Create new watchlist":
+                    st.warning("Create a named watchlist above first, then import stocks into it.")
+                else:
+                    existing = next(item for item in watchlists if item.name == destination)
+                    imported_symbols = {f"NSE:{row.symbol}": int(row.instrument_token) for row in import_universe.itertuples()}
+                    repository.update_watchlist_symbols(user_id, destination, {**existing.symbols, **imported_symbols})
+                    st.success(f"Added {len(imported_symbols)} index constituents to {destination}.")
+                    st.rerun()
+
+    st.divider()
+    st.subheader("My watchlists")
+    if not watchlists:
+        st.markdown('<div class="empty">No watchlists yet. Create one above, then add stocks from market search.</div>', unsafe_allow_html=True)
+    else:
+        filter_column, view_column = st.columns([3, 2])
+        with filter_column:
+            watchlist_filter = st.text_input("Find a watchlist", placeholder="Search by list name", key="watchlist_card_filter")
+        with view_column:
+            watchlist_view = st.segmented_control("Show", ["All", "Active", "Empty"], default="All", key="watchlist_card_view")
+        watchlist_view = watchlist_view or "All"
+        visible_watchlists = [
+            item
+            for item in watchlists
+            if (not watchlist_filter.strip() or watchlist_filter.strip().casefold() in item.name.casefold())
+            and (watchlist_view == "All" or (watchlist_view == "Active" and item.selected) or (watchlist_view == "Empty" and not item.symbols))
+        ]
+        st.caption(f"Showing {len(visible_watchlists)} of {len(watchlists)} watchlists")
+        card_columns = st.columns(2)
+        for index, watchlist in enumerate(visible_watchlists):
+            with card_columns[index % 2]:
+                with st.container(border=True):
+                    top, menu = st.columns([5, 1])
+                    with top:
+                        st.markdown(f"### {watchlist.name}")
+                        st.markdown(f'<div class="watchlist-count">{len(watchlist.symbols)} stocks</div>', unsafe_allow_html=True)
+                    with menu:
+                        with st.popover("", icon=":material/more_horiz:", use_container_width=True):
+                            rename_to = st.text_input("Rename", value=watchlist.name, key=f"watchlist_rename_input_{watchlist.name}")
+                            if st.button("Rename", key=f"watchlist_rename_{watchlist.name}", icon=":material/edit:"):
+                                normalized_name = " ".join(rename_to.strip().split())
+                                if not normalized_name:
+                                    st.error("Watchlist name is required.")
+                                elif normalized_name != watchlist.name and any(item.name.casefold() == normalized_name.casefold() for item in watchlists):
+                                    st.error("A watchlist with that name already exists.")
+                                else:
+                                    repository.rename_watchlist(user_id, watchlist.name, normalized_name)
+                                    if st.session_state.get("open_watchlist") == watchlist.name:
+                                        st.session_state.open_watchlist = normalized_name
+                                    st.rerun()
+                            confirm_delete = st.checkbox("Confirm delete", key=f"watchlist_delete_confirm_{watchlist.name}")
+                            if st.button("Delete", key=f"watchlist_delete_{watchlist.name}", icon=":material/delete:", disabled=not confirm_delete):
+                                repository.delete_watchlist(user_id, watchlist.name)
+                                if st.session_state.get("open_watchlist") == watchlist.name:
+                                    st.session_state.pop("open_watchlist", None)
+                                st.rerun()
+                    preview = [split_watchlist_symbol(symbol)[1] for symbol in list(watchlist.symbols)[:5]]
+                    preview_text = " · ".join(preview) if preview else "No stocks added yet"
+                    if len(watchlist.symbols) > 5:
+                        preview_text += f" · +{len(watchlist.symbols) - 5} more"
+                    st.markdown(f'<div class="symbol-preview">{preview_text}</div>', unsafe_allow_html=True)
+                    selected = st.checkbox("Use for Signals", value=watchlist.selected, key=f"watchlist_selected_{watchlist.name}")
+                    if selected != watchlist.selected:
+                        repository.set_watchlist_selection(user_id, watchlist.name, selected)
+                        st.rerun()
+                    view, add_stock = st.columns(2)
+                    with view:
+                        if st.button("View Stocks", key=f"watchlist_view_{watchlist.name}", width="stretch", icon=":material/list:"):
+                            st.session_state.open_watchlist = watchlist.name
+                            st.rerun()
+                    with add_stock:
+                        if st.button("Add Stock", key=f"watchlist_add_{watchlist.name}", width="stretch", icon=":material/add:"):
+                            st.session_state.add_target_watchlist = watchlist.name
+                            st.session_state.watchlist_batch_destinations = [watchlist.name]
+                            st.rerun()
+        if not visible_watchlists:
+            st.markdown('<div class="empty">No watchlists match the current filter.</div>', unsafe_allow_html=True)
+
+    render_dynamic_watchlist(st, settings, repository, user_id, watchlists)
+
+    st.divider()
+    st.subheader("Signal monitoring")
+    if selected_watchlists:
+        selected_names = " · ".join(item.name for item in selected_watchlists)
+        st.markdown(
+            f"<div class='engine-panel'><strong>● Signal engine {engine_label.lower()}</strong><br><span style='color:#53645a'>Selected watchlists: {selected_names}<br>Total unique stocks monitored: <b>{len(selected_symbols)}</b></span></div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown('<div class="empty">Select a watchlist with “Use for Signals” to define the backend signal universe.</div>', unsafe_allow_html=True)
+
+    open_name = st.session_state.get("open_watchlist")
+    if open_name:
+        open_watchlist = next((item for item in repository.load_watchlists(user_id) if item.name == open_name), None)
+        if open_watchlist is not None:
+            render_watchlist_stock_view(st, settings, repository, user_id, open_watchlist, instruments if instruments is not None else pd.DataFrame(columns=["exchange", "tradingsymbol", "name"]))
+
+
+def load_persisted_signal_frame(repository: Repository, user_id: str, limit: int = 100) -> pd.DataFrame:
+    signals = repository.load_signals(user_id, limit)
+    if not signals:
+        return pd.DataFrame(columns=["Symbol", "Side", "Price", "VWAP", "EMA20", "Stop loss", "Candle time", "Reason"])
+    return pd.DataFrame(
+        [
+            {
+                "Symbol": signal.symbol,
+                "TradingView": tradingview_chart_url(signal.symbol),
+                "Side": signal.side,
+                "Price": signal.price,
+                "VWAP": signal.vwap,
+                "EMA20": signal.ema20,
+                "Stop loss": signal.stop_loss,
+                "Candle time": signal.signal_timestamp,
+                "Reason": signal.reason,
+            }
+            for signal in signals
+        ]
+    )
+
+
+def tradingview_chart_url(symbol: str) -> str:
+    exchange, tradingsymbol = split_watchlist_symbol(symbol)
+    return f"https://in.tradingview.com/chart/?symbol={quote(f'{exchange}:{tradingsymbol}', safe='')}"
+
+
+def start_dashboard_signal_engine(
+    st,
+    settings,
+    access_token: str,
+    user_id: str,
+    selected_strategy: str = EMA_PROGRESSIVE_LIVE_LABEL,
+    pre_spike_config: PreSpikeMomentumConfig | None = None,
+):
+    engine = st.session_state.get("dashboard_signal_engine")
+    if engine is not None and engine.running:
+        return engine
+    if engine is not None:
+        stale_database = st.session_state.pop("dashboard_signal_database", None)
+        if stale_database is not None:
+            stale_database.close()
+        st.session_state.pop("dashboard_signal_engine", None)
+    strategy = build_live_signal_strategy(selected_strategy, settings.signal_timeframe, pre_spike_config)
+    engine, database = build_signal_engine(
+        settings,
+        access_token,
+        user_id=user_id,
+        strategy=strategy,
+        legacy_signals_enabled=False,
+        enable_progressive_strategy=selected_strategy == EMA_PROGRESSIVE_LIVE_LABEL,
+    )
+    engine.start()
+    st.session_state.dashboard_signal_engine = engine
+    st.session_state.dashboard_signal_database = database
+    st.session_state.dashboard_signal_strategy = selected_strategy
+    st.session_state.dashboard_pre_spike_config = pre_spike_config
+    return engine
+
+
+def stop_dashboard_signal_engine(st) -> None:
+    engine = st.session_state.pop("dashboard_signal_engine", None)
+    database = st.session_state.pop("dashboard_signal_database", None)
+    stopped = True
+    if engine is not None:
+        stopped = engine.stop()
+    if database is not None and stopped:
+        database.close()
+    elif database is not None:
+        # Keep the connection alive until the worker finishes its current broker call.
+        st.session_state.dashboard_signal_database = database
+        st.session_state.dashboard_signal_engine = engine
+
+
+def render_pre_spike_signal_table(st, repository: Repository, user_id: str) -> None:
+    events = repository.load_pre_spike_events(user_id, PreSpikeMomentumStrategy.name, active_only=False, limit=100)
+    st.markdown('<div class="eyebrow">Pre-Spike Momentum</div>', unsafe_allow_html=True)
+    st.caption("Completed 5-minute candles only. Signals require price expansion or breakout plus a demand condition.")
+    if not events:
+        st.caption("No PRE_SPIKE_MOMENTUM events are available for the selected watchlists.")
+        return
+    rows = []
+    for event in events:
+        metrics = event.latest_metadata
+        rows.append(
+            {
+                "Stock": event.symbol,
+                "TradingView": tradingview_chart_url(event.symbol),
+                "Signal": metrics.get("signal_type", "EARLY_MOMENTUM"),
+                "Status": event.status,
+                "Event ID": event.event_id,
+                "Score": event.latest_score,
+                "Highest score": event.highest_score,
+                "Current price": event.latest_price,
+                "Entry": event.entry_price,
+                "RVOL": metrics.get("rvol"),
+                "5m change %": metrics.get("price_change_pct"),
+                "VWAP": metrics.get("vwap"),
+                "EMA9": metrics.get("ema9"),
+                "EMA20": metrics.get("ema20"),
+                "EMA50": metrics.get("ema50"),
+                "EMA200": metrics.get("ema200"),
+                "PDH breakout": "Yes" if metrics.get("previous_day_breakout") else "No",
+                "20D high breakout": "Yes" if metrics.get("twenty_day_breakout") else "No",
+                "Volume buildup": metrics.get("volume_buildup_ratio"),
+                "Compression": "Yes" if metrics.get("range_compression") else "No",
+                "Close location": metrics.get("close_location"),
+                "Trigger time": event.trigger_time,
+                "Latest time": event.latest_time,
+                "Reason": event.reason,
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        height=520,
+        hide_index=True,
+        column_config={
+            "TradingView": st.column_config.LinkColumn("TradingView", display_text="Open chart"),
+            "Status": st.column_config.TextColumn(),
+            "Score": st.column_config.NumberColumn(format="%d/100"),
+            "Highest score": st.column_config.NumberColumn(format="%d/100"),
+            "Current price": st.column_config.NumberColumn(format="₹%.2f"),
+            "Entry": st.column_config.NumberColumn(format="₹%.2f"),
+            "RVOL": st.column_config.NumberColumn(format="%.2fx"),
+            "5m change %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Volume buildup": st.column_config.NumberColumn(format="%.2fx"),
+            "Close location": st.column_config.NumberColumn(format="%.0%%"),
+            "VWAP": st.column_config.NumberColumn(format="₹%.2f"),
+            "EMA9": st.column_config.NumberColumn(format="₹%.2f"),
+            "EMA20": st.column_config.NumberColumn(format="₹%.2f"),
+            "EMA50": st.column_config.NumberColumn(format="₹%.2f"),
+            "EMA200": st.column_config.NumberColumn(format="₹%.2f"),
+        },
+    )
+
+
+def render_previous_day_high_signal_table(st, repository: Repository, user_id: str) -> None:
+    signals = [
+        signal
+        for signal in repository.load_signals(user_id, 100)
+        if signal.strategy == PreviousDayHighBreakoutStrategy.name
+    ]
+    st.markdown('<div class="eyebrow">Previous-day high breakout</div>', unsafe_allow_html=True)
+    st.caption("BUY signals trigger when a completed 5-minute candle crosses above the previous trading day's high.")
+    if not signals:
+        st.caption("No previous-day high breakout signals are available for the selected watchlists.")
+        return
+    table = pd.DataFrame(
+        [
+            {
+                "Stock": signal.symbol,
+                "TradingView": tradingview_chart_url(signal.symbol),
+                "Current price": signal.price,
+                "Previous day high": signal.metadata.get("previous_day_high"),
+                "Stop loss": signal.stop_loss,
+                "Trigger time": signal.signal_timestamp,
+                "Reason": signal.reason,
+            }
+            for signal in signals
+        ]
+    )
+    st.dataframe(
+        table,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "TradingView": st.column_config.LinkColumn("TradingView", display_text="Open chart"),
+            "Current price": st.column_config.NumberColumn(format="₹%.2f"),
+            "Previous day high": st.column_config.NumberColumn(format="₹%.2f"),
+            "Stop loss": st.column_config.NumberColumn(format="₹%.2f"),
+            "Trigger time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
+        },
+    )
+
+
+def render_ema200_close_signal_table(st, repository: Repository, user_id: str) -> None:
+    signals = repository.load_signals(user_id, 100, strategy=Ema200CloseStrategy.name)
+    st.markdown('<div class="eyebrow">EMA 200 close-above signals</div>', unsafe_allow_html=True)
+    st.caption("BUY signals trigger on every newly completed candle whose close is above EMA 200.")
+    if not signals:
+        st.caption("No EMA 200 close-above signals are available for the selected watchlists.")
+        return
+    rows = []
+    for signal in signals:
+        ema200 = signal.metadata.get("ema200")
+        distance = ((signal.price / float(ema200)) - 1) * 100 if ema200 else None
+        rows.append(
+            {
+                "Stock": signal.symbol,
+                "TradingView": tradingview_chart_url(signal.symbol),
+                "Signal": signal.side,
+                "Current price": signal.price,
+                "EMA200": ema200,
+                "Distance above EMA200": distance,
+                "Candle open": signal.metadata.get("candle_open"),
+                "Candle high": signal.metadata.get("candle_high"),
+                "Candle low": signal.metadata.get("candle_low"),
+                "Trigger time": signal.signal_timestamp,
+                "Reason": signal.reason,
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        height=520,
+        hide_index=True,
+        column_config={
+            "TradingView": st.column_config.LinkColumn("TradingView", display_text="Open chart"),
+            "Current price": st.column_config.NumberColumn(format="₹%.2f"),
+            "EMA200": st.column_config.NumberColumn(format="₹%.2f"),
+            "Distance above EMA200": st.column_config.NumberColumn(format="%.2f%%"),
+            "Candle open": st.column_config.NumberColumn(format="₹%.2f"),
+            "Candle high": st.column_config.NumberColumn(format="₹%.2f"),
+            "Candle low": st.column_config.NumberColumn(format="₹%.2f"),
+            "Trigger time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
+        },
+    )
+
+
+def render_high_conviction_signal_table(st, repository: Repository, user_id: str) -> None:
+    signals = repository.load_signals(user_id, 100, strategy=HighConvictionLongStrategy.name)
+    st.markdown('<div class="eyebrow">High-conviction long signals</div>', unsafe_allow_html=True)
+    st.caption("Signals require a completed 5-minute candle with breakout, volume expansion, trend alignment, VWAP, and bullish candle confirmation.")
+    if not signals:
+        st.caption("No high-conviction long signals are available for the selected watchlists.")
+        return
+    rows = []
+    for signal in signals:
+        metadata = signal.metadata
+        rows.append(
+            {
+                "Stock": signal.symbol,
+                "TradingView": tradingview_chart_url(signal.symbol),
+                "Score": signal.score,
+                "Entry": signal.price,
+                "Stop loss": signal.stop_loss,
+                "Target 1": signal.target_1,
+                "Target 2": signal.target_2,
+                "RVOL": metadata.get("relative_volume"),
+                "VWAP": metadata.get("vwap"),
+                "EMA9": metadata.get("ema9"),
+                "EMA20": metadata.get("ema20"),
+                "EMA50": metadata.get("ema50"),
+                "EMA200": metadata.get("ema200"),
+                "5m change %": metadata.get("price_change_percent"),
+                "Candle strength": metadata.get("candle_strength"),
+                "Trigger time": signal.signal_timestamp,
+                "Reason": signal.reason,
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        height=520,
+        hide_index=True,
+        column_config={
+            "TradingView": st.column_config.LinkColumn("TradingView", display_text="Open chart"),
+            "Score": st.column_config.NumberColumn(format="%d/100"),
+            "Entry": st.column_config.NumberColumn(format="₹%.2f"),
+            "Stop loss": st.column_config.NumberColumn(format="₹%.2f"),
+            "Target 1": st.column_config.NumberColumn(format="₹%.2f"),
+            "Target 2": st.column_config.NumberColumn(format="₹%.2f"),
+            "RVOL": st.column_config.NumberColumn(format="%.2fx"),
+            "VWAP": st.column_config.NumberColumn(format="₹%.2f"),
+            "EMA9": st.column_config.NumberColumn(format="₹%.2f"),
+            "EMA20": st.column_config.NumberColumn(format="₹%.2f"),
+            "EMA50": st.column_config.NumberColumn(format="₹%.2f"),
+            "EMA200": st.column_config.NumberColumn(format="₹%.2f"),
+            "5m change %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Candle strength": st.column_config.NumberColumn(format="%.0%%"),
+            "Trigger time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
+        },
+    )
+
+
+def backup_and_clear_signal_state(st, settings) -> tuple[bytes, dict[str, int]]:
+    stop_dashboard_signal_engine(st)
+
+    repository = get_dashboard_repository(st)
+    user_id = dashboard_user_id(settings)
+    backup, counts = repository.backup_and_clear_signal_state(user_id)
+    return json.dumps(backup, indent=2, default=str).encode("utf-8"), counts
+
+
+def create_swing_auto_trader(client, mode, trailing_multiplier: float, strategy_name: str):
+    try:
+        return SwingAutoTrader(client, mode, trailing_multiplier, strategy_name)
+    except TypeError as error:
+        if "positional arguments" not in str(error) or "SwingAutoTrader.__init__" not in str(error):
+            raise
+        # Streamlit can retain the imported class while source files hot-reload.
+        import importlib
+        import app.execution.swing_auto_trader as swing_auto_trader_module
+
+        refreshed_module = importlib.reload(swing_auto_trader_module)
+        return refreshed_module.SwingAutoTrader(client, mode, trailing_multiplier, strategy_name)
+
+
+def render_swing_auto_trading(st, settings) -> None:
+    @st.fragment(run_every=60)
+    def render_swing_content() -> None:
+        st.markdown('<div class="eyebrow">Daily trend execution</div>', unsafe_allow_html=True)
+        st.title("Swing auto trading")
+        st.caption("Scans completed daily candles for a fresh EMA 9 cross above EMA 200 and manages a CNC position with a Zerodha-side trailing SL-M order.")
+        repository = get_dashboard_repository(st)
+        user_id = dashboard_user_id(settings)
+        selected_symbols = selected_watchlist_symbols(repository, user_id)
+        selected_watchlists = repository.load_watchlists(user_id, selected_only=True)
+        selected_strategy_label = st.selectbox(
+            "Swing strategy",
+            list(SWING_STRATEGIES),
+            key="swing_strategy",
+        )
+        selected_strategy_name = SWING_STRATEGIES[selected_strategy_label]
+
+        amount_column, quantity_column, trail_column = st.columns(3)
+        amount_limit = amount_column.number_input(
+            "Maximum capital per position",
+            min_value=1.0,
+            max_value=10_000_000.0,
+            value=100_000.0,
+            step=1_000.0,
+            format="%.2f",
+            key="swing_amount_limit",
+        )
+        quantity_limit = quantity_column.number_input(
+            "Maximum quantity per position",
+            min_value=1,
+            max_value=1_000_000,
+            value=100,
+            step=1,
+            key="swing_quantity_limit",
+        )
+        trailing_multiplier = trail_column.number_input(
+            "Trailing stop ATR multiplier",
+            min_value=0.5,
+            max_value=10.0,
+            value=2.0,
+            step=0.25,
+            key="swing_trailing_atr_multiplier",
+        )
+        warmup_period = 200 if selected_strategy_name == "EMA 9/200 swing" else SwingTrendBreakoutStrategy().warmup_period
+        st.caption(f"Universe: {len(selected_symbols)} stocks from {len(selected_watchlists)} selected watchlists · Timeframe: daily · Warm-up: {warmup_period} completed candles")
+        if not selected_symbols:
+            st.info("Select at least one watchlist on the Watchlists page before scanning.", icon=":material/list_alt:")
+            return
+
+        access_token = runtime_access_token(st, settings)
+        if not broker_credentials_configured(settings) or not access_token:
+            st.info("Authenticate with Kite before using the swing scanner.", icon=":material/key:")
+            return
+        try:
+            client = connect_kite(settings, access_token)
+        except (OSError, RuntimeError, ValueError) as error:
+            st.error(f"Kite connection could not be established: {error}")
+            return
+
+        trader = st.session_state.get("swing_auto_trader")
+        previous_strategy_name = st.session_state.get("swing_strategy_name")
+        if previous_strategy_name != selected_strategy_name:
+            st.session_state.swing_strategy_name = selected_strategy_name
+            st.session_state.swing_scan_result = None
+        if trader is None:
+            trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name)
+            st.session_state.swing_auto_trader = trader
+        elif getattr(trader, "strategy_name", "EMA 9/200 swing") != selected_strategy_name:
+            if hasattr(trader, "set_strategy"):
+                trader.set_strategy(selected_strategy_name)
+            else:
+                # Migrate an instance created before selectable swing strategies existed.
+                legacy_positions = getattr(trader, "active_positions", {})
+                legacy_signal_keys = getattr(trader, "submitted_signal_keys", set())
+                legacy_open_symbols = getattr(trader, "broker_open_symbols", set())
+                legacy_pending_entries = getattr(trader, "pending_entries", {})
+                trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name)
+                trader.active_positions.update(legacy_positions)
+                trader.submitted_signal_keys.update(legacy_signal_keys)
+                trader.broker_open_symbols.update(legacy_open_symbols)
+                trader.pending_entries.update(legacy_pending_entries)
+                st.session_state.swing_auto_trader = trader
+        trader.mode = settings.trading_mode
+        trader.orders.mode = settings.trading_mode
+        trader.trailing_atr_multiplier = float(trailing_multiplier)
+        if hasattr(trader.strategy, "trailing_atr_multiplier"):
+            trader.strategy.trailing_atr_multiplier = float(trailing_multiplier)
+        scan_day = pd.Timestamp.now(tz="Asia/Kolkata").date().isoformat()
+        trader.tick_sizes = {}
+        try:
+            trader.tick_sizes = load_swing_tick_sizes_cached(client.client, access_token)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+            st.error(f"Instrument tick-size metadata unavailable; live entries will be blocked until it can be verified: {error}")
+
+        live_confirmed = st.checkbox(
+            "I understand this can place real CNC orders and modify Zerodha-side stop orders.",
+            key="swing_live_confirmation",
+            disabled=settings.trading_mode != TradingMode.LIVE,
+        )
+        if settings.trading_mode == TradingMode.LIVE:
+            st.warning("LIVE mode is active. Starting the scanner can place real CNC BUY orders and SL-M protective orders in Zerodha.", icon=":material/warning:")
+        else:
+            st.info("PAPER mode is active. Swing auto execution is disabled; switch to LIVE mode only after validating the scanner.", icon=":material/science:")
+
+        enabled = bool(st.session_state.get("swing_auto_enabled", False))
+        kill_switch_active = bool(st.session_state.get("swing_kill_switch", False))
+        start_column, stop_column, scan_column = st.columns([2, 1, 1])
+        with start_column:
+            if st.button(
+                "Start swing auto trading",
+                type="primary",
+                icon=":material/play_arrow:",
+                width="stretch",
+                disabled=enabled or settings.trading_mode != TradingMode.LIVE or not live_confirmed,
+            ):
+                st.session_state.swing_auto_enabled = True
+                st.session_state.swing_kill_switch = False
+                st.session_state.swing_last_scan_day = None
+                st.rerun()
+        with stop_column:
+            if st.button(
+                "KILL SWITCH",
+                icon=":material/power_settings_new:",
+                type="secondary",
+                width="stretch",
+                disabled=not enabled,
+                help="Immediately stop automatic scans and new swing orders. Existing broker-side protective stops remain active.",
+            ):
+                st.session_state.swing_auto_enabled = False
+                st.session_state.swing_kill_switch = True
+                st.session_state.swing_scan_result = None
+                st.rerun()
+        with scan_column:
+            manual_scan = st.button("Run scan now", icon=":material/search:", width="stretch")
+
+        status_label = "running" if enabled else "stopped"
+        st.markdown(
+            f"<div class='engine-panel'><strong>● Swing scanner {status_label}</strong><br><span style='color:#53645a'>{selected_strategy_label} · Completed daily candles · Max capital ₹{amount_limit:,.0f} per position · Max quantity {int(quantity_limit)} shares</span></div>",
+            unsafe_allow_html=True,
+        )
+
+        try:
+            trader.sync_broker_positions()
+        except Exception as error:
+            st.warning(f"Broker position sync paused: {error}")
+
+        trailing_events = []
+        for symbol, position in list(trader.active_positions.items()):
+            try:
+                candles = load_swing_daily_candles_cached(client.client, access_token, position.instrument_token, scan_day)
+                position_strategy = getattr(position, "strategy_name", "EMA 9/200 swing")
+                if position_strategy == "SWING_TREND_BREAKOUT":
+                    outcome = trader.manage_position(symbol, candles)
+                    if outcome is not None:
+                        trailing_events.append(f"{symbol}: {outcome.reason}")
+                else:
+                    new_stop = trader.trail_position(symbol, candles)
+                    if new_stop is not None:
+                        trailing_events.append(f"{symbol}: stop moved to ₹{new_stop:,.2f}")
+            except Exception as error:
+                st.warning(f"Trailing stop update failed for {symbol}: {error}")
+        if trailing_events:
+            st.success(" · ".join(trailing_events), icon=":material/trending_up:")
+
+        auto_enabled = bool(st.session_state.get("swing_auto_enabled", False)) and not bool(st.session_state.get("swing_kill_switch", False))
+        should_scan = manual_scan or auto_enabled
+        if should_scan:
+            with st.spinner(f"Loading daily history and scanning {selected_strategy_label}..."):
+                result = trader.scan(
+                    selected_symbols,
+                    lambda instrument_token: load_swing_daily_candles_cached(client.client, access_token, instrument_token, scan_day),
+                )
+            st.session_state.swing_scan_result = result
+            st.session_state.swing_last_scan_day = scan_day
+            if auto_enabled and settings.trading_mode == TradingMode.LIVE and live_confirmed:
+                available_slots = max(0, int(settings.max_open_positions) - len(trader.active_positions))
+                for candidate in result.candidates[:available_slots]:
+                    outcome = trader.submit_candidate(candidate, float(amount_limit), int(quantity_limit))
+                    if outcome.status == "submitted":
+                        st.success(f"{outcome.symbol}: {outcome.reason} · quantity {outcome.quantity}", icon=":material/check_circle:")
+                    elif outcome.status == "submitted_unprotected":
+                        st.error(f"{outcome.symbol}: {outcome.reason}")
+                    elif outcome.status == "entry_pending":
+                        st.info(f"{outcome.symbol}: {outcome.reason}")
+                    elif outcome.status == "flattened_after_protective_stop_failure":
+                        st.error(f"{outcome.symbol}: {outcome.reason}")
+                    elif outcome.status == "critical_unprotected":
+                        st.error(f"CRITICAL {outcome.symbol}: {outcome.reason}")
+                    elif outcome.status == "rejected":
+                        st.error(f"{outcome.symbol}: {outcome.reason}")
+
+        result = st.session_state.get("swing_scan_result")
+        result_strategy_name = getattr(result, "strategy_name", "EMA 9/200 swing") if result is not None else None
+        if result is not None and result_strategy_name == selected_strategy_name:
+            st.subheader(selected_strategy_label)
+            if result.candidates:
+                candidate_rows = []
+                stale_candidate_count = 0
+                for candidate in result.candidates:
+                    signal = candidate.signal
+                    if signal is None:
+                        continue
+                    candidate_quantity = min(int(quantity_limit), int(amount_limit // signal.price))
+                    if selected_strategy_name == "SWING_TREND_BREAKOUT":
+                        evaluation = candidate.evaluation
+                        if not all(
+                            hasattr(evaluation, attribute)
+                            for attribute in (
+                                "classification",
+                                "score",
+                                "breakout_level",
+                                "swing_low",
+                                "volume_ratio",
+                                "rsi14",
+                                "adx14",
+                            )
+                        ):
+                            stale_candidate_count += 1
+                            continue
+                        candidate_rows.append(
+                            {
+                                "Stock": candidate.symbol,
+                                "TradingView": tradingview_chart_url(candidate.symbol),
+                                "State": "CONFIRMED_BUY",
+                                "Classification": evaluation.classification,
+                                "Score": evaluation.score,
+                                "Close": signal.price,
+                                "Breakout high": evaluation.breakout_level,
+                                "Swing low": evaluation.swing_low,
+                                "Volume ratio": evaluation.volume_ratio,
+                                "RSI14": evaluation.rsi14,
+                                "ADX14": evaluation.adx14,
+                                "Initial stop": signal.stop_loss,
+                                "Target 1 (2R)": signal.target_1,
+                                "Quantity": candidate_quantity,
+                                "Cross candle": signal.timestamp,
+                            }
+                        )
+                        continue
+                    candidate_rows.append(
+                        {
+                            "Stock": candidate.symbol,
+                            "TradingView": tradingview_chart_url(candidate.symbol),
+                            "Close": signal.price,
+                            "EMA9": candidate.evaluation.ema9,
+                            "EMA200": candidate.evaluation.ema200,
+                            "ATR14": candidate.evaluation.atr,
+                            "Initial stop": signal.stop_loss,
+                            "Quantity": candidate_quantity,
+                            "Capital": candidate_quantity * signal.price,
+                            "Cross candle": signal.timestamp,
+                        }
+                    )
+                if stale_candidate_count:
+                    st.session_state.swing_scan_result = None
+                    st.warning("A stale scan result from the previous swing strategy was discarded. Run the scan again.")
+                st.dataframe(
+                    pd.DataFrame(candidate_rows),
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "TradingView": st.column_config.LinkColumn("TradingView", display_text="Open chart"),
+                        "Close": st.column_config.NumberColumn(format="₹%.2f"),
+                        "EMA9": st.column_config.NumberColumn(format="₹%.2f"),
+                        "EMA200": st.column_config.NumberColumn(format="₹%.2f"),
+                        "ATR14": st.column_config.NumberColumn(format="₹%.2f"),
+                        "Initial stop": st.column_config.NumberColumn(format="₹%.2f"),
+                        "Capital": st.column_config.NumberColumn(format="₹%.2f"),
+                        "Cross candle": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
+                    },
+                )
+            else:
+                st.caption("No executable candidate was found in the selected watchlists.")
+            pending_candidates = getattr(result, "pending_candidates", ())
+            if pending_candidates and selected_strategy_name == "SWING_TREND_BREAKOUT":
+                valid_pending_candidates = [
+                    candidate
+                    for candidate in pending_candidates
+                    if all(
+                        hasattr(candidate.evaluation, attribute)
+                        for attribute in (
+                            "classification",
+                            "score",
+                            "breakout_level",
+                            "swing_low",
+                            "volume_ratio",
+                            "rsi14",
+                            "adx14",
+                        )
+                    )
+                ]
+                if len(valid_pending_candidates) != len(pending_candidates):
+                    st.session_state.swing_scan_result = None
+                    st.warning("A stale pending breakout result was discarded. Run the scan again.")
+                pending_candidates = valid_pending_candidates
+            if pending_candidates and selected_strategy_name == "SWING_TREND_BREAKOUT":
+                st.subheader("Breakout candidates awaiting next-session confirmation")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Stock": candidate.symbol,
+                                "TradingView": tradingview_chart_url(candidate.symbol),
+                                "State": "SWING_CANDIDATE",
+                                "Classification": candidate.evaluation.classification,
+                                "Score": candidate.evaluation.score,
+                                "Breakout high": candidate.evaluation.breakout_level,
+                                "Swing low": candidate.evaluation.swing_low,
+                                "Volume ratio": candidate.evaluation.volume_ratio,
+                                "RSI14": candidate.evaluation.rsi14,
+                                "ADX14": candidate.evaluation.adx14,
+                                "Candidate candle": candidate.evaluation.timestamp,
+                            }
+                            for candidate in pending_candidates
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "TradingView": st.column_config.LinkColumn("TradingView", display_text="Open chart"),
+                        "Breakout high": st.column_config.NumberColumn(format="₹%.2f"),
+                        "Swing low": st.column_config.NumberColumn(format="₹%.2f"),
+                        "Volume ratio": st.column_config.NumberColumn(format="%.2fx"),
+                        "RSI14": st.column_config.NumberColumn(format="%.2f"),
+                        "ADX14": st.column_config.NumberColumn(format="%.2f"),
+                        "Candidate candle": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
+                    },
+                )
+            if result.errors:
+                st.warning(" · ".join(result.errors[:5]))
+            insufficient_history = getattr(result, "insufficient_history", ())
+            if insufficient_history:
+                st.info(
+                    f"Skipped {len(insufficient_history)} stock(s) without {warmup_period} completed daily candles: "
+                    + ", ".join(insufficient_history[:10])
+                )
+
+        if trader.active_positions:
+            st.subheader("Open swing positions")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Stock": position.symbol,
+                            "Quantity": position.quantity,
+                            "Entry": position.entry_price,
+                            "Trailing stop": position.stop_loss,
+                            "Target 1": getattr(position, "target_1", None),
+                            "Partial booked": getattr(position, "partial_profit_booked", False),
+                            "Zerodha entry order": position.order_id,
+                            "Zerodha stop order": position.protective_order_id,
+                            "Entry candle": position.entry_timestamp,
+                        }
+                        for position in trader.active_positions.values()
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Entry": st.column_config.NumberColumn(format="₹%.2f"),
+                    "Trailing stop": st.column_config.NumberColumn(format="₹%.2f"),
+                    "Target 1": st.column_config.NumberColumn(format="₹%.2f"),
+                    "Entry candle": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
+                },
+            )
+            st.caption("Stopping the scanner does not cancel these Zerodha-side protective orders. Manage or close swing positions from Zerodha; daily stop ratchets run while this page session is active.")
+
+    render_swing_content()
+
+
+def render_historical_day_scan(st, settings) -> None:
+    st.markdown('<div class="eyebrow">Historical daily research</div>', unsafe_allow_html=True)
+    st.title("Historical day scan")
+    st.caption("Choose a watchlist, strategy, and completed date to evaluate every stock using only daily candles available through that date.")
+    repository = get_dashboard_repository(st)
+    user_id = dashboard_user_id(settings)
+    watchlists = repository.load_watchlists(user_id)
+    if not watchlists:
+        st.info("Create a watchlist on the Watchlists page before running a historical scan.", icon=":material/list_alt:")
+        return
+
+    watchlist_names = [watchlist.name for watchlist in watchlists]
+    selected_watchlist_name = st.selectbox("Watchlist", watchlist_names, key="historical_scan_watchlist")
+    selected_watchlist = next(item for item in watchlists if item.name == selected_watchlist_name)
+    strategy_label = st.selectbox("Daily strategy", list(DAILY_SCAN_STRATEGIES), key="historical_scan_strategy")
+    selected_date = st.date_input(
+        "Completed trading date",
+        value=pd.Timestamp.now(tz="Asia/Kolkata").date() - timedelta(days=1),
+        max_value=pd.Timestamp.now(tz="Asia/Kolkata").date() - timedelta(days=1),
+        key="historical_scan_date",
+    )
+    st.caption(f"{len(selected_watchlist.symbols)} stocks · {strategy_label} · {selected_date.isoformat()} · 600 calendar days of daily history loaded per stock")
+    if not selected_watchlist.symbols:
+        st.info("The selected watchlist has no stocks.", icon=":material/inventory_2:")
+        return
+
+    access_token = runtime_access_token(st, settings)
+    if not broker_credentials_configured(settings) or not access_token:
+        st.info("Authenticate with Kite before loading historical daily candles.", icon=":material/key:")
+        return
+    context = (selected_watchlist_name, strategy_label, selected_date.isoformat())
+    results_placeholder = st.empty()
+    scan_requested = st.button("Scan selected date", type="primary", icon=":material/search:", width="stretch")
+    if scan_requested:
+        results_placeholder.empty()
+        try:
+            client = connect_kite(settings, access_token)
+            strategy = DAILY_SCAN_STRATEGIES[strategy_label]()
+            frames: dict[int, pd.DataFrame] = {}
+            frame_errors: dict[int, Exception] = {}
+
+            def load_symbol(token: int) -> tuple[int, pd.DataFrame | None, Exception | None]:
+                try:
+                    return token, load_historical_daily_candles_from_client(client.client, token, selected_date), None
+                except Exception as error:
+                    return token, None, error
+
+            with st.spinner("Loading daily history and evaluating every stock..."):
+                worker_count = min(DYNAMIC_MAX_WORKERS, len(selected_watchlist.symbols))
+                total_symbols = len(selected_watchlist.symbols)
+                token_symbols = {int(token): symbol for symbol, token in selected_watchlist.symbols.items()}
+                progress_bar = st.progress(
+                    0.0,
+                    text=f"Loading daily history: 0/{total_symbols} complete · {total_symbols} remaining",
+                )
+                loading_list = st.empty()
+                stock_states = {symbol: "Queued" for symbol in selected_watchlist.symbols}
+                completed_symbols: list[str] = []
+
+                def update_loading_list(current_symbol: str | None = None) -> None:
+                    pending = [symbol for symbol, state in stock_states.items() if state in {"Queued", "Loading"}]
+                    recent = completed_symbols[-20:]
+                    lines = []
+                    if current_symbol:
+                        lines.append(f"Latest completed: {current_symbol}")
+                    if pending:
+                        lines.append(f"Pending ({len(pending)}): {', '.join(pending[:20])}")
+                    if recent:
+                        lines.append("Completed recently: " + ", ".join(recent))
+                    loading_list.info("\n\n".join(lines) if lines else "All stocks loaded.", icon=":material/downloading:")
+
+                with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="historical-day-scan") as executor:
+                    futures = [executor.submit(load_symbol, int(token)) for token in selected_watchlist.symbols.values()]
+                    update_loading_list()
+                    completed_count = 0
+                    for future in as_completed(futures):
+                        token, frame, error = future.result()
+                        symbol = token_symbols[token]
+                        completed_count += 1
+                        if frame is not None:
+                            frames[token] = frame
+                            stock_states[symbol] = "Loaded"
+                            completed_symbols.append(symbol)
+                        if error is not None:
+                            frame_errors[token] = error
+                            stock_states[symbol] = "Error"
+                            completed_symbols.append(f"{symbol} (error)")
+                        progress_bar.progress(
+                            completed_count / total_symbols if total_symbols else 1.0,
+                            text=f"Loading {symbol}: {completed_count}/{total_symbols} complete · {total_symbols - completed_count} remaining",
+                        )
+                        update_loading_list()
+                progress_bar.progress(1.0, text=f"Daily history loaded: {total_symbols}/{total_symbols} complete · 0 remaining")
+                loading_list.success("All stocks loaded. Evaluating strategy conditions...", icon=":material/check_circle:")
+
+                def candle_loader(token: int) -> pd.DataFrame:
+                    if token in frame_errors:
+                        raise frame_errors[token]
+                    return frames.get(token, pd.DataFrame())
+
+                result = scan_historical_watchlist(selected_date, selected_watchlist.symbols, strategy, candle_loader)
+            loading_errors = tuple(
+                f"{symbol}: {frame_errors[token]}"
+                for symbol, token in selected_watchlist.symbols.items()
+                if token in frame_errors
+            )
+            result = HistoricalScanResult(result.matches, loading_errors + result.errors, result.scanned)
+            st.session_state.historical_day_scan_result = result
+            st.session_state.historical_day_scan_context = context
+        except (OSError, RuntimeError, ValueError) as error:
+            st.error(f"Historical scan could not be completed: {error}")
+            return
+
+    with results_placeholder.container():
+        result = st.session_state.get("historical_day_scan_result")
+        if st.session_state.get("historical_day_scan_context") != context or result is None:
+            st.info("Run the scan to evaluate every stock in the selected watchlist.", icon=":material/play_arrow:")
+            return
+
+        st.metric("Matching stocks", len(result.matches), f"of {result.scanned} scanned")
+        if result.matches:
+            rows = []
+            for match in result.matches:
+                metadata = match["metadata"]
+                rows.append(
+                    {
+                        "Stock": match["symbol"],
+                        "TradingView": tradingview_chart_url(match["symbol"]),
+                        "Signal": match["side"],
+                        "Close": match["price"],
+                        "EMA9": match["ema9"],
+                        "EMA20": match["ema20"],
+                        "EMA200": match["ema200"],
+                        "ATR14": match["atr"],
+                        "Stop loss": match["stop_loss"],
+                        "Previous day high": metadata.get("previous_day_high"),
+                        "Trigger candle": match["timestamp"],
+                        "Reason": match["reason"],
+                    }
+                )
+            table = pd.DataFrame(rows)
+            st.dataframe(
+                table,
+                width="stretch",
+                height=600,
+                hide_index=True,
+                column_config={
+                    "TradingView": st.column_config.LinkColumn("TradingView", display_text="Open chart"),
+                    "Close": st.column_config.NumberColumn(format="₹%.2f"),
+                    "EMA9": st.column_config.NumberColumn(format="₹%.2f"),
+                    "EMA20": st.column_config.NumberColumn(format="₹%.2f"),
+                    "EMA200": st.column_config.NumberColumn(format="₹%.2f"),
+                    "ATR14": st.column_config.NumberColumn(format="₹%.2f"),
+                    "Stop loss": st.column_config.NumberColumn(format="₹%.2f"),
+                    "Previous day high": st.column_config.NumberColumn(format="₹%.2f"),
+                    "Trigger candle": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
+                },
+            )
+            st.download_button(
+                "Download scan results",
+                data=table.to_csv(index=False).encode("utf-8"),
+                file_name=f"historical-day-scan-{selected_watchlist_name}-{selected_date.isoformat()}.csv",
+                mime="text/csv",
+                icon=":material/download:",
+            )
+        else:
+            st.info("No stocks met the selected strategy condition on this date.", icon=":material/search_off:")
+        if result.errors:
+            st.warning("Some stocks could not be evaluated: " + " · ".join(result.errors[:10]))
+
+
+def render_signal_feed(st, settings) -> None:
+    @st.fragment(run_every=5)
+    def render_live_signal_feed() -> None:
+        render_signal_feed_content(st, settings)
+
+    render_live_signal_feed()
+
+
+def render_signal_feed_content(st, settings) -> None:
+    st.markdown('<div class="eyebrow">Backend signal feed</div>', unsafe_allow_html=True)
+    st.title("Scanner & signals")
+    st.caption("Start the signal engine here. It continuously scans your selected watchlists and saves BUY/SELL signals while this dashboard is running.")
+    repository = get_dashboard_repository(st)
+    user_id = dashboard_user_id(settings)
+    selected = selected_watchlist_symbols(repository, user_id)
+    selected_watchlists = repository.load_watchlists(user_id, selected_only=True)
+    selected_live_strategy = st.segmented_control(
+        "Live strategy",
+        [EMA_PROGRESSIVE_LIVE_LABEL, PRE_SPIKE_LIVE_LABEL, PREVIOUS_DAY_HIGH_LABEL, EMA_200_CLOSE_LIVE_LABEL, HIGH_CONVICTION_LIVE_LABEL],
+        default=EMA_PROGRESSIVE_LIVE_LABEL,
+        key="live_signal_strategy_selection",
+    ) or EMA_PROGRESSIVE_LIVE_LABEL
+    pre_spike_config = render_pre_spike_config(st, "live_pre_spike") if selected_live_strategy == PRE_SPIKE_LIVE_LABEL else None
+    active_live_strategy = st.session_state.get("dashboard_signal_strategy")
+    active_pre_spike_config = st.session_state.get("dashboard_pre_spike_config")
+    running_engine = st.session_state.get("dashboard_signal_engine")
+    if running_engine is not None and not running_engine.running and getattr(running_engine, "stop_requested", False):
+        stopped_database = st.session_state.pop("dashboard_signal_database", None)
+        if stopped_database is not None:
+            stopped_database.close()
+        st.session_state.pop("dashboard_signal_engine", None)
+        running_engine = None
+    configuration_changed = (
+        active_live_strategy != selected_live_strategy
+        or (selected_live_strategy == PRE_SPIKE_LIVE_LABEL and active_pre_spike_config != pre_spike_config)
+    )
+    if configuration_changed and running_engine is not None and running_engine.running:
+        stop_dashboard_signal_engine(st)
+    st.session_state.dashboard_signal_strategy = selected_live_strategy
+    st.session_state.dashboard_pre_spike_config = pre_spike_config
+    engine = st.session_state.get("dashboard_signal_engine")
+    is_running = engine is not None and engine.running
+    stop_requested = engine is not None and getattr(engine, "stop_requested", False)
+    status = repository.load_signal_engine_status(user_id)
+    last_scan = status.last_run_at.strftime("%I:%M:%S %p") if status else "No scan yet"
+    heartbeat_age = None
+    heartbeat_at = getattr(status, "heartbeat_at", None) if status else None
+    if status and heartbeat_at is None:
+        heartbeat_at = status.last_run_at
+    if heartbeat_at:
+        current_time = datetime.now(heartbeat_at.tzinfo) if heartbeat_at.tzinfo else datetime.now()
+        heartbeat_age = max(0.0, (current_time - heartbeat_at).total_seconds())
+    heartbeat_timeout = max(120, settings.signal_poll_seconds * 3)
+    if stop_requested and is_running:
+        engine_state = "stopping"
+        status_label = "Stopping"
+        status_color = "#b7791f"
+    elif status and status.last_error:
+        engine_state = "error"
+        status_label = "Error"
+        status_color = "#b42318"
+    elif is_running and (heartbeat_age is None or heartbeat_age <= heartbeat_timeout):
+        engine_state = "running"
+        status_label = "Running"
+        status_color = "#20844b"
+    elif is_running:
+        engine_state = "stalled"
+        status_label = "Stalled"
+        status_color = "#b7791f"
+    else:
+        engine_state = "stopped"
+        status_label = "Stopped"
+        status_color = "#b7791f"
+    if engine_state in {"running", "stalled", "stopping", "error"}:
+        state_copy = {
+            "running": ("Scanning in progress", f"Monitoring {len(selected)} selected stocks for the next completed-candle signal"),
+            "stalled": ("Scan heartbeat is stale", "The worker is still present but has not reported a recent cycle"),
+            "stopping": ("Stopping scan engine", "The current stock evaluation will finish, then the worker will exit"),
+            "error": ("Scan engine needs attention", escape(status.last_error[:240] if status else "The latest scan cycle reported an error")),
+        }[engine_state]
+        animation_markup = '<div class="scan-activity-beam"><span></span><span></span><span></span><span></span></div>' if engine_state == "running" else ""
+        st.markdown(
+            f"""
+            <div class="scan-activity {engine_state}" role="status" aria-live="polite">
+                <div class="scan-activity-mark"><span class="scan-activity-dot"></span></div>
+                <div class="scan-activity-copy">
+                    <strong>{state_copy[0]}</strong>
+                    <span>{state_copy[1]}</span>
+                    {animation_markup}
+                </div>
+                <div class="scan-activity-live">{engine_state.upper()}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        f"<div class='engine-panel'><strong style='color:{status_color}'>● Signal engine {status_label.lower()}</strong><br><span style='color:#53645a'>Strategy {selected_live_strategy} · Monitoring {len(selected)} unique stocks from {len(selected_watchlists)} selected watchlist{'s' if len(selected_watchlists) != 1 else ''} · Timeframe {settings.signal_timeframe} · Last scan {last_scan}</span></div>",
+        unsafe_allow_html=True,
+    )
+    start_column, stop_column, refresh_column = st.columns([2, 1, 1])
+    with start_column:
+        start_disabled = not selected or not broker_credentials_configured(settings) or not runtime_access_token(st, settings)
+        if st.button("Start scan engine", type="primary", icon=":material/play_arrow:", width="stretch", disabled=is_running or start_disabled):
+            try:
+                start_dashboard_signal_engine(
+                    st,
+                    settings,
+                    runtime_access_token(st, settings),
+                    user_id,
+                    selected_live_strategy,
+                    pre_spike_config,
+                )
+                st.success("Scan engine started. It is now monitoring the selected watchlists.")
+                st.rerun()
+            except (OSError, RuntimeError, ValueError) as error:
+                st.error(f"Scan engine could not start: {error}")
+    with stop_column:
+        if st.button("Stop engine", icon=":material/stop:", width="stretch", disabled=not is_running or stop_requested):
+            stop_dashboard_signal_engine(st)
+            st.rerun()
+    with refresh_column:
+        if st.button("Refresh", icon=":material/refresh:", width="stretch"):
+            st.rerun()
+    if not selected_watchlists:
+        st.info("Select at least one watchlist on the Watchlists page before starting the scan engine.", icon=":material/info:")
+    elif not broker_credentials_configured(settings) or not runtime_access_token(st, settings):
+        st.info("Connect Kite before starting the scan engine.", icon=":material/key:")
+    if status and status.last_error:
+        st.warning(f"The last engine cycle reported: {status.last_error}")
+
+    if selected_live_strategy == PRE_SPIKE_LIVE_LABEL:
+        render_pre_spike_signal_table(st, repository, user_id)
+        return
+    if selected_live_strategy == PREVIOUS_DAY_HIGH_LABEL:
+        render_previous_day_high_signal_table(st, repository, user_id)
+        return
+    if selected_live_strategy == EMA_200_CLOSE_LIVE_LABEL:
+        render_ema200_close_signal_table(st, repository, user_id)
+        return
+    if selected_live_strategy == HIGH_CONVICTION_LIVE_LABEL:
+        render_high_conviction_signal_table(st, repository, user_id)
+        return
+
+    progressive_response = repository.load_progressive_signal_response(user_id)
+    st.markdown('<div class="eyebrow">EMA 9 to EMA 200 progressive</div>', unsafe_allow_html=True)
+    st.caption("The lifecycle below is evaluated from completed candles for every stock in the passed watchlist.")
+    bucket_a = pd.DataFrame(progressive_response["bucket_a"])
+    bucket_b = pd.DataFrame(progressive_response["bucket_b"])
+    if not bucket_a.empty:
+        bucket_a["tradingview_url"] = bucket_a["symbol"].map(tradingview_chart_url)
+    if not bucket_b.empty:
+        bucket_b["tradingview_url"] = bucket_b["symbol"].map(tradingview_chart_url)
+    bucket_a_column, bucket_b_column = st.columns(2, gap="large")
+    with bucket_a_column:
+        st.subheader("LIGHT SIGNALS")
+        if bucket_a.empty:
+            st.caption("No active or historical Bucket A cycles are available.")
+        else:
+            bucket_a_display = bucket_a.rename(
+                columns={
+                    "symbol": "Stock",
+                    "tradingview_url": "TradingView",
+                    "current_price": "Current price",
+                    "ema9": "EMA9",
+                    "ema20": "EMA20",
+                    "ema50": "EMA50",
+                    "ema100": "EMA100",
+                    "ema200": "EMA200",
+                    "crossover_time": "Crossover time",
+                    "status": "Status",
+                }
+            )
+            st.dataframe(
+                bucket_a_display.reindex(
+                    columns=["Stock", "TradingView", "Current price", "EMA9", "EMA20", "EMA50", "EMA100", "EMA200", "Crossover time", "Status"]
+                ),
+                width="stretch",
+                height=520,
+                hide_index=True,
+                column_config={
+                    "TradingView": st.column_config.LinkColumn("TradingView", display_text="Open chart"),
+                    "Current price": st.column_config.NumberColumn(format="₹%.2f"),
+                    "EMA9": st.column_config.NumberColumn(format="₹%.2f"),
+                    "EMA20": st.column_config.NumberColumn(format="₹%.2f"),
+                    "EMA50": st.column_config.NumberColumn(format="₹%.2f"),
+                    "EMA100": st.column_config.NumberColumn(format="₹%.2f"),
+                    "EMA200": st.column_config.NumberColumn(format="₹%.2f"),
+                },
+            )
+    with bucket_b_column:
+        st.subheader("STRONG SIGNALS")
+        if bucket_b.empty:
+            st.caption("No Bucket B cycles are available.")
+        else:
+            bucket_b_display = bucket_b.rename(
+                columns={
+                    "symbol": "Stock",
+                    "tradingview_url": "TradingView",
+                    "current_price": "Current price",
+                    "ema9": "EMA9",
+                    "ema20": "EMA20",
+                    "ema50": "EMA50",
+                    "ema100": "EMA100",
+                    "ema200": "EMA200",
+                    "initial_crossover_time": "Light signal time",
+                    "strong_signal_time": "Strong signal time",
+                    "status": "Status",
+                }
+            )
+            with st.container(border=True):
+                st.dataframe(
+                    bucket_b_display.reindex(
+                        columns=["Stock", "TradingView", "Current price", "EMA9", "EMA20", "EMA50", "EMA100", "EMA200", "Light signal time", "Strong signal time", "Status"]
+                    ),
+                    width="stretch",
+                    height=520,
+                    hide_index=True,
+                    column_config={
+                        "TradingView": st.column_config.LinkColumn("TradingView", display_text="Open chart"),
+                        "Current price": st.column_config.NumberColumn(format="₹%.2f"),
+                        "EMA9": st.column_config.NumberColumn(format="₹%.2f"),
+                        "EMA20": st.column_config.NumberColumn(format="₹%.2f"),
+                        "EMA50": st.column_config.NumberColumn(format="₹%.2f"),
+                        "EMA100": st.column_config.NumberColumn(format="₹%.2f"),
+                        "EMA200": st.column_config.NumberColumn(format="₹%.2f"),
+                    },
+                )
+
+
+def render_automatic_feed(st, settings) -> None:
+    st.markdown('<div class="eyebrow">Signal execution</div>', unsafe_allow_html=True)
+    st.title("Automatic trading")
+    st.caption("The backend generates signals continuously. This page consumes persisted signals and applies the existing execution and risk gates.")
+    repository = get_dashboard_repository(st)
+    user_id = dashboard_user_id(settings)
+    signals = repository.load_signals(user_id, 25)
+    if not signals:
+        st.markdown('<div class="empty">No persisted signals are available for automatic execution.</div>', unsafe_allow_html=True)
+        return
+    st.dataframe(load_persisted_signal_frame(repository, user_id, 25), width="stretch", hide_index=True)
+    if settings.trading_mode == TradingMode.LIVE:
+        st.warning("LIVE mode is active. Submitting a signal can place a real MARKET order.", icon=":material/warning:")
+    else:
+        st.info("PAPER mode is active. Orders stay inside the local paper execution boundary.", icon=":material/science:")
+    if not st.button("Submit latest signals through risk gates", type="primary", icon=":material/play_arrow:"):
+        return
+    access_token = runtime_access_token(st, settings)
+    token_to_symbol = {token: symbol for symbol, token in selected_watchlist_symbols(repository, user_id).items()}
+    if not token_to_symbol:
+        st.error("Select at least one watchlist before submitting signals.")
+        return
+    try:
+        pipeline = get_dashboard_pipeline(st, settings, access_token, token_to_symbol, CrossoverStrategy())
+        events = [
+            pipeline.submit_strategy_entry(
+                Signal(
+                    symbol=signal.symbol,
+                    action=SignalAction(signal.side),
+                    timestamp=signal.signal_timestamp,
+                    price=signal.price,
+                    stop_loss=signal.stop_loss,
+                    reason=signal.reason,
+                    score=100,
+                    entry_price=signal.price,
+                )
+            )
+            for signal in signals
+            if signal.stop_loss is not None
+        ]
+        record_dashboard_events(st, events)
+        st.success(f"Processed {len(events)} persisted signal(s) through the execution gates.")
+    except Exception as error:
+        st.error(f"Signals could not be submitted: {error}")
+
+
+def render_risk_settings(st, settings) -> None:
+    st.markdown('<div class="eyebrow">Risk and execution policy</div>', unsafe_allow_html=True)
+    st.title("Risk & settings")
+    st.caption("Saved changes persist across dashboard restarts and apply to new entries after validation.")
+    if st.session_state.pop("risk_settings_saved", False):
+        st.success("Risk and execution settings saved and will be restored next time.", icon=":material/check_circle:")
+
+    pipeline = st.session_state.get("dashboard_pipeline")
+    if pipeline is not None and pipeline.managed_positions:
+        st.warning("Open positions are being monitored with their existing settings. New settings apply after those positions are closed.", icon=":material/info:")
+
+    with st.form("risk_settings_form"):
+        st.subheader("Trading policy")
+        mode_column, capital_column, deployment_column = st.columns(3)
+        trading_mode = mode_column.selectbox(
+            "Trading mode",
+            list(TradingMode),
+            index=list(TradingMode).index(settings.trading_mode),
+            format_func=lambda mode: mode.value.upper(),
+        )
+        initial_capital = capital_column.number_input(
+            "Initial capital",
+            min_value=1.0,
+            value=float(settings.initial_capital),
+            step=1_000.0,
+            format="%.2f",
+        )
+        max_capital_deployment = deployment_column.number_input(
+            "Maximum capital deployment (%)",
+            min_value=1.0,
+            max_value=100.0,
+            value=float(settings.max_capital_deployment * 100),
+            step=1.0,
+            format="%.1f",
+        )
+
+        risk_column, loss_column, positions_column, trades_column = st.columns(4)
+        risk_per_trade = risk_column.number_input(
+            "Risk per trade (%)",
+            min_value=0.01,
+            max_value=100.0,
+            value=float(settings.risk_per_trade * 100),
+            step=0.05,
+            format="%.2f",
+        )
+        max_daily_loss = loss_column.number_input(
+            "Maximum daily loss (%)",
+            min_value=0.01,
+            max_value=100.0,
+            value=float(settings.max_daily_loss * 100),
+            step=0.05,
+            format="%.2f",
+        )
+        max_open_positions = positions_column.number_input(
+            "Maximum open positions",
+            min_value=1,
+            max_value=100,
+            value=int(settings.max_open_positions),
+            step=1,
+        )
+        max_trades_per_day = trades_column.number_input(
+            "Maximum trades per day",
+            min_value=1,
+            max_value=1_000,
+            value=int(settings.max_trades_per_day),
+            step=1,
+        )
+
+        st.subheader("Market timing")
+        market_column, entry_start_column, entry_end_column, force_exit_column = st.columns(4)
+        market_open = market_column.time_input("Market open", value=settings.market_open)
+        entry_start = entry_start_column.time_input("Entry window start", value=settings.entry_start)
+        entry_end = entry_end_column.time_input("Entry window end", value=settings.entry_end)
+        force_exit = force_exit_column.time_input("Force exit", value=settings.force_exit)
+
+        trailing_atr_multiplier = st.number_input(
+            "Trailing stop ATR multiplier",
+            min_value=0.1,
+            max_value=10.0,
+            value=float(settings.trailing_atr_multiplier),
+            step=0.1,
+            format="%.1f",
+        )
+        save_settings = st.form_submit_button("Save risk & settings", type="primary", width="stretch", icon=":material/save:")
+
+    if not save_settings:
+        return
+
+    overrides = {
+        "trading_mode": trading_mode,
+        "initial_capital": float(initial_capital),
+        "risk_per_trade": float(risk_per_trade) / 100,
+        "max_daily_loss": float(max_daily_loss) / 100,
+        "max_open_positions": int(max_open_positions),
+        "max_trades_per_day": int(max_trades_per_day),
+        "max_capital_deployment": float(max_capital_deployment) / 100,
+        "market_open": market_open,
+        "entry_start": entry_start,
+        "entry_end": entry_end,
+        "force_exit": force_exit,
+        "trailing_atr_multiplier": float(trailing_atr_multiplier),
+    }
+    try:
+        updated_settings = apply_frontend_settings(settings, overrides)
+    except (TypeError, ValueError) as error:
+        st.error(f"Settings could not be saved: {error}")
+        return
+
+    save_dashboard_settings(
+        get_dashboard_repository(st),
+        settings.user_id,
+        serialize_frontend_settings(settings_values(updated_settings)),
+    )
+    st.session_state.frontend_settings = settings_values(updated_settings)
+    st.session_state.risk_settings_saved = True
+    if pipeline is None or not pipeline.managed_positions:
+        st.session_state.pop("dashboard_pipeline", None)
+        st.session_state.pop("dashboard_kite_client", None)
+    st.rerun()
+
+
+def render_automatic_trading(st, settings) -> None:
+    st.markdown('<div class="eyebrow">Controlled execution</div>', unsafe_allow_html=True)
+    st.title("Automatic trading")
+    st.caption("Automatic entries use the selected strategy, score threshold, risk gates, and activity ledger as the manual signal page.")
+    repository = get_dashboard_repository(st)
+    strategy_options = load_dashboard_strategy_options(repository, include_pre_spike=True, include_previous_day_high=True)
+    strategy_labels = list(strategy_options)
+    selected_strategy = st.selectbox(
+        "Strategy",
+        strategy_labels,
+        index=strategy_labels.index(PRE_SPIKE_LIVE_LABEL),
+        key="automatic_strategy",
+    )
+    pre_spike_config = render_pre_spike_config(st, "automatic_pre_spike") if selected_strategy == PRE_SPIKE_LIVE_LABEL else None
+    try:
+        strategy = build_dashboard_strategy(repository, selected_strategy, pre_spike_config)
+    except ValueError as error:
+        st.error(f"Strategy could not be loaded: {error}")
+        return
+    uses_market_filters = isinstance(strategy, VwapEmaBreakoutStrategy)
+    uses_market_confirmation = isinstance(strategy, HighConvictionLongStrategy)
+    universe_source = st.segmented_control(
+        "Stock universe source",
+        ["Selected watchlists", "Existing index", "Manual CSV upload"],
+        default="Existing index",
+        key="automatic_universe_source",
+    )
+    selected_index = st.selectbox("Existing stock universe", SUPPORTED_INDEXES, index=SUPPORTED_INDEXES.index("NIFTY 500"), key="automatic_index") if universe_source == "Existing index" else universe_source
+    manual_universe_file = st.file_uploader(
+        "Upload stock universe CSV",
+        type="csv",
+        key="automatic_manual_universe",
+        help="Required column: symbol or tradingsymbol. Optional column: sector or industry.",
+    ) if universe_source == "Manual CSV upload" else None
+    quantity_column, limit_column = st.columns(2)
+    order_quantity = quantity_column.number_input(
+        "Quantity per order",
+        min_value=1,
+        max_value=100_000,
+        value=1,
+        step=1,
+        key="automatic_order_quantity",
+        help="The requested quantity is still checked against the configured risk and exposure limits.",
+    )
+    max_entries = limit_column.number_input("Maximum entries per run", min_value=1, max_value=5, value=1, step=1, key="automatic_max_entries")
+    automatic_enabled = bool(st.session_state.get("automatic_enabled", False))
+    status_text = "Auto trade is running. New qualifying BUY signals will be submitted automatically." if automatic_enabled else "Auto trade is stopped. Use Start auto trade to submit qualifying BUY signals."
+    st.caption(status_text)
+    if settings.trading_mode == TradingMode.LIVE:
+        st.warning("LIVE mode is active. Enabling automatic entries can place real MARKET orders.", icon=":material/warning:")
+    else:
+        st.info("PAPER mode is active. Orders stay inside the local paper execution boundary.", icon=":material/science:")
+    access_token = runtime_access_token(st, settings)
+    if not broker_credentials_configured(settings) or not access_token:
+        st.info(f"Authenticate with Kite to run automatic trading on the existing {selected_index} selection.", icon=":material/lock:")
+        return
+    try:
+        client = connect_kite(settings, access_token)
+        if universe_source == "Manual CSV upload" and manual_universe_file is None:
+            st.info("Upload a CSV containing the stock symbols to continue.", icon=":material/upload_file:")
+            return
+        if universe_source == "Selected watchlists":
+            selected_symbols = selected_watchlist_symbols(repository, dashboard_user_id(settings))
+            if not selected_symbols:
+                st.info("Select at least one watchlist before scanning.", icon=":material/list_alt:")
+                return
+            current_instruments = load_watchlist_instruments(settings, access_token)
+            resolved_symbols, skipped_symbols = reconcile_selected_watchlist_symbols(selected_symbols, current_instruments)
+            if skipped_symbols:
+                st.warning(
+                    "Skipped unavailable or non-equity watchlist instruments: "
+                    + ", ".join(skipped_symbols)
+                    + ". Refresh the watchlist before enabling automatic trading."
+                )
+            if not resolved_symbols:
+                st.info("No selected watchlist instruments are currently tradable on Kite.", icon=":material/block:")
+                return
+            token_to_symbol = {token: symbol for symbol, token in resolved_symbols.items()}
+            selected_sector = "All sectors"
+        else:
+            index_universe = (
+                load_nifty_index_universe_from_api(client.client, selected_index)
+                if universe_source == "Existing index"
+                else load_manual_stock_universe(manual_universe_file, client.client)
+            )
+            index_universe, selected_sector = select_sector_universe(st, index_universe, "automatic_sector")
+            token_to_symbol = dict(zip(index_universe["instrument_token"].astype(int), index_universe["symbol"], strict=True))
+    except (OSError, RuntimeError, ValueError) as error:
+        st.error(f"{selected_index} selection could not be loaded: {error}")
+        return
+
+    universe_label = (
+        "Selected watchlists"
+        if universe_source == "Selected watchlists"
+        else selected_index if universe_source == "Existing index" else f"Manual CSV: {manual_universe_file.name}"
+    )
+    automatic_scan_context = (
+        selected_strategy,
+        repr(getattr(strategy, "config", None)),
+        universe_label,
+        selected_sector,
+        tuple(sorted(token_to_symbol.items())),
+    )
+    st.write(f"Selected stocks: {len(token_to_symbol)} · Sector: {selected_sector} · Strategy: {selected_strategy}")
+    if isinstance(strategy, PreSpikeMomentumStrategy):
+        st.caption(
+            f"Completed 5-minute candles · 60-day lookback · score >= {strategy.config.minimum_score} · "
+            f"RVOL >= {strategy.config.minimum_rvol:.1f}x · 5-minute move >= {strategy.config.minimum_price_change_pct:.2f}%."
+        )
+    elif isinstance(strategy, PreviousDayHighBreakoutStrategy):
+        st.caption("BUY when the latest completed 5-minute candle closes above the previous trading day's high.")
+    elif isinstance(strategy, HighConvictionLongStrategy):
+        st.caption("Completed 5-minute candle · score >= 85 · previous 20-candle close breakout · RVOL >= 1.5x · 1 ATR stop · targets +1% / +2%.")
+    elif not uses_market_filters:
+        st.caption(
+            f"Candle close rule: Entry EMA {strategy.entry_ema}, Exit EMA {strategy.exit_ema}, "
+            f"fresh crossover only, minimum gap {strategy.min_gap_percent:.1f}%, stop {strategy.stop_atr:.1f} x ATR{strategy.atr_period}."
+        )
+
+    def run_automatic_cycle(execute_entries: bool) -> None:
+        token_by_symbol = {symbol: token for token, symbol in token_to_symbol.items()}
+        run_started_at = datetime.now()
+        progress = ScanProgress(st, "Automatic scan running")
+        st.session_state.automatic_last_run_at = run_started_at
+        st.session_state.automatic_next_run_at = run_started_at + timedelta(seconds=300)
+        try:
+            if uses_market_filters or uses_market_confirmation:
+                progress.update("Loading NIFTY 50 market regime")
+                regime = load_live_nifty_regime(client.client)
+            else:
+                regime = None
+
+            def load_symbol_candles(symbol: str) -> pd.DataFrame:
+                lookback_days = 60 if isinstance(strategy, PreSpikeMomentumStrategy) else 5
+                return load_live_candles_from_client(client.client, token_by_symbol[symbol], "5minute", lookback_days)
+
+            def load_confirmation(symbol: str) -> TimeframeConfirmation:
+                candles = load_live_candles_from_client(client.client, token_by_symbol[symbol], "15minute", 20)
+                return TimeframeConfirmation.from_candles(candles)
+
+            timeframe_label = "5-minute and 15-minute candles" if uses_market_filters else "5-minute candles"
+            progress.update(f"Evaluating {len(token_to_symbol)} stocks on {timeframe_label}")
+            result = StrategySignalScanner(
+                buy_limit=5,
+                sell_limit=5,
+                minimum_score=int(getattr(strategy, "minimum_score", 80)),
+            ).scan(
+                list(token_to_symbol.values()),
+                strategy,
+                load_symbol_candles,
+                market_regime=regime,
+                confirmation_loader=load_confirmation if uses_market_filters else None,
+            )
+            st.session_state.automatic_signal_result = result
+            st.session_state.automatic_signal_context = automatic_scan_context
+            st.session_state.automatic_signal_regime = regime
+            st.session_state.automatic_signal_time = run_started_at.strftime("%H:%M:%S")
+            st.session_state.last_market_data_at = datetime.now()
+            if execute_entries:
+                record_signal_notifications(
+                    st,
+                    pd.concat([result.buy, result.sell], ignore_index=True),
+                    selected_strategy,
+                    universe_label,
+                    selected_sector,
+                    settings,
+                )
+            if not execute_entries:
+                progress.complete(f"Scan complete: {len(result.buy)} BUY, {len(result.sell)} SELL signals")
+                return
+            if not settings.entry_start <= datetime.now().time() <= settings.entry_end:
+                progress.complete("Scan complete; entry window is closed")
+                st.info("Automatic entries are paused outside the configured entry window.")
+                return
+            progress.update("Applying freshness, risk, and position limits")
+            pipeline = get_dashboard_pipeline(st, settings, access_token, token_to_symbol, strategy)
+            candidates = result.buy
+            if not candidates.empty:
+                signal_times = pd.to_datetime(candidates["timestamp"], errors="coerce")
+                now = pd.Timestamp.now(tz=signal_times.dt.tz) if signal_times.dt.tz is not None else pd.Timestamp.now()
+                fresh = signal_times.notna() & ((now - signal_times).dt.total_seconds().between(-60, 600))
+                candidates = candidates.loc[fresh]
+            candidates = candidates.loc[
+                (candidates["current_price"] > 0)
+                & (candidates["stop_loss"] > 0)
+                & (
+                    ((candidates["side"] == SignalAction.BUY.value) & (candidates["stop_loss"] < candidates["entry_price"]))
+                    | ((candidates["side"] == SignalAction.SELL.value) & (candidates["stop_loss"] > candidates["entry_price"]))
+                )
+            ]
+            candidates = candidates.sort_values(["score", "expected_value"], ascending=[False, False], na_position="last").head(int(max_entries))
+            progress.update(f"Submitting up to {len(candidates)} qualifying automatic entries")
+            events = [
+                pipeline.submit_strategy_entry(
+                    Signal(
+                        symbol=str(row["symbol"]),
+                        action=SignalAction(str(row["side"])),
+                        timestamp=pd.Timestamp(row["timestamp"]).to_pydatetime(),
+                        price=float(row["entry_price"]),
+                        stop_loss=float(row["stop_loss"]),
+                        reason=str(row["signal_reasons"]),
+                        score=int(row["score"]),
+                        entry_price=float(row["entry_price"]),
+                        target_1=float(row["target_1"]) if pd.notna(row["target_1"]) else None,
+                        target_2=float(row["target_2"]) if pd.notna(row["target_2"]) else None,
+                        metadata={
+                            "move_stop_to_breakeven_after_target_1": isinstance(strategy, HighConvictionLongStrategy),
+                        },
+                    ),
+                    quantity=int(order_quantity),
+                )
+                for _, row in candidates.iterrows()
+            ]
+            record_dashboard_events(st, events)
+            submitted = [event for event in events if event.kind == "entry_submitted"]
+            rejected = [event for event in events if event.kind == "entry_rejected"]
+            skipped = [event for event in events if event.kind == "entry_skipped"]
+            if submitted:
+                st.success(f"Submitted {len(submitted)} automatic entr{'y' if len(submitted) == 1 else 'ies'}.")
+            if rejected:
+                st.error("\n".join(f"{event.symbol}: {event.reason}" for event in rejected))
+            if skipped and not submitted and not rejected:
+                st.caption("All qualifying signals were already submitted or have open positions.")
+            if not events:
+                st.info("No strong signals qualified for automatic entry.")
+            progress.complete(f"Automatic run complete: {len(submitted)} submitted, {len(rejected)} rejected")
+        except Exception as error:
+            progress.error("Automatic scan could not be completed")
+            st.error(f"Automatic scan could not be completed: {error}")
+
+    start_column, stop_column, scan_column = st.columns([2, 1, 1])
+    with start_column:
+        if st.button("Start auto trade", type="primary", width="stretch", icon=":material/play_arrow:", disabled=automatic_enabled):
+            st.session_state.automatic_enabled = True
+            st.rerun()
+    with stop_column:
+        if st.button("Stop auto trade", width="stretch", icon=":material/stop:", disabled=not automatic_enabled):
+            st.session_state.automatic_enabled = False
+            st.rerun()
+    with scan_column:
+        if st.button("Scan only", width="stretch", icon=":material/search:"):
+            run_automatic_cycle(False)
+
+    @st.fragment(run_every="300s")
+    def automatic_scheduler_fragment():
+        if st.session_state.get("automatic_enabled", False):
+            run_automatic_cycle(True)
+        else:
+            st.caption("Scheduler is idle until auto trade is started.")
+
+    automatic_scheduler_fragment()
+
+    result = st.session_state.get("automatic_signal_result")
+    if result is not None and st.session_state.get("automatic_signal_context") != automatic_scan_context:
+        st.info("The last scan belongs to a different strategy or stock selection. Run Scan only to refresh it.")
+        result = None
+    if result is None:
+        st.markdown(f'<div class="empty">Run a scan to evaluate every stock in the existing selection. Only signals scoring {getattr(strategy, "minimum_score", 80)} or higher are eligible.</div>', unsafe_allow_html=True)
+        return
+    regime = st.session_state.get("automatic_signal_regime")
+    if regime is not None:
+        st.info(f"NIFTY 50 regime: {regime.label} · close ₹{regime.close:,.2f} · VWAP ₹{regime.vwap:,.2f}")
+    st.caption(f"Last run {st.session_state.get('automatic_signal_time', 'unknown')} · scanned {result.scanned} selected stocks · threshold score >= {getattr(strategy, 'minimum_score', 80)}")
+    signals = pd.concat([result.buy, result.sell], ignore_index=True)
+    if signals.empty:
+        st.info("No strong BUY or SELL opportunities are available right now.")
+    elif isinstance(strategy, PreviousDayHighBreakoutStrategy):
+        st.subheader("Previous-day high breakout signals")
+        breakout_table = signals.loc[:, ["symbol", "current_price", "previous_day_high", "entry_price", "stop_loss", "timestamp", "signal_reasons"]].rename(
+            columns={
+                "symbol": "Stock",
+                "current_price": "Current price",
+                "previous_day_high": "Previous day high",
+                "entry_price": "Breakout price",
+                "stop_loss": "Stop loss",
+                "timestamp": "Trigger time",
+                "signal_reasons": "Reason",
+            }
+        )
+        st.dataframe(
+            breakout_table,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Current price": st.column_config.NumberColumn(format="₹%.2f"),
+                "Previous day high": st.column_config.NumberColumn(format="₹%.2f"),
+                "Breakout price": st.column_config.NumberColumn(format="₹%.2f"),
+                "Stop loss": st.column_config.NumberColumn(format="₹%.2f"),
+                "Trigger time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm"),
+            },
+        )
+    elif isinstance(strategy, HighConvictionLongStrategy):
+        st.subheader("High-conviction long signals")
+        high_conviction_table = signals.loc[:, ["symbol", "score", "current_price", "entry_price", "stop_loss", "target_1", "target_2", "relative_volume", "vwap", "ema20", "ema50", "ema200", "signal_reasons"]].rename(
+            columns={
+                "symbol": "Symbol", "score": "Score", "current_price": "Current price", "entry_price": "Entry",
+                "stop_loss": "Stop loss", "target_1": "Target 1", "target_2": "Target 2", "relative_volume": "RVOL",
+                "vwap": "VWAP", "ema20": "EMA20", "ema50": "EMA50", "ema200": "EMA200", "signal_reasons": "Reasons",
+            }
+        )
+        st.dataframe(
+            high_conviction_table,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Score": st.column_config.NumberColumn(format="%d/100"),
+                "Current price": st.column_config.NumberColumn(format="₹%.2f"),
+                "Entry": st.column_config.NumberColumn(format="₹%.2f"),
+                "Stop loss": st.column_config.NumberColumn(format="₹%.2f"),
+                "Target 1": st.column_config.NumberColumn(format="₹%.2f"),
+                "Target 2": st.column_config.NumberColumn(format="₹%.2f"),
+                "RVOL": st.column_config.NumberColumn(format="%.2fx"),
+                "VWAP": st.column_config.NumberColumn(format="₹%.2f"),
+                "EMA20": st.column_config.NumberColumn(format="₹%.2f"),
+                "EMA50": st.column_config.NumberColumn(format="₹%.2f"),
+                "EMA200": st.column_config.NumberColumn(format="₹%.2f"),
+            },
+        )
+    else:
+        st.dataframe(
+            signals.loc[:, ["symbol", "side", "score", "current_price", "stop_loss", "target_2", "expected_value", "risk_reward", "signal_reasons"]].rename(
+                columns={
+                    "symbol": "Symbol", "side": "Side", "score": "Score", "current_price": "Current price",
+                    "stop_loss": "Stop loss", "target_2": "Target 2", "expected_value": "Expected value",
+                    "risk_reward": "Risk / reward", "signal_reasons": "Reasons",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Score": st.column_config.NumberColumn(format="%d"),
+                "Current price": st.column_config.NumberColumn(format="₹%.2f"),
+                "Stop loss": st.column_config.NumberColumn(format="₹%.2f"),
+                "Target 2": st.column_config.NumberColumn(format="₹%.2f"),
+                "Expected value": st.column_config.NumberColumn(format="₹%.2f"),
+                "Risk / reward": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+    if result.errors:
+        with st.expander(f"Skipped selected stocks ({len(result.errors)})"):
+            st.write("\n".join(result.errors))
+    st.subheader("Automatic position monitor")
+    st.caption("Stops are checked against live quotes every 5 seconds. The exit is submitted as a market order when a stop is reached.")
+
+    @st.fragment(run_every="5s")
+    def automatic_monitor_fragment():
+        render_position_monitor(st, settings, access_token)
+
+    automatic_monitor_fragment()
+
+
+def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, activity: pd.DataFrame) -> None:
+    today = date.today().isoformat()
+    if not activity.empty:
+        activity = activity.copy()
+        activity["timestamp"] = pd.to_datetime(activity["timestamp"], errors="coerce")
+        activity["event_kind"] = activity["event_kind"].astype(str)
+        activity["pnl"] = pd.to_numeric(activity["pnl"], errors="coerce")
+        today_activity = activity[activity["timestamp"].dt.strftime("%Y-%m-%d") == today]
+        closed_activity = activity[activity["event_kind"].isin(["exit_submitted", "broker_exit_detected"])]
+        net_pnl = float(activity["pnl"].sum())
+        day_pnl = float(today_activity["pnl"].sum())
+        submitted_count = int(activity["event_kind"].isin(["entry_submitted", "exit_submitted"]).sum())
+        rejected_count = int(activity["event_kind"].str.endswith("_rejected").sum())
+        closed_count = int(len(closed_activity))
+    else:
+        today_trades = trades[trades["exit_time"].astype(str).str.startswith(today)] if not trades.empty else trades
+        net_pnl = float(trades["pnl"].sum()) if not trades.empty else 0.0
+        day_pnl = float(today_trades["pnl"].sum()) if not today_trades.empty else 0.0
+        submitted_count = int(len(orders))
+        rejected_count = 0
+        closed_count = int(len(trades))
+    mode_label = "LIVE TRADING" if settings.trading_mode == TradingMode.LIVE else "PAPER TRADING"
+    st.markdown('<div class="eyebrow">Session control room</div>', unsafe_allow_html=True)
+    st.title("Intraday desk")
+    st.markdown(f'<span class="status"><span class="status-dot"></span>{mode_label}</span>', unsafe_allow_html=True)
+    st.divider()
+    first, second, third, fourth = st.columns(4)
+    first.metric("Simulated equity", f"₹{settings.initial_capital + net_pnl:,.0f}", f"₹{net_pnl:,.0f} total")
+    second.metric("Today's P&L", f"₹{day_pnl:,.0f}")
+    third.metric("Orders submitted", submitted_count)
+    fourth.metric("Rejected", rejected_count)
+    first, second, third, fourth = st.columns(4)
+    first.metric("Closed trades", closed_count)
+    if closed_count:
+        wins = int((closed_activity["pnl"] > 0).sum()) if not activity.empty else int((trades["pnl"] > 0).sum())
+        second.metric("Win rate", f"{wins / closed_count:.1%}")
+    else:
+        second.metric("Win rate", "0.0%")
+    third.metric("Risk budget", f"{settings.risk_per_trade:.2%} / trade")
+    fourth.metric("Ledger events", int(len(activity)) if not activity.empty else int(len(orders) + len(trades)))
+    render_control_center(st, settings, activity, day_pnl)
+    st.subheader("Equity path")
+    equity_source = activity[activity["event_kind"].isin(["exit_submitted", "broker_exit_detected"])] if not activity.empty else trades
+    if equity_source.empty:
+        st.markdown('<div class="empty">No closed trades recorded yet.</div>', unsafe_allow_html=True)
+    else:
+        chart = equity_source.copy()
+        time_column = "timestamp" if not activity.empty else "exit_time"
+        chart[time_column] = pd.to_datetime(chart[time_column])
+        chart = chart.sort_values(time_column).set_index(time_column)
+        chart["equity"] = settings.initial_capital + chart["pnl"].cumsum()
+        st.line_chart(chart["equity"], height=260)
+    if not activity.empty:
+        st.subheader("Daily ledger")
+        daily = activity.assign(day=activity["timestamp"].dt.strftime("%Y-%m-%d"))
+        daily = daily.groupby("day", as_index=False).agg(
+            Events=("event_kind", "size"),
+            Submitted=("event_kind", lambda values: values.isin(["entry_submitted", "exit_submitted"]).sum()),
+            Rejected=("event_kind", lambda values: values.astype(str).str.endswith("_rejected").sum()),
+            Closed=("event_kind", lambda values: values.isin(["exit_submitted", "broker_exit_detected"]).sum()),
+            PnL=("pnl", "sum"),
+        ).sort_values("day", ascending=False)
+        st.dataframe(daily, width="stretch", hide_index=True, column_config={"PnL": st.column_config.NumberColumn(format="₹%.2f")})
+        rejection_rows = activity[activity["event_kind"].str.endswith("_rejected")]
+        if not rejection_rows.empty:
+            st.subheader("Rejection reasons")
+            rejection_summary = rejection_rows.groupby("reason", dropna=False).size().reset_index(name="Count").sort_values("Count", ascending=False)
+            st.dataframe(rejection_summary, width="stretch", hide_index=True)
+        if not closed_activity.empty:
+            closed_activity = closed_activity.copy()
+            closed_activity["pnl"] = pd.to_numeric(closed_activity["pnl"], errors="coerce").fillna(0.0)
+            gross_profit = float(closed_activity.loc[closed_activity["pnl"] > 0, "pnl"].sum())
+            gross_loss = abs(float(closed_activity.loc[closed_activity["pnl"] < 0, "pnl"].sum()))
+            profit_factor = gross_profit / gross_loss if gross_loss else float("inf") if gross_profit else 0.0
+            equity_curve = settings.initial_capital + closed_activity.sort_values("timestamp")["pnl"].cumsum()
+            drawdown = equity_curve - equity_curve.cummax()
+            metric_one, metric_two, metric_three, metric_four = st.columns(4)
+            metric_one.metric("Average win", f"₹{closed_activity.loc[closed_activity['pnl'] > 0, 'pnl'].mean():,.2f}" if (closed_activity["pnl"] > 0).any() else "₹0.00")
+            metric_two.metric("Average loss", f"₹{closed_activity.loc[closed_activity['pnl'] < 0, 'pnl'].mean():,.2f}" if (closed_activity["pnl"] < 0).any() else "₹0.00")
+            metric_three.metric("Profit factor", "∞" if profit_factor == float("inf") else f"{profit_factor:.2f}")
+            metric_four.metric("Max drawdown", f"₹{drawdown.min():,.2f}")
+            by_side = closed_activity.groupby("side", dropna=False).agg(Trades=("pnl", "size"), Net_PnL=("pnl", "sum"), Average_PnL=("pnl", "mean")).reset_index()
+            by_side = by_side.rename(columns={"side": "Exit side"})
+            by_hour = closed_activity.assign(Hour=closed_activity["timestamp"].dt.strftime("%H:00")).groupby("Hour", as_index=False).agg(Trades=("pnl", "size"), Net_PnL=("pnl", "sum"))
+            st.dataframe(by_side, width="stretch", hide_index=True, column_config={"Net_PnL": st.column_config.NumberColumn(format="₹%.2f"), "Average_PnL": st.column_config.NumberColumn(format="₹%.2f")})
+            st.dataframe(by_hour, width="stretch", hide_index=True, column_config={"Net_PnL": st.column_config.NumberColumn(format="₹%.2f")})
+    st.subheader("Current orders")
+    render_position_monitor(st, settings, runtime_access_token(st, settings))
+    pipeline = st.session_state.get("dashboard_pipeline")
+    if pipeline is not None and pipeline.managed_positions:
+        with st.form("close_all_positions_form"):
+            close_confirmed = st.checkbox(
+                "Confirm that every monitored position should be closed at the current available price.",
+                key="close_all_positions_confirmation",
+            )
+            close_submitted = st.form_submit_button("Close all positions", type="primary", icon=":material/close:")
+        if close_submitted:
+            if not close_confirmed:
+                st.warning("Confirm the close-all action before submitting it.")
+            else:
+                events = pipeline.close_all_positions()
+                record_dashboard_events(st, events)
+                st.success(f"Processed {len(events)} close request(s).")
+                st.rerun()
+
+
+def main() -> None:
+    st.set_page_config(page_title="Intraday desk", page_icon=":material/candlestick_chart:", layout="wide")
+    inject_styles(st)
+    base_settings = get_settings()
+    settings = get_frontend_settings(st, base_settings)
+    orders, trades, activity = load_activity()
+
+    authenticated = broker_credentials_configured(settings) and bool(runtime_access_token(st, settings))
+    pages = WORKSPACE_PAGES if authenticated else ["Kite authentication"]
+    st.session_state.setdefault("active_page", "Kite authentication")
+    if st.session_state.active_page not in pages:
+        st.session_state.active_page = pages[0]
+    if not authenticated or st.session_state.get("workspace_navigation") not in pages:
+        st.session_state.workspace_navigation = st.session_state.active_page
+
+    with st.sidebar:
+        st.markdown('<div class="eyebrow">NSE / BSE trading desk</div>', unsafe_allow_html=True)
+        st.title("Intraday desk")
+        page = st.radio(
+            "Workspace",
+            pages,
+            index=None,
+            key="workspace_navigation",
+            width="stretch",
+        )
+        st.session_state.active_page = page
+        st.session_state.previous_workspace_page = page
+        if not authenticated:
+            st.caption("Complete Kite authentication to unlock the workspace.")
+        st.divider()
+        st.caption(f"Session date  {date.today().isoformat()}")
+        st.caption(f"Broker mode  {settings.trading_mode.value}")
+        if authenticated:
+            if st.button("Refresh data", width="stretch", icon=":material/refresh:"):
+                st.rerun()
+            if st.button("Backup and clear signals", width="stretch", icon=":material/archive:"):
+                try:
+                    backup_data, cleared_counts = backup_and_clear_signal_state(st, settings)
+                    st.session_state.signal_backup_data = backup_data
+                    st.session_state.signal_backup_name = f"signal-backup-{datetime.now(ZoneInfo('Asia/Kolkata')):%Y%m%d-%H%M%S}-IST.json"
+                    st.session_state.signal_backup_counts = cleared_counts
+                    st.success("Signal results and notifications cleared.")
+                except Exception as error:
+                    st.error(f"Signal backup could not be created: {error}")
+            if st.session_state.get("signal_backup_data"):
+                counts = st.session_state.get("signal_backup_counts", {})
+                st.caption(
+                    "Cleared "
+                    f"{counts.get('signals', 0)} signals, "
+                    f"{counts.get('ema_progressive_cycles', 0)} progressive cycles, and "
+                    f"{counts.get('notifications', 0)} notifications."
+                )
+                st.download_button(
+                    "Download latest signal backup",
+                    data=st.session_state.signal_backup_data,
+                    file_name=st.session_state.get("signal_backup_name", "signal-backup.json"),
+                    mime="application/json",
+                    width="stretch",
+                    icon=":material/download:",
+                )
+            st.divider()
+            if st.session_state.get("emergency_halt"):
+                st.caption("New entries halted")
+                if st.button("Resume entries", width="stretch", icon=":material/play_arrow:"):
+                    pipeline = st.session_state.get("dashboard_pipeline")
+                    if pipeline is not None:
+                        pipeline.resume_entries()
+                    st.session_state.emergency_halt = False
+                    st.rerun()
+            else:
+                with st.form("sidebar_emergency_halt_form"):
+                    halt_confirmed = st.checkbox("Confirm halt", key="sidebar_halt_confirmation")
+                    halt_submitted = st.form_submit_button("Emergency stop", width="stretch", icon=":material/stop_circle:")
+                if halt_submitted:
+                    if not halt_confirmed:
+                        st.warning("Confirm the emergency halt before submitting it.")
+                    else:
+                        pipeline = st.session_state.get("dashboard_pipeline")
+                        if pipeline is not None:
+                            pipeline.halt_entries()
+                        st.session_state.automatic_enabled = False
+                        st.session_state.emergency_halt = True
+                        st.rerun()
+
+    page_content = st.empty()
+    page_content.empty()
+    with page_content.container():
+        if page == "Kite authentication":
+            render_kite_authentication(st, settings)
+        elif page == "Overview":
+            render_overview(st, settings, orders, trades, activity)
+        elif page == "Watchlists":
+            render_watchlists(st, settings)
+        elif page == "Scanner & signals":
+            render_signal_feed(st, settings)
+        elif page == "Swing auto trading":
+            render_swing_auto_trading(st, settings)
+        elif page == "Historical day scan":
+            render_historical_day_scan(st, settings)
+        elif page == "Automatic trading":
+            render_automatic_trading(st, settings)
+        elif page == "Risk & settings":
+            render_risk_settings(st, settings)
+
+
+if __name__ == "__main__":
+    main()

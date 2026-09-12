@@ -5,6 +5,8 @@ import pytest
 from kiteconnect.exceptions import InputException
 
 from app.config.constants import TradingMode
+from app.database.database import Database
+from app.database.repository import Repository
 from app.execution.swing_auto_trader import SwingAutoTrader
 from app.strategy.base import NoSignal
 from app.strategy.ema_9_200_swing import Ema9200SwingStrategy
@@ -255,4 +257,38 @@ def test_repeated_scan_does_not_submit_the_same_signal_twice():
     assert first.status == "submitted"
     assert second.status == "skipped"
     assert second.reason == "position is already open"
+
+
+def test_swing_trader_persists_position_lifecycle_when_repository_is_supplied(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = StubKiteClient()
+    trader = SwingAutoTrader(client, TradingMode.LIVE, repository=repository)
+    candidate = trader.scan({"NSE:AAA": 1}, lambda token: swing_frame()).candidates[0]
+
+    order_result = trader.submit_candidate(candidate, amount_limit=1_000, quantity_limit=10)
+    assert order_result.status == "submitted"
+
+    [saved] = repository.load_positions()
+    assert saved.symbol == "NSE:AAA"
+    assert saved.position_type == "SWING"
+    assert saved.protective_order_id == order_result.protective_order_id
+
+    trailing_frame = swing_frame(last_close=130.0, rows=202)
+    trailing_frame.loc[201, "close"] = 150.0
+    trailing_frame.loc[201, "open"] = 150.0
+    trailing_frame.loc[201, "high"] = 152.0
+    trailing_frame.loc[201, "low"] = 148.0
+    new_stop = trader.trail_position("NSE:AAA", trailing_frame)
+    assert new_stop is not None
+
+    [trailed] = repository.load_positions()
+    assert trailed.stop_loss == new_stop
+
+    client.holding_quantities = [0]
+    trader.sync_broker_positions()
+
+    assert repository.load_positions() == []
+    database.close()
     assert len(client.requests) == 2

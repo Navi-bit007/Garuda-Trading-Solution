@@ -173,7 +173,11 @@ class Database:
             target_1 REAL,
             target_2 REAL,
             protective_order_id TEXT,
-            target_1_hit INTEGER NOT NULL DEFAULT 0
+            target_1_hit INTEGER NOT NULL DEFAULT 0,
+            instrument_token INTEGER,
+            position_type TEXT NOT NULL DEFAULT 'INTRADAY',
+            atr_multiplier REAL,
+            strategy_name TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS strategy_presets (
             name TEXT PRIMARY KEY,
@@ -226,6 +230,14 @@ class Database:
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(positions)").fetchall()}
         if "target_1_hit" not in columns:
             self.connection.execute("ALTER TABLE positions ADD COLUMN target_1_hit INTEGER NOT NULL DEFAULT 0")
+        if "instrument_token" not in columns:
+            self.connection.execute("ALTER TABLE positions ADD COLUMN instrument_token INTEGER")
+        if "position_type" not in columns:
+            self.connection.execute("ALTER TABLE positions ADD COLUMN position_type TEXT NOT NULL DEFAULT 'INTRADAY'")
+        if "atr_multiplier" not in columns:
+            self.connection.execute("ALTER TABLE positions ADD COLUMN atr_multiplier REAL")
+        if "strategy_name" not in columns:
+            self.connection.execute("ALTER TABLE positions ADD COLUMN strategy_name TEXT NOT NULL DEFAULT ''")
 
     def _migrate_signals(self) -> None:
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(signals)").fetchall()}

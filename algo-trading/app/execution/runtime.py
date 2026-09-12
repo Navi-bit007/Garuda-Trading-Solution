@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 from app.broker.authentication import AccessToken, require_credentials
@@ -17,11 +18,16 @@ from app.strategy.vwap_ema_breakout import VwapEmaBreakoutStrategy
 
 logger = logging.getLogger(__name__)
 
+RECONCILE_INTERVAL_SECONDS = 20.0
+
 
 class TradingRuntime:
-    def __init__(self, pipeline: TradingPipeline, stream: KiteTickStream):
+    def __init__(self, pipeline: TradingPipeline, stream: KiteTickStream, reconcile_interval_seconds: float = RECONCILE_INTERVAL_SECONDS):
         self.pipeline = pipeline
         self.stream = stream
+        self.reconcile_interval_seconds = reconcile_interval_seconds
+        self._reconcile_stop = threading.Event()
+        self._reconcile_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self.stream.start(
@@ -33,9 +39,28 @@ class TradingRuntime:
             on_reconnect=lambda response: logger.warning("Kite tick stream reconnecting: %s", response),
             on_noreconnect=lambda response: logger.error("Kite tick stream stopped reconnecting"),
         )
+        self._reconcile_stop.clear()
+        self._reconcile_thread = threading.Thread(target=self._reconcile_loop, daemon=True)
+        self._reconcile_thread.start()
 
     def stop(self) -> None:
         self.stream.stop()
+        self._reconcile_stop.set()
+        if self._reconcile_thread is not None:
+            self._reconcile_thread.join(timeout=5.0)
+            self._reconcile_thread = None
+
+    def _reconcile_loop(self) -> None:
+        # A standalone live/paper run has no dashboard periodically calling
+        # sync_broker_positions(); without this, a position closed by the trailing-stop
+        # agent's broker-side SL-M fill would never be noticed here, leaving managed_positions
+        # stale and blocking new entries for that symbol.
+        while not self._reconcile_stop.wait(self.reconcile_interval_seconds):
+            try:
+                for event in self.pipeline.sync_broker_positions():
+                    self._log_event(event)
+            except Exception:
+                logger.exception("Broker position reconciliation failed")
 
     def _on_ticks(self, ticks: list[dict]) -> None:
         try:

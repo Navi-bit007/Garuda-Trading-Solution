@@ -168,6 +168,10 @@ class PositionRecord:
     target_2: float | None = None
     protective_order_id: str | None = None
     target_1_hit: bool = False
+    instrument_token: int | None = None
+    position_type: str = "INTRADAY"
+    atr_multiplier: float | None = None
+    strategy_name: str = ""
 
 
 @dataclass(frozen=True)

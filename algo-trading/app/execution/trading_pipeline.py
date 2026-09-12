@@ -359,7 +359,7 @@ class TradingPipeline:
         )
         if self.activity_repository is not None and hasattr(self.activity_repository, "save_position"):
             self.activity_repository.save_position(
-                PositionRecord(symbol, position_side.value, quantity, signal.price, signal.stop_loss, signal.timestamp, signal.target_1, signal.target_2, protective_order_id, False)
+                PositionRecord(symbol, position_side.value, quantity, signal.price, signal.stop_loss, signal.timestamp, signal.target_1, signal.target_2, protective_order_id, False, atr_multiplier=self.settings.trailing_atr_multiplier)
             )
         strategy_stop_multiplier = float(getattr(self.strategy, "stop_atr", self.settings.trailing_atr_multiplier))
         if strategy_stop_multiplier > 0:
@@ -387,6 +387,13 @@ class TradingPipeline:
         else:
             if target_1_reached:
                 return [self._close_position(symbol, price, timestamp, "target 1 reached")]
+        if self.settings.trading_mode == TradingMode.LIVE:
+            # The resting broker-side SL-M order (kept current by the standalone
+            # scripts/run_trailing_stop_agent.py process) is the sole trailing-stop trigger in
+            # LIVE mode; sync_broker_positions() detects the eventual fill. PAPER/backtest has
+            # no real broker order to hand off to, so the pipeline keeps simulating it below.
+            return []
+        if not managed.move_stop_to_breakeven:
             atr_value = self._atr_value(symbol)
             if atr_value > 0:
                 managed.trailing_stop.update(price, atr_value)
@@ -398,13 +405,16 @@ class TradingPipeline:
     def _move_stop_to_breakeven(self, managed: ManagedPosition, timestamp: datetime, market_price: float) -> list[PipelineEvent]:
         position = managed.position
         exit_side = Side.SELL if position.side == Side.BUY else Side.BUY
-        try:
-            self.orders.modify_protective_stop(
-                managed.protective_order_id or "",
-                OrderRequest(position.symbol, exit_side, position.quantity, market_price, position.entry_price),
-            )
-        except Exception as error:
-            return [self._event("breakeven_rejected", position.symbol, timestamp, position.entry_price, reason=f"protective stop could not move to breakeven: {error}", side=exit_side.value, quantity=position.quantity, entry_price=position.entry_price, stop_loss=position.stop_loss)]
+        if self.settings.trading_mode != TradingMode.LIVE:
+            # PAPER/backtest has no real resting broker order to hand off to the trailing-stop
+            # agent, so the pipeline keeps moving its own simulated protective stop.
+            try:
+                self.orders.modify_protective_stop(
+                    managed.protective_order_id or "",
+                    OrderRequest(position.symbol, exit_side, position.quantity, market_price, position.entry_price),
+                )
+            except Exception as error:
+                return [self._event("breakeven_rejected", position.symbol, timestamp, position.entry_price, reason=f"protective stop could not move to breakeven: {error}", side=exit_side.value, quantity=position.quantity, entry_price=position.entry_price, stop_loss=position.stop_loss)]
         position.stop_loss = position.entry_price
         managed.trailing_stop.stop = position.entry_price
         managed.target_1_hit = True
@@ -421,6 +431,7 @@ class TradingPipeline:
                     position.target_2,
                     managed.protective_order_id,
                     True,
+                    atr_multiplier=self.settings.trailing_atr_multiplier,
                 )
             )
         return [self._event("breakeven_activated", position.symbol, timestamp, position.entry_price, reason="target 1 reached; protective stop moved to breakeven", side=exit_side.value, quantity=position.quantity, entry_price=position.entry_price, stop_loss=position.stop_loss)]

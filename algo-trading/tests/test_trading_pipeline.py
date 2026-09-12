@@ -34,8 +34,10 @@ class NoSetupStrategy:
 
 
 class BrokerExitClient:
-    def __init__(self):
+    def __init__(self, broker_quantity: int = 0):
         self.requests = []
+        self.modifications = []
+        self.broker_quantity = broker_quantity
 
     def instruments(self, exchange=None):
         return [{"tradingsymbol": "AAA", "tick_size": 0.05}]
@@ -44,8 +46,14 @@ class BrokerExitClient:
         self.requests.append(request)
         return f"ORDER-{len(self.requests)}"
 
+    def modify_order(self, **request):
+        self.modifications.append(request)
+        return request.get("order_id")
+
     def positions(self):
-        return {"net": []}
+        if self.broker_quantity == 0:
+            return {"net": []}
+        return {"net": [{"tradingsymbol": "AAA", "quantity": self.broker_quantity}]}
 
     def order_history(self, order_id):
         return [{"status": "COMPLETE", "filled_quantity": 10, "average_price": 94.5}]
@@ -148,6 +156,50 @@ def test_pipeline_moves_broker_sold_position_to_recently_closed_with_realized_pn
     assert not pipeline.managed_positions
     assert pipeline.recent_closed_positions[0].exit_price == 94.5
     assert pipeline.recent_closed_positions[0].pnl == -55.0
+
+
+def test_live_pipeline_does_not_auto_close_on_trailing_stop_breach():
+    client = BrokerExitClient(broker_quantity=10)
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client)
+    entry = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+    assert entry.kind == "entry_submitted"
+
+    events = pipeline.monitor_ticks([{"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 26), "last_price": 90}])
+
+    assert events == []
+    assert "AAA" in pipeline.managed_positions
+
+
+def test_live_pipeline_breakeven_flags_target_1_hit_without_modifying_broker_stop(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = BrokerExitClient(broker_quantity=10)
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+    signal = Signal(
+        "AAA",
+        SignalAction.BUY,
+        datetime(2026, 1, 1, 9, 25),
+        100,
+        95,
+        "high conviction",
+        score=95,
+        target_1=101,
+        target_2=102,
+        metadata={"move_stop_to_breakeven_after_target_1": True},
+    )
+    assert pipeline.submit_strategy_entry(signal, quantity=10).kind == "entry_submitted"
+
+    events = pipeline.monitor_ticks([{"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 26), "last_price": 101}])
+
+    assert [event.kind for event in events] == ["breakeven_activated"]
+    assert pipeline.managed_positions["AAA"].position.stop_loss == 100
+    assert pipeline.managed_positions["AAA"].target_1_hit is True
+    assert client.modifications == []
+    [saved] = repository.load_positions()
+    assert saved.target_1_hit is True
+    assert saved.stop_loss == 100
+    database.close()
 
 
 def test_pipeline_rejects_entry_when_risk_size_is_zero():

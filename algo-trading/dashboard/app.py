@@ -476,6 +476,15 @@ def inject_styles(st) -> None:
         .selection-tray { border: 1px solid #a9cbb4; background: #f2faf3; padding: 14px 16px; border-radius: 7px; margin: 12px 0; }
         .selection-tray strong { color: #176b4d; }
         .result-meta { color: var(--muted); font-size: .82rem; padding-top: 2px; }
+        .auth-step { border: 1px solid var(--line); background: rgba(255,255,255,.55); border-radius: 9px; padding: 18px 20px; margin-bottom: 14px; }
+        .auth-step.locked { opacity: .55; }
+        .auth-step-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+        .auth-step-number { display: grid; place-items: center; width: 26px; height: 26px; flex: 0 0 26px; border-radius: 50%; background: #176b4d; color: #ffffff !important; font-size: .8rem; font-weight: 800; }
+        .auth-step.locked .auth-step-number { background: #9aa89a; }
+        .auth-step.done .auth-step-number { background: #176b4d; }
+        .auth-step-title { font-weight: 700; font-size: 1rem; color: var(--ink); }
+        .auth-step-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+        .auth-step-row [data-testid="stButton"], .auth-step-row [data-testid="stLinkButton"] { margin: 0; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -483,6 +492,8 @@ def inject_styles(st) -> None:
 
 
 def runtime_access_token(st, settings) -> str:
+    if st.session_state.get("kite_logged_out"):
+        return ""
     session_token = st.session_state.get("kite_access_token", "")
     if session_token.strip():
         return session_token.strip()
@@ -490,6 +501,21 @@ def runtime_access_token(st, settings) -> str:
     if entered_token.strip():
         return entered_token.strip()
     return settings.kite_access_token.get_secret_value().strip()
+
+
+def log_out_of_kite(st) -> None:
+    for key in (
+        "kite_access_token",
+        "kite_request_token",
+        "kite_access_token_input",
+        "kite_auth_notice",
+        "dashboard_kite_client",
+        "dashboard_pipeline",
+    ):
+        st.session_state.pop(key, None)
+    st.session_state.kite_logged_out = True
+    st.session_state.pop("active_page", None)
+    st.query_params.clear()
 
 
 def connect_kite(settings, access_token: str) -> KiteClient:
@@ -1266,47 +1292,92 @@ def render_kite_authentication(st, settings) -> None:
     st.title("Kite authentication")
     if notice := st.session_state.pop("kite_auth_notice", ""):
         st.success(notice, icon=":material/check_circle:")
+
+    if not broker_credentials_configured(settings):
+        st.info("Add KITE_API_KEY and KITE_API_SECRET to .env before starting Kite login.", icon=":material/key:")
+        return
+
     runtime_token = runtime_access_token(st, settings)
-    st.subheader("Connect Zerodha Kite")
-    if broker_credentials_configured(settings):
+
+    if runtime_token:
+        st.success("Kite authenticated. Workspace unlocked.", icon=":material/check_circle:")
+        if st.button("Log out", icon=":material/logout:"):
+            log_out_of_kite(st)
+            st.rerun()
+        return
+
+    request_token_from_url = st.query_params.get("request_token", "")
+    if request_token_from_url:
+        st.session_state.kite_request_token = request_token_from_url
+        st.session_state.pop("kite_logged_out", None)
+    stored_request_token = st.session_state.get("kite_request_token", "")
+    step_one_done = bool(stored_request_token)
+
+    with st.container(border=True):
+        st.markdown(
+            '<div class="auth-step-head">'
+            f'<div class="auth-step-number">{"&#10003;" if step_one_done else "1"}</div>'
+            '<div class="auth-step-title">Open Kite login</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
         login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={quote(settings.kite_api_key)}"
-        st.link_button("Open Kite login", login_url, icon=":material/login:")
+        col_button, col_status = st.columns([1, 2], vertical_alignment="center")
+        with col_button:
+            st.link_button("Open Kite login", login_url, type="primary", icon=":material/login:")
+        with col_status:
+            if step_one_done:
+                st.success("Kite login successful.", icon=":material/check_circle:")
+            else:
+                st.caption("Sign in to Zerodha Kite, then you'll be redirected back here.")
+
+    with st.container(border=True):
+        st.markdown(
+            '<div class="auth-step-head">'
+            '<div class="auth-step-number">2</div>'
+            '<div class="auth-step-title">Generate access token</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        if not step_one_done:
+            st.caption("Complete step 1 first.")
+        else:
+            generate_clicked = st.button("Generate access token", type="primary", icon=":material/vpn_key:")
+            if generate_clicked:
+                try:
+                    access_token = exchange_request_token(
+                        settings.kite_api_key,
+                        settings.kite_api_secret.get_secret_value(),
+                        stored_request_token,
+                    )
+                except AuthenticationError as error:
+                    st.error(str(error), icon=":material/error:")
+                else:
+                    st.session_state.kite_access_token = access_token.value
+                    st.session_state.kite_auth_notice = "Access token generated. Workspace navigation is now enabled."
+                    st.session_state.pop("kite_request_token", None)
+                    st.session_state.pop("kite_logged_out", None)
+                    st.query_params.clear()
+                    st.rerun()
+
+    with st.expander("Paste tokens manually (optional)"):
         access_token_input = st.text_input(
             "Kite access token",
             type="password",
             key="kite_access_token_input",
-            help="Paste an access token you already generated, or use the request-token exchange below.",
+            help="Paste an access token you already generated, skipping the steps above.",
         )
         if access_token_input.strip():
-            runtime_token = access_token_input.strip()
-            st.session_state.kite_access_token = runtime_token
-        request_token_from_url = st.query_params.get("request_token", "")
-        request_token = st.text_input(
+            st.session_state.kite_access_token = access_token_input.strip()
+            st.session_state.pop("kite_logged_out", None)
+        manual_request_token = st.text_input(
             "Kite request token",
-            value=request_token_from_url,
             type="password",
-            help="After Kite login, the request_token appears in the redirected URL.",
+            help="If the Kite redirect landed in a different tab, paste its request_token here.",
         )
-        if st.button("Generate access token", type="primary", width="stretch"):
-            try:
-                access_token = exchange_request_token(
-                    settings.kite_api_key,
-                    settings.kite_api_secret.get_secret_value(),
-                    request_token,
-                )
-            except AuthenticationError as error:
-                st.error(str(error), icon=":material/error:")
-            else:
-                st.session_state.kite_access_token = access_token.value
-                st.session_state.kite_auth_notice = "Access token generated. Workspace navigation is now enabled."
-                st.query_params.clear()
-                st.rerun()
-        if runtime_token:
-            st.success("Kite authenticated. Workspace navigation is enabled.", icon=":material/check_circle:")
-        else:
-            st.info("Complete Kite login and provide a daily access token to unlock the workspace.", icon=":material/lock:")
-    else:
-        st.info("Add KITE_API_KEY and KITE_API_SECRET to .env before starting Kite login.", icon=":material/key:")
+        if manual_request_token.strip():
+            st.session_state.kite_request_token = manual_request_token.strip()
+            st.session_state.pop("kite_logged_out", None)
 
 
 def dashboard_user_id(settings) -> str:
@@ -2299,18 +2370,22 @@ def backup_and_clear_signal_state(st, settings) -> tuple[bytes, dict[str, int]]:
     return json.dumps(backup, indent=2, default=str).encode("utf-8"), counts
 
 
-def create_swing_auto_trader(client, mode, trailing_multiplier: float, strategy_name: str):
+def create_swing_auto_trader(client, mode, trailing_multiplier: float, strategy_name: str, repository=None):
     try:
-        return SwingAutoTrader(client, mode, trailing_multiplier, strategy_name)
+        return SwingAutoTrader(client, mode, trailing_multiplier, strategy_name, repository=repository)
     except TypeError as error:
-        if "positional arguments" not in str(error) or "SwingAutoTrader.__init__" not in str(error):
+        message = str(error)
+        stale_signature = "SwingAutoTrader.__init__" in message and (
+            "positional arguments" in message or "unexpected keyword argument" in message
+        )
+        if not stale_signature:
             raise
         # Streamlit can retain the imported class while source files hot-reload.
         import importlib
         import app.execution.swing_auto_trader as swing_auto_trader_module
 
         refreshed_module = importlib.reload(swing_auto_trader_module)
-        return refreshed_module.SwingAutoTrader(client, mode, trailing_multiplier, strategy_name)
+        return refreshed_module.SwingAutoTrader(client, mode, trailing_multiplier, strategy_name, repository=repository)
 
 
 def render_swing_auto_trading(st, settings) -> None:
@@ -2378,7 +2453,7 @@ def render_swing_auto_trading(st, settings) -> None:
             st.session_state.swing_strategy_name = selected_strategy_name
             st.session_state.swing_scan_result = None
         if trader is None:
-            trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name)
+            trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name, repository=repository)
             st.session_state.swing_auto_trader = trader
         elif getattr(trader, "strategy_name", "EMA 9/200 swing") != selected_strategy_name:
             if hasattr(trader, "set_strategy"):
@@ -2389,7 +2464,7 @@ def render_swing_auto_trading(st, settings) -> None:
                 legacy_signal_keys = getattr(trader, "submitted_signal_keys", set())
                 legacy_open_symbols = getattr(trader, "broker_open_symbols", set())
                 legacy_pending_entries = getattr(trader, "pending_entries", {})
-                trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name)
+                trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name, repository=repository)
                 trader.active_positions.update(legacy_positions)
                 trader.submitted_signal_keys.update(legacy_signal_keys)
                 trader.broker_open_symbols.update(legacy_open_symbols)
@@ -2459,23 +2534,19 @@ def render_swing_auto_trading(st, settings) -> None:
         except Exception as error:
             st.warning(f"Broker position sync paused: {error}")
 
-        trailing_events = []
-        for symbol, position in list(trader.active_positions.items()):
-            try:
-                candles = load_swing_daily_candles_cached(client.client, access_token, position.instrument_token, scan_day)
-                position_strategy = getattr(position, "strategy_name", "EMA 9/200 swing")
-                if position_strategy == "SWING_TREND_BREAKOUT":
-                    outcome = trader.manage_position(symbol, candles)
-                    if outcome is not None:
-                        trailing_events.append(f"{symbol}: {outcome.reason}")
-                else:
-                    new_stop = trader.trail_position(symbol, candles)
-                    if new_stop is not None:
-                        trailing_events.append(f"{symbol}: stop moved to ₹{new_stop:,.2f}")
-            except Exception as error:
-                st.warning(f"Trailing stop update failed for {symbol}: {error}")
-        if trailing_events:
-            st.success(" · ".join(trailing_events), icon=":material/trending_up:")
+        # Trailing-stop math and broker-side SL-M modification are owned exclusively by the
+        # standalone scripts/run_trailing_stop_agent.py process; this view only reads the stop
+        # it last persisted, so it stays accurate even when the dashboard isn't open.
+        swing_stops = {
+            record.symbol: record.stop_loss
+            for record in repository.load_positions()
+            if record.position_type == "SWING"
+        }
+        if swing_stops:
+            st.caption(
+                "Current stop (maintained by the trailing stop agent): "
+                + " · ".join(f"{symbol} ₹{stop:,.2f}" for symbol, stop in swing_stops.items())
+            )
 
         auto_enabled = bool(st.session_state.get("swing_auto_enabled", False)) and not bool(st.session_state.get("swing_kill_switch", False))
         should_scan = manual_scan or auto_enabled
@@ -3735,7 +3806,7 @@ def main() -> None:
         st.session_state.active_page = page
         st.session_state.previous_workspace_page = page
         if not authenticated:
-            st.caption("Complete Kite authentication to unlock the workspace.")
+            st.caption("Complete both Kite authentication steps to unlock the workspace.")
         st.divider()
         st.caption(f"Session date  {date.today().isoformat()}")
         st.caption(f"Broker mode  {settings.trading_mode.value}")

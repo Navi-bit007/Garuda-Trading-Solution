@@ -10,6 +10,9 @@ import pandas as pd
 
 from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import NSE_TICK_SIZE, Side, TradingMode
+from app.database.models import PositionRecord
+from app.database.repository import Repository
+from app.execution.swing_trailing import compute_ema_swing_stop, compute_trend_breakout_stop
 from app.market.candles import validate_ohlcv
 from app.market.indicators import atr, ema
 from app.strategy.base import NoSignal
@@ -84,6 +87,7 @@ class SwingAutoTrader:
         mode: TradingMode = TradingMode.LIVE,
         trailing_atr_multiplier: float = 2.0,
         strategy_name: str = "EMA 9/200 swing",
+        repository: Repository | None = None,
     ):
         if trailing_atr_multiplier <= 0:
             raise ValueError("trailing ATR multiplier must be positive")
@@ -93,6 +97,7 @@ class SwingAutoTrader:
         self.strategy_name = ""
         self.strategy = Ema9200SwingStrategy()
         self.orders = OrderAPI(mode, client)
+        self.repository = repository
         self.tick_sizes: dict[int, float] = {}
         self.active_positions: dict[str, SwingPosition] = {}
         self.submitted_signal_keys: set[str] = set()
@@ -323,12 +328,14 @@ class SwingAutoTrader:
             position.partial_profit_booked = True
             if position.quantity > 0 and position.protective_order_id is not None:
                 self._modify_protective_stop(symbol, position.protective_order_id, position.quantity, position.stop_loss, market_price)
+            self._save_position(position)
             return SwingOrderResult(symbol, "partial_profit_booked", f"booked 40% at 2R; remaining quantity {position.quantity}", partial_quantity, order_id, position.protective_order_id)
 
         if latest_timestamp > position.entry_timestamp and close < float(ema(frame["close"], 20).iloc[-1]):
             order_id = self._place_market_exit(symbol, position.quantity)
             quantity = position.quantity
             del self.active_positions[symbol]
+            self._delete_position(symbol)
             try:
                 self._cancel_protective_stop(position.protective_order_id)
             except Exception as error:
@@ -342,15 +349,12 @@ class SwingAutoTrader:
                 )
             return SwingOrderResult(symbol, "exited", "completed daily close below EMA20", quantity, order_id, position.protective_order_id)
 
-        ema20_value = float(ema(frame["close"], 20).iloc[-1])
-        candidate_stop = self._round_down_to_tick(
-            ema20_value,
-            self._position_tick_size(position),
-        )
-        if position.protective_order_id is not None and position.quantity > 0 and position.last_trailing_candle < latest_timestamp and position.stop_loss < candidate_stop < market_price:
+        candidate_stop = compute_trend_breakout_stop(frame, self._position_tick_size(position))
+        if candidate_stop is not None and position.protective_order_id is not None and position.quantity > 0 and position.last_trailing_candle < latest_timestamp and position.stop_loss < candidate_stop < market_price:
             self._modify_protective_stop(symbol, position.protective_order_id, position.quantity, candidate_stop, market_price)
             position.stop_loss = candidate_stop
             position.last_trailing_candle = latest_timestamp
+            self._save_position(position)
             return SwingOrderResult(symbol, "stop_trailed", f"EMA20 trailing stop moved to {candidate_stop:.2f}", position.quantity, protective_order_id=position.protective_order_id)
         position.last_trailing_candle = max(position.last_trailing_candle, latest_timestamp)
         return None
@@ -366,18 +370,19 @@ class SwingAutoTrader:
         latest_timestamp = latest["timestamp"]
         if latest_timestamp <= position.last_trailing_candle:
             return None
-        atr_value = float(atr(frame, self.strategy.atr_period).iloc[-1])
-        if not pd.notna(atr_value) or atr_value <= 0:
-            position.last_trailing_candle = latest_timestamp
-            return None
         reference_price = float(latest["close"])
         if current_price is not None:
             reference_price = min(reference_price, float(current_price))
-        candidate_stop = reference_price - self.trailing_atr_multiplier * atr_value
-        candidate_stop = self._round_down_to_tick(
-            candidate_stop,
+        candidate_stop = compute_ema_swing_stop(
+            frame,
+            self.strategy.atr_period,
+            self.trailing_atr_multiplier,
+            reference_price,
             self._position_tick_size(position),
         )
+        if candidate_stop is None:
+            position.last_trailing_candle = latest_timestamp
+            return None
         if candidate_stop <= position.stop_loss or candidate_stop >= reference_price:
             position.last_trailing_candle = latest_timestamp
             return None
@@ -390,6 +395,7 @@ class SwingAutoTrader:
         )
         position.stop_loss = candidate_stop
         position.last_trailing_candle = latest_timestamp
+        self._save_position(position)
         return candidate_stop
 
     def sync_broker_positions(self) -> None:
@@ -405,6 +411,7 @@ class SwingAutoTrader:
         for symbol in list(self.active_positions):
             if self._tradingsymbol(symbol) not in open_symbols:
                 del self.active_positions[symbol]
+                self._delete_position(symbol)
 
     @staticmethod
     def _tradingsymbol(symbol: str) -> str:
@@ -482,6 +489,32 @@ class SwingAutoTrader:
             target_1=signal.target_1,
             strategy_name=self.strategy_name,
         )
+        self._save_position(self.active_positions[candidate.symbol])
+
+    def _save_position(self, position: SwingPosition) -> None:
+        if self.repository is None:
+            return
+        self.repository.save_position(
+            PositionRecord(
+                symbol=position.symbol,
+                side=Side.BUY.value,
+                quantity=position.quantity,
+                entry_price=position.entry_price,
+                stop_loss=position.stop_loss,
+                entry_time=position.entry_timestamp,
+                target_1=position.target_1,
+                protective_order_id=position.protective_order_id,
+                instrument_token=position.instrument_token,
+                position_type="SWING",
+                atr_multiplier=self.trailing_atr_multiplier,
+                strategy_name=position.strategy_name,
+            )
+        )
+
+    def _delete_position(self, symbol: str) -> None:
+        if self.repository is None:
+            return
+        self.repository.delete_position(symbol)
 
     @staticmethod
     def _round_down_to_tick(price: float, tick_size: float) -> float:

@@ -668,15 +668,33 @@ class Repository:
         with self.database.lock:
             self.database.connection.execute(
                 """
-            INSERT INTO positions (symbol, side, quantity, entry_price, stop_loss, entry_time, target_1, target_2, protective_order_id, target_1_hit)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO positions (
+                symbol, side, quantity, entry_price, stop_loss, entry_time, target_1, target_2,
+                protective_order_id, target_1_hit, instrument_token, position_type, atr_multiplier, strategy_name
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 side=excluded.side, quantity=excluded.quantity, entry_price=excluded.entry_price,
                 stop_loss=excluded.stop_loss, entry_time=excluded.entry_time, target_1=excluded.target_1,
                 target_2=excluded.target_2, protective_order_id=excluded.protective_order_id,
-                target_1_hit=excluded.target_1_hit
+                target_1_hit=excluded.target_1_hit, instrument_token=excluded.instrument_token,
+                position_type=excluded.position_type, atr_multiplier=excluded.atr_multiplier,
+                strategy_name=excluded.strategy_name
                 """,
-                (position.symbol, position.side, position.quantity, position.entry_price, position.stop_loss, position.entry_time.isoformat(), position.target_1, position.target_2, position.protective_order_id, int(position.target_1_hit)),
+                (
+                    position.symbol, position.side, position.quantity, position.entry_price, position.stop_loss,
+                    position.entry_time.isoformat(), position.target_1, position.target_2,
+                    position.protective_order_id, int(position.target_1_hit), position.instrument_token,
+                    position.position_type, position.atr_multiplier, position.strategy_name,
+                ),
+            )
+            self.database.connection.commit()
+
+    def update_stop_price(self, symbol: str, stop_loss: float) -> None:
+        with self.database.lock:
+            self.database.connection.execute(
+                "UPDATE positions SET stop_loss = ? WHERE symbol = ?",
+                (stop_loss, symbol),
             )
             self.database.connection.commit()
 
@@ -700,6 +718,10 @@ class Repository:
                 target_2=float(row["target_2"]) if row["target_2"] is not None else None,
                 protective_order_id=row["protective_order_id"],
                 target_1_hit=bool(row["target_1_hit"]),
+                instrument_token=int(row["instrument_token"]) if row["instrument_token"] is not None else None,
+                position_type=row["position_type"] if row["position_type"] is not None else "INTRADAY",
+                atr_multiplier=float(row["atr_multiplier"]) if row["atr_multiplier"] is not None else None,
+                strategy_name=row["strategy_name"] if row["strategy_name"] is not None else "",
             )
             for row in rows
         ]

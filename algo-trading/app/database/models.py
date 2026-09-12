@@ -22,6 +22,10 @@ class TradeRecord:
     exit_price: float
     quantity: int
     pnl: float
+    side: str = "BUY"
+    position_type: str = "INTRADAY"
+    strategy_name: str = ""
+    exit_reason: str = ""
 
 
 @dataclass(frozen=True)

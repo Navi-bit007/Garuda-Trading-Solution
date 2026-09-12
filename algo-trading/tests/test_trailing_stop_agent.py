@@ -18,6 +18,8 @@ class StubKiteClient:
         self.instrument_rows = [{"tradingsymbol": "AAA", "instrument_token": 111, "tick_size": 0.05}]
         self.ltp_response: dict = {}
         self.historical_rows: dict = {}
+        self.broker_holdings = [{"tradingsymbol": "AAA", "quantity": 10}]
+        self.order_history_by_id: dict = {}
 
     def instruments(self, exchange=None):
         return self.instrument_rows
@@ -27,6 +29,12 @@ class StubKiteClient:
 
     def historical_data(self, instrument_token, start, end, interval):
         return self.historical_rows.get((instrument_token, interval), [])
+
+    def positions(self):
+        return {"net": self.broker_holdings}
+
+    def order_history(self, order_id):
+        return self.order_history_by_id.get(order_id, [])
 
 
 def intraday_candles(rows: int = 30, base: float = 100.0, spread: float = 4.0) -> list[dict]:
@@ -282,6 +290,7 @@ def test_swing_ema_position_trails_once_per_completed_daily_candle(tmp_path):
     )
     agent = build_agent(repository, client)
     agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "CNC", "NSE")
+    client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "TRIGGER PENDING"}]
     client.historical_rows[(111, "day")] = daily_candles(rows=30, start_close=100.0, step=1.0)
 
     now = datetime(2025, 2, 1, 10, 0)
@@ -294,4 +303,79 @@ def test_swing_ema_position_trails_once_per_completed_daily_candle(tmp_path):
     agent.run_once(now=now + timedelta(minutes=1))
     [saved_again] = repository.load_positions()
     assert saved_again.stop_loss == first_stop
+    database.close()
+
+
+def swing_position_record(**overrides) -> PositionRecord:
+    values = dict(
+        symbol="NSE:AAA",
+        side="BUY",
+        quantity=10,
+        entry_price=100.0,
+        stop_loss=90.0,
+        entry_time=datetime(2025, 1, 1),
+        protective_order_id="PAPER-STOP-000001",
+        instrument_token=111,
+        position_type="SWING",
+        atr_multiplier=2.0,
+        strategy_name="EMA 9/200 swing",
+    )
+    values.update(overrides)
+    return PositionRecord(**values)
+
+
+def test_expired_overnight_stop_is_rearmed(tmp_path):
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    repository.save_position(swing_position_record())
+    agent = build_agent(repository, client)
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "CNC", "NSE")
+    # The exchange cancels "regular" day orders at market close: simulate that overnight expiry.
+    client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "CANCELLED"}]
+    client.ltp_response = {"NSE:AAA": {"last_price": 105.0}}
+    client.historical_rows[(111, "day")] = []
+
+    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+
+    [saved] = repository.load_positions()
+    assert saved.protective_order_id != "PAPER-STOP-000001"
+    assert saved.protective_order_id in agent.orders.paper_protective_orders
+    assert agent.orders.paper_protective_orders[saved.protective_order_id].stop_loss == 90.0
+    database.close()
+
+
+def test_live_overnight_stop_is_left_alone(tmp_path):
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    repository.save_position(swing_position_record())
+    agent = build_agent(repository, client)
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "CNC", "NSE")
+    client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "TRIGGER PENDING"}]
+    client.historical_rows[(111, "day")] = []
+
+    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+
+    [saved] = repository.load_positions()
+    assert saved.protective_order_id == "PAPER-STOP-000001"
+    database.close()
+
+
+def test_position_closed_at_broker_is_dropped_from_tracking(tmp_path):
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    repository.save_position(swing_position_record())
+    agent = build_agent(repository, client)
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "CNC", "NSE")
+    client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "COMPLETE", "average_price": 89.5}]
+    client.broker_holdings = []  # the SL-M already filled and flattened the holding
+    client.historical_rows[(111, "day")] = []
+
+    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+
+    assert repository.load_positions() == []
+    assert "NSE:AAA" not in agent.positions
+    [trade] = repository.load_trades()
+    assert trade.symbol == "NSE:AAA"
+    assert trade.exit_price == 89.5
+    assert trade.position_type == "SWING"
     database.close()

@@ -36,7 +36,11 @@ class Database:
             entry_price REAL NOT NULL,
             exit_price REAL NOT NULL,
             quantity INTEGER NOT NULL,
-            pnl REAL NOT NULL
+            pnl REAL NOT NULL,
+            side TEXT NOT NULL DEFAULT 'BUY',
+            position_type TEXT NOT NULL DEFAULT 'INTRADAY',
+            strategy_name TEXT NOT NULL DEFAULT '',
+            exit_reason TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS activity (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,6 +202,7 @@ class Database:
             self._migrate_progressive_cycles()
             self._migrate_dynamic_watchlists()
             self._migrate_positions()
+            self._migrate_trades()
             self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_user_signal ON signals(user_id, signal_id)")
             self.connection.execute("CREATE INDEX IF NOT EXISTS ix_pre_spike_events_lookup ON pre_spike_events(user_id, strategy, symbol, timeframe, trading_date, latest_time)")
             self.connection.commit()
@@ -238,6 +243,17 @@ class Database:
             self.connection.execute("ALTER TABLE positions ADD COLUMN atr_multiplier REAL")
         if "strategy_name" not in columns:
             self.connection.execute("ALTER TABLE positions ADD COLUMN strategy_name TEXT NOT NULL DEFAULT ''")
+
+    def _migrate_trades(self) -> None:
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(trades)").fetchall()}
+        if "side" not in columns:
+            self.connection.execute("ALTER TABLE trades ADD COLUMN side TEXT NOT NULL DEFAULT 'BUY'")
+        if "position_type" not in columns:
+            self.connection.execute("ALTER TABLE trades ADD COLUMN position_type TEXT NOT NULL DEFAULT 'INTRADAY'")
+        if "strategy_name" not in columns:
+            self.connection.execute("ALTER TABLE trades ADD COLUMN strategy_name TEXT NOT NULL DEFAULT ''")
+        if "exit_reason" not in columns:
+            self.connection.execute("ALTER TABLE trades ADD COLUMN exit_reason TEXT NOT NULL DEFAULT ''")
 
     def _migrate_signals(self) -> None:
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(signals)").fetchall()}

@@ -290,5 +290,9 @@ def test_swing_trader_persists_position_lifecycle_when_repository_is_supplied(tm
     trader.sync_broker_positions()
 
     assert repository.load_positions() == []
+    [trade] = repository.load_trades()
+    assert trade.symbol == "NSE:AAA"
+    assert trade.position_type == "SWING"
+    assert trade.quantity == 7
     database.close()
     assert len(client.requests) == 2

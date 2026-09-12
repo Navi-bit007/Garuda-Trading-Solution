@@ -57,8 +57,41 @@ class Repository:
 
     def save_trade(self, trade: TradeRecord) -> None:
         with self.database.lock:
-            self.database.connection.execute("INSERT INTO trades (symbol, entry_time, exit_time, entry_price, exit_price, quantity, pnl) VALUES (?, ?, ?, ?, ?, ?, ?)", (trade.symbol, trade.entry_time.isoformat(), trade.exit_time.isoformat(), trade.entry_price, trade.exit_price, trade.quantity, trade.pnl))
+            self.database.connection.execute(
+                """
+                INSERT INTO trades (
+                    symbol, entry_time, exit_time, entry_price, exit_price, quantity, pnl,
+                    side, position_type, strategy_name, exit_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade.symbol, trade.entry_time.isoformat(), trade.exit_time.isoformat(),
+                    trade.entry_price, trade.exit_price, trade.quantity, trade.pnl,
+                    trade.side, trade.position_type, trade.strategy_name, trade.exit_reason,
+                ),
+            )
             self.database.connection.commit()
+
+    def load_trades(self) -> list[TradeRecord]:
+        with self.database.lock:
+            rows = self.database.connection.execute("SELECT * FROM trades ORDER BY exit_time DESC").fetchall()
+        return [
+            TradeRecord(
+                symbol=row["symbol"],
+                entry_time=datetime.fromisoformat(row["entry_time"]),
+                exit_time=datetime.fromisoformat(row["exit_time"]),
+                entry_price=float(row["entry_price"]),
+                exit_price=float(row["exit_price"]),
+                quantity=int(row["quantity"]),
+                pnl=float(row["pnl"]),
+                side=row["side"] if row["side"] is not None else "BUY",
+                position_type=row["position_type"] if row["position_type"] is not None else "INTRADAY",
+                strategy_name=row["strategy_name"] if row["strategy_name"] is not None else "",
+                exit_reason=row["exit_reason"] if row["exit_reason"] is not None else "",
+            )
+            for row in rows
+        ]
 
     def save_activity(self, activity: ActivityRecord) -> None:
         with self.database.lock:

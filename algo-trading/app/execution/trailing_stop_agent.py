@@ -12,7 +12,7 @@ import pandas as pd
 from app.broker.market_data import MarketData
 from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import Side
-from app.database.models import PositionRecord
+from app.database.models import PositionRecord, TradeRecord
 from app.database.repository import Repository
 from app.execution.swing_trailing import compute_ema_swing_stop, compute_trend_breakout_stop
 from app.execution.trailing_stop import TrailingStop
@@ -28,6 +28,11 @@ DEFAULT_ATR_REFRESH_SECONDS = 300.0
 DEFAULT_ATR_PERIOD = 14
 DEFAULT_SWING_LOOKBACK_DAYS = 600
 MAX_MODIFY_ATTEMPTS = 3
+# Statuses that mean the exchange has definitively dropped the order (day-order expiry at
+# market close, a manual cancel, or a broker rejection) -- anything else (TRIGGER PENDING,
+# OPEN, ...) is treated as still live, since we'd rather risk one extra check next cycle than
+# place a duplicate protective order on ambiguous/transient data.
+TERMINAL_INACTIVE_ORDER_STATUSES = {"CANCELLED", "REJECTED"}
 
 
 @dataclass
@@ -240,12 +245,114 @@ class TrailingStopAgent:
     # -- swing: daily-candle-driven trail --------------------------------------
 
     def _process_swing(self, timestamp: datetime) -> None:
-        positions = [position for position in self.positions.values() if position.record.position_type == "SWING"]
-        for position in positions:
+        if not any(position.record.position_type == "SWING" for position in self.positions.values()):
+            return
+        try:
+            self._reconcile_swing_positions(timestamp)
+        except Exception:
+            logger.exception("Swing broker reconciliation failed")
+        for position in [p for p in self.positions.values() if p.record.position_type == "SWING"]:
             try:
                 self._process_swing_position(position, timestamp)
             except Exception:
                 logger.exception("Swing trailing update failed for %s", position.record.symbol)
+
+    def _reconcile_swing_positions(self, timestamp: datetime) -> None:
+        """Detect an exchange-expired overnight SL-M and re-place it, and drop positions the
+        broker no longer holds (closed by a fill nothing else caught, e.g. while no dashboard
+        was open). NSE "regular" orders -- including the SL-M this app places -- are day
+        orders: Zerodha cancels them at market close, so a swing (multi-day) position's stop
+        would otherwise sit unprotected every morning until something re-arms it.
+        """
+        positions = [position for position in self.positions.values() if position.record.position_type == "SWING"]
+        if not positions or self.broker_client is None or not hasattr(self.broker_client, "positions"):
+            return
+        try:
+            broker_positions = self.broker_client.positions().get("net", [])
+        except Exception:
+            logger.exception("Broker position lookup failed during swing reconciliation")
+            return
+        open_tradingsymbols = {str(entry.get("tradingsymbol")) for entry in broker_positions if int(entry.get("quantity", 0) or 0) != 0}
+        for position in positions:
+            record = position.record
+            if self._tradingsymbol(record.symbol) not in open_tradingsymbols:
+                exit_price = self._broker_exit_fill_price(record)
+                self.repository.save_trade(
+                    TradeRecord(
+                        symbol=record.symbol,
+                        entry_time=record.entry_time,
+                        exit_time=datetime.now(),
+                        entry_price=record.entry_price,
+                        exit_price=exit_price,
+                        quantity=record.quantity,
+                        pnl=(exit_price - record.entry_price) * record.quantity,
+                        side=record.side,
+                        position_type="SWING",
+                        strategy_name=record.strategy_name,
+                        exit_reason="broker-side position closed (protective stop or manual exit)",
+                    )
+                )
+                self.repository.delete_position(record.symbol)
+                self.positions.pop(record.symbol, None)
+                continue
+            if self._protective_stop_needs_rearm(record.protective_order_id):
+                self._rearm_protective_stop(position)
+
+    def _broker_exit_fill_price(self, record: PositionRecord) -> float:
+        order_id = record.protective_order_id
+        if order_id and self.broker_client is not None and hasattr(self.broker_client, "order_history"):
+            try:
+                history = self.broker_client.order_history(order_id) or []
+            except Exception:
+                history = []
+            for entry in reversed(history):
+                status = str(entry.get("status", "")).upper()
+                try:
+                    average_price = float(entry.get("average_price", 0) or 0)
+                except (TypeError, ValueError):
+                    average_price = 0
+                if status in {"COMPLETE", "COMPLETED", "FILLED"} and average_price > 0:
+                    return average_price
+        return record.stop_loss
+
+    def _protective_stop_needs_rearm(self, order_id: str | None) -> bool:
+        if not order_id:
+            return True
+        if self.broker_client is None or not hasattr(self.broker_client, "order_history"):
+            return False
+        try:
+            history = self.broker_client.order_history(order_id)
+        except Exception:
+            logger.exception("order_history lookup failed for %s", order_id)
+            return False
+        if not history:
+            return True
+        status = str(history[-1].get("status", "")).strip().upper()
+        return status in TERMINAL_INACTIVE_ORDER_STATUSES
+
+    def _rearm_protective_stop(self, position: AgentPosition) -> None:
+        record = position.record
+        reference_price = record.entry_price
+        try:
+            key = f"{self._exchange(record.symbol)}:{self._tradingsymbol(record.symbol)}"
+            quote = self.market_data.ltp([key]).get(key)
+            if quote:
+                reference_price = float(quote.get("last_price", 0)) or reference_price
+        except Exception:
+            logger.exception("LTP lookup failed while re-arming stop for %s", record.symbol)
+        exit_side = Side.SELL if record.side == "BUY" else Side.BUY
+        request = OrderRequest(record.symbol, exit_side, record.quantity, reference_price, record.stop_loss, "CNC", self._exchange(record.symbol))
+        try:
+            new_order_id = self.orders.place_protective_stop(request)
+        except Exception as error:
+            logger.error("Failed to re-arm protective stop for %s: %s", record.symbol, error)
+            self.notifier.send(f"critical_unprotected: could not re-arm overnight-expired stop for {record.symbol}: {error}")
+            return
+        updated = replace(record, protective_order_id=new_order_id)
+        self.repository.save_position(updated)
+        position.record = updated
+        logger.info("Re-armed protective stop for %s at %.2f (order %s)", record.symbol, record.stop_loss, new_order_id)
+        self.notifier.send(f"Re-armed protective stop for {record.symbol} at {record.stop_loss:.2f} (previous SL-M had expired)")
 
     def _process_swing_position(self, position: AgentPosition, timestamp: datetime) -> None:
         record = position.record

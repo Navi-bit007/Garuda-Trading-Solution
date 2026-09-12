@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, ROUND_FLOOR
 from math import floor
 from time import monotonic, sleep
@@ -10,7 +11,7 @@ import pandas as pd
 
 from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import NSE_TICK_SIZE, Side, TradingMode
-from app.database.models import PositionRecord
+from app.database.models import PositionRecord, TradeRecord
 from app.database.repository import Repository
 from app.execution.swing_trailing import compute_ema_swing_stop, compute_trend_breakout_stop
 from app.market.candles import validate_ohlcv
@@ -329,6 +330,7 @@ class SwingAutoTrader:
             if position.quantity > 0 and position.protective_order_id is not None:
                 self._modify_protective_stop(symbol, position.protective_order_id, position.quantity, position.stop_loss, market_price)
             self._save_position(position)
+            self._record_trade_history(position, partial_quantity, market_price, "partial profit booked at target 1")
             return SwingOrderResult(symbol, "partial_profit_booked", f"booked 40% at 2R; remaining quantity {position.quantity}", partial_quantity, order_id, position.protective_order_id)
 
         if latest_timestamp > position.entry_timestamp and close < float(ema(frame["close"], 20).iloc[-1]):
@@ -336,6 +338,7 @@ class SwingAutoTrader:
             quantity = position.quantity
             del self.active_positions[symbol]
             self._delete_position(symbol)
+            self._record_trade_history(position, quantity, market_price, "completed daily close below EMA20")
             try:
                 self._cancel_protective_stop(position.protective_order_id)
             except Exception as error:
@@ -410,8 +413,28 @@ class SwingAutoTrader:
         self.broker_open_symbols = open_symbols
         for symbol in list(self.active_positions):
             if self._tradingsymbol(symbol) not in open_symbols:
+                position = self.active_positions[symbol]
+                exit_price = self._broker_exit_fill_price(position)
                 del self.active_positions[symbol]
                 self._delete_position(symbol)
+                self._record_trade_history(position, position.quantity, exit_price, "broker-side position closed (protective stop or manual exit)")
+
+    def _broker_exit_fill_price(self, position: SwingPosition) -> float:
+        order_id = position.protective_order_id
+        if order_id and hasattr(self.client, "order_history"):
+            try:
+                history = self.client.order_history(order_id) or []
+            except Exception:
+                history = []
+            for record in reversed(history):
+                status = str(record.get("status", "")).upper()
+                try:
+                    average_price = float(record.get("average_price", 0) or 0)
+                except (TypeError, ValueError):
+                    average_price = 0
+                if status in {"COMPLETE", "COMPLETED", "FILLED"} and average_price > 0:
+                    return average_price
+        return position.stop_loss
 
     @staticmethod
     def _tradingsymbol(symbol: str) -> str:
@@ -515,6 +538,25 @@ class SwingAutoTrader:
         if self.repository is None:
             return
         self.repository.delete_position(symbol)
+
+    def _record_trade_history(self, position: SwingPosition, quantity: int, exit_price: float, exit_reason: str) -> None:
+        if self.repository is None:
+            return
+        self.repository.save_trade(
+            TradeRecord(
+                symbol=position.symbol,
+                entry_time=position.entry_timestamp,
+                exit_time=datetime.now(),
+                entry_price=position.entry_price,
+                exit_price=exit_price,
+                quantity=quantity,
+                pnl=(exit_price - position.entry_price) * quantity,
+                side=Side.BUY.value,
+                position_type="SWING",
+                strategy_name=position.strategy_name,
+                exit_reason=exit_reason,
+            )
+        )
 
     @staticmethod
     def _round_down_to_tick(price: float, tick_size: float) -> float:

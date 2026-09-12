@@ -10,7 +10,6 @@ import re
 import sys
 import time
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -194,6 +193,8 @@ SWING_STRATEGIES = {
 }
 WORKSPACE_PAGES = [
     "Overview",
+    "Live monitor",
+    "P&L statement",
     "Watchlists",
     "Scanner & signals",
     "Swing auto trading",
@@ -439,6 +440,7 @@ def inject_styles(st) -> None:
         .status { display: inline-flex; align-items: center; gap: 8px; border: 1px solid #9bc9ac; background: var(--mint); color: #1d5434; border-radius: 999px; padding: 5px 10px; font-size: .78rem; font-weight: 700; }
         .status-dot { width: 7px; height: 7px; background: #20844b; border-radius: 50%; }
         .empty { border: 1px dashed #b6c4b7; padding: 22px; border-radius: 7px; color: var(--muted); background: rgba(255,255,255,.38); }
+        .last-refreshed { text-align: right; color: var(--muted); font-size: .78rem; margin-bottom: 6px; }
         .watchlist-card { min-height: 220px; }
         .watchlist-card h3 { margin: 0; font-size: 1.15rem; }
         .watchlist-count { color: var(--muted); font-size: .86rem; margin: 4px 0 14px; }
@@ -1052,7 +1054,10 @@ def render_broker_reconciliation(st, settings, access_token: str) -> None:
                     "quantity_mismatches": quantity_mismatches,
                 }
             except Exception as error:
-                st.error(f"Broker positions could not be loaded: {error}")
+                if "timed out" in str(error).lower():
+                    st.error("Kite API did not respond in time. It may be under heavy load right now — wait a moment and click Refresh broker positions again.")
+                else:
+                    st.error(f"Broker positions could not be loaded: {error}")
         reconciliation = st.session_state.get("broker_reconciliation")
         if reconciliation is None:
             st.caption("No broker comparison has been run in this session.")
@@ -1285,6 +1290,213 @@ def render_position_monitor(st, settings, access_token: str) -> None:
     recent_events = st.session_state.get("dashboard_events", [])[-5:]
     if recent_events:
         st.caption(" · ".join(f"{event.kind}: {event.symbol}" for event in recent_events))
+
+
+def render_live_monitor(st, settings) -> None:
+    @st.fragment(run_every=10)
+    def render_live_monitor_content() -> None:
+        st.markdown(
+            f'<div class="last-refreshed">Last refreshed: {pd.Timestamp.now(tz="Asia/Kolkata"):%d %b %Y, %I:%M:%S %p} IST</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div class="eyebrow">Unified position tracker</div>', unsafe_allow_html=True)
+        st.title("Live monitor")
+        st.caption(
+            "Every open intraday and swing position, read straight from the database the "
+            "standalone trailing-stop agent maintains -- cross-checked against Zerodha's own "
+            "live positions so drift between the two is visible immediately."
+        )
+        repository = get_dashboard_repository(st)
+        records = repository.load_positions()
+        if not records:
+            st.markdown('<div class="empty">No open positions.</div>', unsafe_allow_html=True)
+            return
+
+        access_token = runtime_access_token(st, settings)
+        quotes: dict = {}
+        broker_open_tradingsymbols: set[str] | None = None
+        if broker_credentials_configured(settings) and access_token:
+            try:
+                client = connect_kite(settings, access_token)
+                keys = [record.symbol if ":" in record.symbol else f"NSE:{record.symbol}" for record in records]
+                quotes = client.client.ltp(keys)
+                broker_positions = client.client.positions().get("net", [])
+                broker_open_tradingsymbols = {
+                    str(position.get("tradingsymbol", "")).strip().upper()
+                    for position in broker_positions
+                    if int(position.get("quantity", 0) or 0) != 0
+                }
+            except Exception as error:
+                st.warning(f"Live broker data unavailable right now: {error}")
+
+        def tradingsymbol(symbol: str) -> str:
+            return symbol.split(":", 1)[1].strip().upper() if ":" in symbol else symbol.strip().upper()
+
+        def build_rows(position_type: str) -> list[dict]:
+            rows = []
+            for record in records:
+                if record.position_type != position_type:
+                    continue
+                key = record.symbol if ":" in record.symbol else f"NSE:{record.symbol}"
+                quote = quotes.get(key) or {}
+                last_price = float(quote.get("last_price", 0) or 0) or record.entry_price
+                direction = 1 if record.side == "BUY" else -1
+                pnl = (last_price - record.entry_price) * record.quantity * direction
+                stop_distance_pct = abs(last_price - record.stop_loss) / last_price * 100 if last_price else 0.0
+                if broker_open_tradingsymbols is None:
+                    broker_status = "Unknown"
+                elif tradingsymbol(record.symbol) in broker_open_tradingsymbols:
+                    broker_status = "Matches broker"
+                else:
+                    broker_status = "Not found at broker"
+                rows.append(
+                    {
+                        "Symbol": record.symbol,
+                        "Strategy": record.strategy_name or "-",
+                        "Side": record.side,
+                        "Qty": record.quantity,
+                        "Entry": record.entry_price,
+                        "Last": last_price,
+                        "Stop": record.stop_loss,
+                        "Stop distance %": stop_distance_pct,
+                        "P&L": pnl,
+                        "Target 1 hit": "Yes" if record.target_1_hit else "No",
+                        "Protective order": record.protective_order_id or "Unavailable",
+                        "Broker status": broker_status,
+                        "Entered": record.entry_time,
+                    }
+                )
+            return rows
+
+        column_config = {
+            "Entry": st.column_config.NumberColumn(format="₹%.2f"),
+            "Last": st.column_config.NumberColumn(format="₹%.2f"),
+            "Stop": st.column_config.NumberColumn(format="₹%.2f"),
+            "Stop distance %": st.column_config.NumberColumn(format="%.2f%%"),
+            "P&L": st.column_config.NumberColumn(format="₹%.2f"),
+            "Entered": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
+        }
+
+        def render_table(title: str, position_type: str) -> None:
+            st.subheader(title)
+            rows = build_rows(position_type)
+            if not rows:
+                st.markdown('<div class="empty">No open positions.</div>', unsafe_allow_html=True)
+                return
+            frame = pd.DataFrame(rows).sort_values("Entered", ascending=False)
+            st.dataframe(frame, width="stretch", hide_index=True, column_config=column_config)
+
+        render_table("Intraday positions", "INTRADAY")
+        render_table("Swing positions", "SWING")
+
+        if broker_open_tradingsymbols is not None:
+            tracked_tradingsymbols = {tradingsymbol(record.symbol) for record in records}
+            untracked = sorted(broker_open_tradingsymbols - tracked_tradingsymbols)
+            if untracked:
+                st.warning(
+                    "Zerodha shows open position(s) this app isn't tracking at all -- "
+                    "possibly a manual trade or a dropped record: " + ", ".join(untracked)
+                )
+
+        intraday_count = sum(1 for record in records if record.position_type == "INTRADAY")
+        swing_count = len(records) - intraday_count
+        st.caption(f"{intraday_count} intraday · {swing_count} swing position(s) · refreshes every 10 seconds.")
+
+    render_live_monitor_content()
+
+
+def render_pnl_statement(st, settings) -> None:
+    @st.fragment(run_every=10)
+    def render_pnl_statement_content() -> None:
+        st.markdown(
+            f'<div class="last-refreshed">Last refreshed: {pd.Timestamp.now(tz="Asia/Kolkata"):%d %b %Y, %I:%M:%S %p} IST</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div class="eyebrow">Trade record</div>', unsafe_allow_html=True)
+        st.title("P&L statement")
+        st.caption("Every open position (live) and every closed trade (realized), in one statement.")
+
+        repository = get_dashboard_repository(st)
+        open_records = repository.load_positions()
+        closed_records = repository.load_trades()
+        if not open_records and not closed_records:
+            st.markdown('<div class="empty">No trades yet.</div>', unsafe_allow_html=True)
+            return
+
+        access_token = runtime_access_token(st, settings)
+        quotes: dict = {}
+        if open_records and broker_credentials_configured(settings) and access_token:
+            try:
+                client = connect_kite(settings, access_token)
+                keys = [record.symbol if ":" in record.symbol else f"NSE:{record.symbol}" for record in open_records]
+                quotes = client.client.ltp(keys)
+            except Exception as error:
+                st.warning(f"Live quotes unavailable right now: {error}")
+
+        status_filter = st.radio("Show", ["All", "Open", "Closed"], horizontal=True, key="pnl_statement_filter")
+
+        rows = []
+        if status_filter in ("All", "Open"):
+            for record in open_records:
+                key = record.symbol if ":" in record.symbol else f"NSE:{record.symbol}"
+                quote = quotes.get(key) or {}
+                ltp = float(quote.get("last_price", 0) or 0) or record.entry_price
+                direction = 1 if record.side == "BUY" else -1
+                pnl = (ltp - record.entry_price) * record.quantity * direction
+                rows.append(
+                    {
+                        "Stock Name": record.symbol,
+                        "Current Position": "OPEN",
+                        "Entry Price": record.entry_price,
+                        "Exit Price": None,
+                        "LTP": ltp,
+                        "P&L": pnl,
+                        "SL Current Price": record.stop_loss,
+                        "Used Strategy Name": record.strategy_name or "-",
+                        "Activity time": record.entry_time,
+                    }
+                )
+        if status_filter in ("All", "Closed"):
+            for trade in closed_records:
+                rows.append(
+                    {
+                        "Stock Name": trade.symbol,
+                        "Current Position": "CLOSED",
+                        "Entry Price": trade.entry_price,
+                        "Exit Price": trade.exit_price,
+                        "LTP": None,
+                        "P&L": trade.pnl,
+                        "SL Current Price": None,
+                        "Used Strategy Name": trade.strategy_name or "-",
+                        "Activity time": trade.exit_time,
+                    }
+                )
+
+        if not rows:
+            st.markdown('<div class="empty">No trades match this filter.</div>', unsafe_allow_html=True)
+            return
+
+        frame = pd.DataFrame(rows).sort_values("Activity time", ascending=False).drop(columns="Activity time")
+        st.dataframe(
+            frame,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Entry Price": st.column_config.NumberColumn(format="₹%.2f"),
+                "Exit Price": st.column_config.NumberColumn(format="₹%.2f"),
+                "LTP": st.column_config.NumberColumn(format="₹%.2f"),
+                "P&L": st.column_config.NumberColumn(format="₹%.2f"),
+                "SL Current Price": st.column_config.NumberColumn(format="₹%.2f"),
+            },
+        )
+        realized_pnl = sum(trade.pnl for trade in closed_records)
+        unrealized_pnl = sum(row["P&L"] for row in rows if row["Current Position"] == "OPEN")
+        st.caption(
+            f"{len(open_records)} open · {len(closed_records)} closed · "
+            f"Realized P&L ₹{realized_pnl:,.2f} · Unrealized P&L ₹{unrealized_pnl:,.2f}"
+        )
+
+    render_pnl_statement_content()
 
 
 def render_kite_authentication(st, settings) -> None:
@@ -2361,15 +2573,6 @@ def render_high_conviction_signal_table(st, repository: Repository, user_id: str
     )
 
 
-def backup_and_clear_signal_state(st, settings) -> tuple[bytes, dict[str, int]]:
-    stop_dashboard_signal_engine(st)
-
-    repository = get_dashboard_repository(st)
-    user_id = dashboard_user_id(settings)
-    backup, counts = repository.backup_and_clear_signal_state(user_id)
-    return json.dumps(backup, indent=2, default=str).encode("utf-8"), counts
-
-
 def create_swing_auto_trader(client, mode, trailing_multiplier: float, strategy_name: str, repository=None):
     try:
         return SwingAutoTrader(client, mode, trailing_multiplier, strategy_name, repository=repository)
@@ -2410,7 +2613,7 @@ def render_swing_auto_trading(st, settings) -> None:
             "Maximum capital per position",
             min_value=1.0,
             max_value=10_000_000.0,
-            value=100_000.0,
+            value=2_000.0,
             step=1_000.0,
             format="%.2f",
             key="swing_amount_limit",
@@ -2419,7 +2622,7 @@ def render_swing_auto_trading(st, settings) -> None:
             "Maximum quantity per position",
             min_value=1,
             max_value=1_000_000,
-            value=100,
+            value=1,
             step=1,
             key="swing_quantity_limit",
         )
@@ -2523,12 +2726,6 @@ def render_swing_auto_trading(st, settings) -> None:
         with scan_column:
             manual_scan = st.button("Run scan now", icon=":material/search:", width="stretch")
 
-        status_label = "running" if enabled else "stopped"
-        st.markdown(
-            f"<div class='engine-panel'><strong>● Swing scanner {status_label}</strong><br><span style='color:#53645a'>{selected_strategy_label} · Completed daily candles · Max capital ₹{amount_limit:,.0f} per position · Max quantity {int(quantity_limit)} shares</span></div>",
-            unsafe_allow_html=True,
-        )
-
         try:
             trader.sync_broker_positions()
         except Exception as error:
@@ -2552,13 +2749,21 @@ def render_swing_auto_trading(st, settings) -> None:
         should_scan = manual_scan or auto_enabled
         if should_scan:
             with st.spinner(f"Loading daily history and scanning {selected_strategy_label}..."):
-                result = trader.scan(
-                    selected_symbols,
-                    lambda instrument_token: load_swing_daily_candles_cached(client.client, access_token, instrument_token, scan_day),
-                )
-            st.session_state.swing_scan_result = result
-            st.session_state.swing_last_scan_day = scan_day
-            if auto_enabled and settings.trading_mode == TradingMode.LIVE and live_confirmed:
+                try:
+                    result = trader.scan(
+                        selected_symbols,
+                        lambda instrument_token: load_swing_daily_candles_cached(client.client, access_token, instrument_token, scan_day),
+                    )
+                    st.session_state.swing_last_error = None
+                except Exception as error:
+                    st.session_state.swing_last_error = str(error)
+                    st.error(f"Swing scan could not be completed: {error}")
+                    result = None
+            st.session_state.swing_last_scan_at = datetime.now()
+            if result is not None:
+                st.session_state.swing_scan_result = result
+                st.session_state.swing_last_scan_day = scan_day
+            if result is not None and auto_enabled and settings.trading_mode == TradingMode.LIVE and live_confirmed:
                 available_slots = max(0, int(settings.max_open_positions) - len(trader.active_positions))
                 for candidate in result.candidates[:available_slots]:
                     outcome = trader.submit_candidate(candidate, float(amount_limit), int(quantity_limit))
@@ -2574,6 +2779,29 @@ def render_swing_auto_trading(st, settings) -> None:
                         st.error(f"CRITICAL {outcome.symbol}: {outcome.reason}")
                     elif outcome.status == "rejected":
                         st.error(f"{outcome.symbol}: {outcome.reason}")
+
+        swing_last_error = st.session_state.get("swing_last_error")
+        last_scan_at = st.session_state.get("swing_last_scan_at")
+        last_scan_label = last_scan_at.strftime("%I:%M:%S %p") if last_scan_at else "No scan yet"
+        if kill_switch_active or not enabled:
+            swing_engine_state = "stopped"
+        elif swing_last_error:
+            swing_engine_state = "error"
+        else:
+            swing_engine_state = "running"
+        if swing_engine_state in {"running", "error"}:
+            state_copy = {
+                "running": ("Swing scanner armed", f"Monitoring {len(selected_symbols)} selected stocks · rescans every 60s for a fresh completed daily candle"),
+                "error": ("Swing scanner needs attention", escape((swing_last_error or "The latest scan cycle reported an error")[:240])),
+            }[swing_engine_state]
+            render_scan_activity_banner(st, swing_engine_state, *state_copy)
+        status_color = "#b42318" if swing_engine_state == "error" else "#20844b" if swing_engine_state == "running" else "#b7791f"
+        st.markdown(
+            f"<div class='engine-panel'><strong style='color:{status_color}'>● Swing scanner {swing_engine_state}</strong><br>"
+            f"<span style='color:#53645a'>{selected_strategy_label} · Completed daily candles · Max capital ₹{amount_limit:,.0f} per position · "
+            f"Max quantity {int(quantity_limit)} shares · Last scan {last_scan_label}</span></div>",
+            unsafe_allow_html=True,
+        )
 
         result = st.session_state.get("swing_scan_result")
         result_strategy_name = getattr(result, "strategy_name", "EMA 9/200 swing") if result is not None else None
@@ -2925,6 +3153,24 @@ def render_historical_day_scan(st, settings) -> None:
             st.warning("Some stocks could not be evaluated: " + " · ".join(result.errors[:10]))
 
 
+def render_scan_activity_banner(st, state: str, title: str, detail: str) -> None:
+    animation_markup = '<div class="scan-activity-beam"><span></span><span></span><span></span><span></span></div>' if state == "running" else ""
+    st.markdown(
+        f"""
+        <div class="scan-activity {state}" role="status" aria-live="polite">
+            <div class="scan-activity-mark"><span class="scan-activity-dot"></span></div>
+            <div class="scan-activity-copy">
+                <strong>{title}</strong>
+                <span>{detail}</span>
+                {animation_markup}
+            </div>
+            <div class="scan-activity-live">{state.upper()}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_signal_feed(st, settings) -> None:
     @st.fragment(run_every=5)
     def render_live_signal_feed() -> None:
@@ -3005,21 +3251,7 @@ def render_signal_feed_content(st, settings) -> None:
             "stopping": ("Stopping scan engine", "The current stock evaluation will finish, then the worker will exit"),
             "error": ("Scan engine needs attention", escape(status.last_error[:240] if status else "The latest scan cycle reported an error")),
         }[engine_state]
-        animation_markup = '<div class="scan-activity-beam"><span></span><span></span><span></span><span></span></div>' if engine_state == "running" else ""
-        st.markdown(
-            f"""
-            <div class="scan-activity {engine_state}" role="status" aria-live="polite">
-                <div class="scan-activity-mark"><span class="scan-activity-dot"></span></div>
-                <div class="scan-activity-copy">
-                    <strong>{state_copy[0]}</strong>
-                    <span>{state_copy[1]}</span>
-                    {animation_markup}
-                </div>
-                <div class="scan-activity-live">{engine_state.upper()}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        render_scan_activity_banner(st, engine_state, *state_copy)
     st.markdown(
         f"<div class='engine-panel'><strong style='color:{status_color}'>● Signal engine {status_label.lower()}</strong><br><span style='color:#53645a'>Strategy {selected_live_strategy} · Monitoring {len(selected)} unique stocks from {len(selected_watchlists)} selected watchlist{'s' if len(selected_watchlists) != 1 else ''} · Timeframe {settings.signal_timeframe} · Last scan {last_scan}</span></div>",
         unsafe_allow_html=True,
@@ -3367,8 +3599,6 @@ def render_automatic_trading(st, settings) -> None:
     )
     max_entries = limit_column.number_input("Maximum entries per run", min_value=1, max_value=5, value=1, step=1, key="automatic_max_entries")
     automatic_enabled = bool(st.session_state.get("automatic_enabled", False))
-    status_text = "Auto trade is running. New qualifying BUY signals will be submitted automatically." if automatic_enabled else "Auto trade is stopped. Use Start auto trade to submit qualifying BUY signals."
-    st.caption(status_text)
     if settings.trading_mode == TradingMode.LIVE:
         st.warning("LIVE mode is active. Enabling automatic entries can place real MARKET orders.", icon=":material/warning:")
     else:
@@ -3446,6 +3676,7 @@ def render_automatic_trading(st, settings) -> None:
         progress = ScanProgress(st, "Automatic scan running")
         st.session_state.automatic_last_run_at = run_started_at
         st.session_state.automatic_next_run_at = run_started_at + timedelta(seconds=300)
+        st.session_state.automatic_last_error = None
         try:
             if uses_market_filters or uses_market_confirmation:
                 progress.update("Loading NIFTY 50 market regime")
@@ -3549,7 +3780,41 @@ def render_automatic_trading(st, settings) -> None:
             progress.complete(f"Automatic run complete: {len(submitted)} submitted, {len(rejected)} rejected")
         except Exception as error:
             progress.error("Automatic scan could not be completed")
+            st.session_state.automatic_last_error = str(error)
             st.error(f"Automatic scan could not be completed: {error}")
+
+    @st.fragment(run_every=5)
+    def render_automatic_status() -> None:
+        live_automatic_enabled = bool(st.session_state.get("automatic_enabled", False))
+        automatic_last_error = st.session_state.get("automatic_last_error")
+        automatic_last_run_at = st.session_state.get("automatic_last_run_at")
+        automatic_next_run_at = st.session_state.get("automatic_next_run_at")
+        last_run_label = automatic_last_run_at.strftime("%I:%M:%S %p") if automatic_last_run_at else "No run yet"
+        next_run_label = automatic_next_run_at.strftime("%I:%M:%S %p") if automatic_next_run_at else "pending first run"
+        stalled = bool(live_automatic_enabled and automatic_next_run_at is not None and datetime.now() > automatic_next_run_at + timedelta(seconds=120))
+        if not live_automatic_enabled:
+            automatic_engine_state = "stopped"
+        elif automatic_last_error:
+            automatic_engine_state = "error"
+        elif stalled:
+            automatic_engine_state = "stalled"
+        else:
+            automatic_engine_state = "running"
+        if automatic_engine_state in {"running", "stalled", "error"}:
+            state_copy = {
+                "running": ("Auto trade armed", f"Monitoring {len(token_to_symbol)} stocks from {universe_label} · next scan around {next_run_label}"),
+                "stalled": ("Scheduler heartbeat is stale", "Auto trade is enabled but has not completed a cycle recently"),
+                "error": ("Automatic trading needs attention", escape((automatic_last_error or "The latest automatic cycle reported an error")[:240])),
+            }[automatic_engine_state]
+            render_scan_activity_banner(st, automatic_engine_state, *state_copy)
+        automatic_status_color = "#b42318" if automatic_engine_state == "error" else "#20844b" if automatic_engine_state == "running" else "#b7791f"
+        st.markdown(
+            f"<div class='engine-panel'><strong style='color:{automatic_status_color}'>● Auto trade {automatic_engine_state}</strong><br>"
+            f"<span style='color:#53645a'>{selected_strategy} · {universe_label} · {len(token_to_symbol)} stocks · Timeframe 5minute · Last run {last_run_label} · Next run {next_run_label}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+    render_automatic_status()
 
     start_column, stop_column, scan_column = st.columns([2, 1, 1])
     with start_column:
@@ -3707,11 +3972,37 @@ def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, ac
     first.metric("Closed trades", closed_count)
     if closed_count:
         wins = int((closed_activity["pnl"] > 0).sum()) if not activity.empty else int((trades["pnl"] > 0).sum())
-        second.metric("Win rate", f"{wins / closed_count:.1%}")
+        overall_win_rate = wins / closed_count
+        second.metric("Win rate", f"{overall_win_rate:.1%}")
     else:
+        overall_win_rate = 0.0
         second.metric("Win rate", "0.0%")
     third.metric("Risk budget", f"{settings.risk_per_trade:.2%} / trade")
     fourth.metric("Ledger events", int(len(activity)) if not activity.empty else int(len(orders) + len(trades)))
+
+    card_col, table_col = st.columns([1, 3])
+    card_col.metric("Overall success ratio", f"{overall_win_rate:.1%}", f"{closed_count} closed trades")
+    with table_col:
+        st.markdown("**Strategy vs success ratio**")
+        strategy_trades = trades.copy() if not trades.empty else pd.DataFrame(columns=["strategy_name", "pnl"])
+        if strategy_trades.empty:
+            st.markdown('<div class="empty">No closed trades with strategy tracking yet.</div>', unsafe_allow_html=True)
+        else:
+            strategy_trades["strategy_name"] = strategy_trades["strategy_name"].fillna("").replace("", "Unlabeled")
+            strategy_trades["pnl"] = pd.to_numeric(strategy_trades["pnl"], errors="coerce").fillna(0.0)
+            by_strategy = strategy_trades.groupby("strategy_name").agg(
+                Trades=("pnl", "size"),
+                Wins=("pnl", lambda values: int((values > 0).sum())),
+                Net_PnL=("pnl", "sum"),
+            ).reset_index()
+            by_strategy["Success ratio"] = (by_strategy["Wins"] / by_strategy["Trades"]).map(lambda value: f"{value:.1%}")
+            by_strategy = by_strategy.rename(columns={"strategy_name": "Strategy"}).sort_values("Net_PnL", ascending=False)
+            st.dataframe(
+                by_strategy[["Strategy", "Trades", "Wins", "Success ratio", "Net_PnL"]],
+                width="stretch",
+                hide_index=True,
+                column_config={"Net_PnL": st.column_config.NumberColumn("Net P&L", format="₹%.2f")},
+            )
     render_control_center(st, settings, activity, day_pnl)
     st.subheader("Equity path")
     equity_source = activity[activity["event_kind"].isin(["exit_submitted", "broker_exit_detected"])] if not activity.empty else trades
@@ -3803,41 +4094,26 @@ def main() -> None:
             key="workspace_navigation",
             width="stretch",
         )
+        previous_page = st.session_state.get("previous_workspace_page")
         st.session_state.active_page = page
         st.session_state.previous_workspace_page = page
+        if page != previous_page:
+            # Auto trading must never keep running silently once its control page is left --
+            # arming it again always requires an explicit, freshly-confirmed Start click.
+            # (Unattended execution belongs to the standalone trailing-stop agent process, not
+            # to session state that outlives a glance at another dashboard page.)
+            if previous_page == "Swing auto trading":
+                st.session_state.swing_auto_enabled = False
+                st.session_state.swing_kill_switch = False
+                st.session_state.swing_live_confirmation = False
+            if previous_page == "Automatic trading":
+                st.session_state.automatic_enabled = False
         if not authenticated:
             st.caption("Complete both Kite authentication steps to unlock the workspace.")
         st.divider()
         st.caption(f"Session date  {date.today().isoformat()}")
         st.caption(f"Broker mode  {settings.trading_mode.value}")
         if authenticated:
-            if st.button("Refresh data", width="stretch", icon=":material/refresh:"):
-                st.rerun()
-            if st.button("Backup and clear signals", width="stretch", icon=":material/archive:"):
-                try:
-                    backup_data, cleared_counts = backup_and_clear_signal_state(st, settings)
-                    st.session_state.signal_backup_data = backup_data
-                    st.session_state.signal_backup_name = f"signal-backup-{datetime.now(ZoneInfo('Asia/Kolkata')):%Y%m%d-%H%M%S}-IST.json"
-                    st.session_state.signal_backup_counts = cleared_counts
-                    st.success("Signal results and notifications cleared.")
-                except Exception as error:
-                    st.error(f"Signal backup could not be created: {error}")
-            if st.session_state.get("signal_backup_data"):
-                counts = st.session_state.get("signal_backup_counts", {})
-                st.caption(
-                    "Cleared "
-                    f"{counts.get('signals', 0)} signals, "
-                    f"{counts.get('ema_progressive_cycles', 0)} progressive cycles, and "
-                    f"{counts.get('notifications', 0)} notifications."
-                )
-                st.download_button(
-                    "Download latest signal backup",
-                    data=st.session_state.signal_backup_data,
-                    file_name=st.session_state.get("signal_backup_name", "signal-backup.json"),
-                    mime="application/json",
-                    width="stretch",
-                    icon=":material/download:",
-                )
             st.divider()
             if st.session_state.get("emergency_halt"):
                 st.caption("New entries halted")
@@ -3865,10 +4141,20 @@ def main() -> None:
     page_content = st.empty()
     page_content.empty()
     with page_content.container():
+        if page not in ("Live monitor", "P&L statement"):
+            last_refreshed = pd.Timestamp.now(tz="Asia/Kolkata")
+            st.markdown(
+                f'<div class="last-refreshed">Last refreshed: {last_refreshed:%d %b %Y, %I:%M:%S %p} IST</div>',
+                unsafe_allow_html=True,
+            )
         if page == "Kite authentication":
             render_kite_authentication(st, settings)
         elif page == "Overview":
             render_overview(st, settings, orders, trades, activity)
+        elif page == "Live monitor":
+            render_live_monitor(st, settings)
+        elif page == "P&L statement":
+            render_pnl_statement(st, settings)
         elif page == "Watchlists":
             render_watchlists(st, settings)
         elif page == "Scanner & signals":

@@ -247,6 +247,45 @@ def test_manual_entry_is_risk_sized_and_monitor_closes_position():
     assert not pipeline.managed_positions
 
 
+def test_app_initiated_exit_persists_trade_history(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    pipeline = TradingPipeline(build_settings(), {1: "AAA"}, BuyStrategy(), activity_repository=repository)
+    pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25))
+
+    exits = pipeline.monitor_ticks([
+        {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 26), "last_price": 94},
+    ])
+
+    assert [event.kind for event in exits] == ["exit_submitted"]
+    [trade] = repository.load_trades()
+    assert trade.symbol == "AAA"
+    assert trade.entry_price == 100
+    assert trade.exit_price == 94
+    assert trade.exit_reason == "trailing stop"
+    assert trade.position_type == "INTRADAY"
+    database.close()
+
+
+def test_broker_detected_exit_persists_trade_history(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = BrokerExitClient()
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+    pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+
+    events = pipeline.sync_broker_positions()
+
+    assert [event.kind for event in events] == ["broker_exit_detected"]
+    [trade] = repository.load_trades()
+    assert trade.symbol == "AAA"
+    assert trade.exit_price == 94.5
+    assert "broker-side position closed" in trade.exit_reason
+    database.close()
+
+
 def test_manual_entry_rejects_stop_above_entry():
     pipeline = TradingPipeline(build_settings(), {1: "AAA"}, BuyStrategy())
 

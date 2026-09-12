@@ -11,7 +11,7 @@ import pandas as pd
 
 from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import Side, SignalAction, TradingMode
-from app.database.models import ActivityRecord, PositionRecord
+from app.database.models import ActivityRecord, PositionRecord, TradeRecord
 from app.execution.order_manager import OrderManager
 from app.execution.position_manager import Position, PositionManager
 from app.execution.trailing_stop import TrailingStop
@@ -263,6 +263,7 @@ class TradingPipeline:
                 reason,
             )
             self.recent_closed_positions = [closed, *self.recent_closed_positions[:19]]
+            self._record_trade_history(managed, closed, reason)
             events.append(
                 self._event(
                     "broker_exit_detected",
@@ -456,7 +457,29 @@ class TradingPipeline:
             self.activity_repository.delete_position(symbol)
         if cancellation_error is not None:
             reason = f"{reason}; protective stop cancellation failed: {cancellation_error}"
+        closed = ClosedPosition(symbol, managed.position.side, managed.position.quantity, managed.position.entry_price, price, pnl, timestamp, order_id, reason)
+        self.recent_closed_positions = [closed, *self.recent_closed_positions[:19]]
+        self._record_trade_history(managed, closed, reason)
         return self._event("critical_unprotected" if cancellation_error is not None else "exit_submitted", symbol, timestamp, price, order_id, reason, exit_side.value, managed.position.quantity, managed.position.entry_price, pnl=pnl)
+
+    def _record_trade_history(self, managed: ManagedPosition, closed: ClosedPosition, exit_reason: str) -> None:
+        if self.activity_repository is None or not hasattr(self.activity_repository, "save_trade"):
+            return
+        self.activity_repository.save_trade(
+            TradeRecord(
+                symbol=closed.symbol,
+                entry_time=managed.position.entry_time or closed.closed_at,
+                exit_time=closed.closed_at,
+                entry_price=closed.entry_price,
+                exit_price=closed.exit_price,
+                quantity=closed.quantity,
+                pnl=closed.pnl,
+                side=closed.side.value,
+                position_type="INTRADAY",
+                strategy_name=getattr(self.strategy, "name", ""),
+                exit_reason=exit_reason,
+            )
+        )
 
     def _broker_exit_fill(self, managed: ManagedPosition) -> tuple[float, str | None, str]:
         order_id = managed.protective_order_id

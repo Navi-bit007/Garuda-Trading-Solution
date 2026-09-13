@@ -108,6 +108,7 @@ def test_intraday_trailing_stop_ratchets_and_persists(tmp_path):
             instrument_token=111,
             position_type="INTRADAY",
             atr_multiplier=1.5,
+            trading_mode="LIVE",
         )
     )
     agent = build_agent(repository, client)
@@ -139,6 +140,7 @@ def test_missing_instrument_token_is_resolved_and_persisted(tmp_path):
             protective_order_id="PAPER-STOP-000001",
             instrument_token=None,
             position_type="INTRADAY",
+            trading_mode="LIVE",
         )
     )
     agent = build_agent(repository, client)
@@ -150,6 +152,39 @@ def test_missing_instrument_token_is_resolved_and_persisted(tmp_path):
     assert agent.positions["NSE:AAA"].instrument_token == 111
     [saved] = repository.load_positions()
     assert saved.instrument_token == 111
+    database.close()
+
+
+def test_paper_mode_position_is_never_loaded_or_touched(tmp_path):
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    entry_time = datetime(2026, 1, 1, 9, 20)
+    repository.save_position(
+        PositionRecord(
+            symbol="NSE:AAA",
+            side="BUY",
+            quantity=10,
+            entry_price=100.0,
+            stop_loss=90.0,
+            entry_time=entry_time,
+            protective_order_id="PAPER-STOP-000001",
+            instrument_token=111,
+            position_type="INTRADAY",
+            atr_multiplier=1.5,
+            trading_mode="PAPER",
+        )
+    )
+    agent = build_agent(repository, client)
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "MIS", "NSE")
+    client.ltp_response = {"NSE:AAA": {"last_price": 110.0}}
+    client.historical_rows[(111, "15minute")] = intraday_candles()
+
+    agent.run_once(now=entry_time + timedelta(minutes=5))
+
+    assert "NSE:AAA" not in agent.positions
+    [saved] = repository.load_positions()
+    assert saved.stop_loss == 90.0
+    assert agent.orders.paper_protective_orders["PAPER-STOP-000001"].stop_loss == 90.0
     database.close()
 
 
@@ -169,6 +204,7 @@ def test_restart_never_regresses_the_persisted_stop(tmp_path):
             instrument_token=111,
             position_type="INTRADAY",
             atr_multiplier=1.5,
+            trading_mode="LIVE",
         )
     )
     agent = build_agent(repository, client)
@@ -205,6 +241,7 @@ def test_target_1_hit_floors_the_stop_at_breakeven(tmp_path):
             position_type="INTRADAY",
             atr_multiplier=1.5,
             target_1_hit=True,
+            trading_mode="LIVE",
         )
     )
     agent = build_agent(repository, client)
@@ -236,6 +273,7 @@ def test_permanent_modify_failure_leaves_db_untouched_and_notifies(tmp_path):
             instrument_token=111,
             position_type="INTRADAY",
             atr_multiplier=1.5,
+            trading_mode="LIVE",
         )
     )
     sent_messages: list[str] = []
@@ -286,6 +324,7 @@ def test_swing_ema_position_trails_once_per_completed_daily_candle(tmp_path):
             position_type="SWING",
             atr_multiplier=2.0,
             strategy_name="EMA 9/200 swing",
+            trading_mode="LIVE",
         )
     )
     agent = build_agent(repository, client)
@@ -319,6 +358,7 @@ def swing_position_record(**overrides) -> PositionRecord:
         position_type="SWING",
         atr_multiplier=2.0,
         strategy_name="EMA 9/200 swing",
+        trading_mode="LIVE",
     )
     values.update(overrides)
     return PositionRecord(**values)

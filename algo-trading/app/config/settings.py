@@ -30,8 +30,6 @@ class Settings(BaseSettings):
     kite_access_token: SecretStr = SecretStr("")
     trading_mode: TradingMode = TradingMode.PAPER
     initial_capital: float = Field(default=100_000, gt=0)
-    risk_per_trade: float = Field(default=0.005, gt=0, le=1)
-    max_daily_loss: float = Field(default=0.015, gt=0, le=1)
     max_open_positions: int = Field(default=3, ge=1)
     max_trades_per_day: int = Field(default=5, ge=1)
     max_capital_deployment: float = Field(default=0.80, gt=0, le=1)
@@ -48,6 +46,11 @@ class Settings(BaseSettings):
     signal_poll_seconds: int = Field(default=30, ge=5)
     pre_spike_cooldown_minutes: int = Field(default=30, ge=0)
     enable_ema_progressive_strategy: bool = True
+    swing_capital_limit: float = Field(default=2_000.0, gt=0)
+    swing_quantity_limit: int = Field(default=1, ge=1)
+    swing_trailing_atr_multiplier: float = Field(default=2.0, gt=0)
+    swing_max_open_positions: int = Field(default=10, ge=1)
+    intraday_capital_limit: float = Field(default=5_000.0, gt=0)
 
     if PYDANTIC_V2:
         @field_validator("entry_end")

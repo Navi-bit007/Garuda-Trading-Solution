@@ -89,10 +89,9 @@ class TradingPipeline:
         self.history: dict[str, list[dict]] = defaultdict(list)
         self.last_prices: dict[str, float] = {}
         self.last_atr: dict[str, float] = {}
-        self.limits = DailyLimits(settings.initial_capital, settings.max_daily_loss, settings.max_trades_per_day)
+        self.limits = DailyLimits(settings.initial_capital, settings.max_trades_per_day)
         self.risk = RiskManager(
             settings.initial_capital,
-            settings.risk_per_trade,
             settings.max_open_positions,
             self.limits,
             Exposure(settings.initial_capital, settings.max_capital_deployment),
@@ -329,13 +328,13 @@ class TradingPipeline:
             return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"{signal.action.value} stop loss must be {stop_direction} entry price", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss)
         if requested_quantity is not None and requested_quantity <= 0:
             return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason="quantity must be positive", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss, quantity=requested_quantity)
-        maximum_quantity = self.risk.quantity(signal.price, signal.stop_loss)
+        maximum_quantity = self.risk.quantity(signal.price)
         quantity = maximum_quantity if requested_quantity is None else requested_quantity
         if quantity > maximum_quantity:
-            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"quantity exceeds risk limit of {maximum_quantity}", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss, quantity=quantity)
+            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"quantity exceeds capital deployment limit of {maximum_quantity}", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss, quantity=quantity)
         current_exposure = sum(position.position.entry_price * position.position.quantity for position in self.managed_positions.values())
-        if not self.risk.approve_entry(len(self.managed_positions), current_exposure, signal.price, signal.stop_loss, quantity):
-            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason="risk limits rejected entry", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss, quantity=quantity)
+        if not self.risk.approve_entry(len(self.managed_positions), current_exposure, signal.price, quantity):
+            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason="entry limits rejected entry", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss, quantity=quantity)
         try:
             order_id = self.order_manager.submit_signal(signal, quantity)
             protective_order_id = self.order_manager.submit_protective_stop(signal, quantity)
@@ -360,7 +359,7 @@ class TradingPipeline:
         )
         if self.activity_repository is not None and hasattr(self.activity_repository, "save_position"):
             self.activity_repository.save_position(
-                PositionRecord(symbol, position_side.value, quantity, signal.price, signal.stop_loss, signal.timestamp, signal.target_1, signal.target_2, protective_order_id, False, atr_multiplier=self.settings.trailing_atr_multiplier)
+                PositionRecord(symbol, position_side.value, quantity, signal.price, signal.stop_loss, signal.timestamp, signal.target_1, signal.target_2, protective_order_id, False, atr_multiplier=self.settings.trailing_atr_multiplier, trading_mode=self.settings.trading_mode.value)
             )
         strategy_stop_multiplier = float(getattr(self.strategy, "stop_atr", self.settings.trailing_atr_multiplier))
         if strategy_stop_multiplier > 0:
@@ -433,6 +432,7 @@ class TradingPipeline:
                     managed.protective_order_id,
                     True,
                     atr_multiplier=self.settings.trailing_atr_multiplier,
+                    trading_mode=self.settings.trading_mode.value,
                 )
             )
         return [self._event("breakeven_activated", position.symbol, timestamp, position.entry_price, reason="target 1 reached; protective stop moved to breakeven", side=exit_side.value, quantity=position.quantity, entry_price=position.entry_price, stop_loss=position.stop_loss)]

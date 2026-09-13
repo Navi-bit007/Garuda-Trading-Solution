@@ -202,8 +202,8 @@ def test_live_pipeline_breakeven_flags_target_1_hit_without_modifying_broker_sto
     database.close()
 
 
-def test_pipeline_rejects_entry_when_risk_size_is_zero():
-    pipeline = TradingPipeline(build_settings(risk_per_trade=0.000001), {1: "AAA"}, BuyStrategy())
+def test_pipeline_rejects_entry_when_deployment_size_is_zero():
+    pipeline = TradingPipeline(build_settings(max_capital_deployment=0.0000001), {1: "AAA"}, BuyStrategy())
     events = pipeline.on_ticks([
         {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 20), "last_price": 100, "volume_traded": 100},
         {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 21), "last_price": 100, "volume_traded": 150},
@@ -231,12 +231,12 @@ def test_pipeline_rejects_malformed_strategy_entries(price, stop_loss, quantity,
     assert pipeline.orders.paper_orders == []
 
 
-def test_manual_entry_is_risk_sized_and_monitor_closes_position():
+def test_manual_entry_is_deployment_sized_and_monitor_closes_position():
     pipeline = TradingPipeline(build_settings(), {1: "AAA"}, BuyStrategy())
     entry = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25))
 
     assert entry.kind == "entry_submitted"
-    assert pipeline.managed_positions["AAA"].position.quantity == 100
+    assert pipeline.managed_positions["AAA"].position.quantity == 800
 
     exits = pipeline.monitor_ticks([
         {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 26), "last_price": 94},
@@ -295,13 +295,13 @@ def test_manual_entry_rejects_stop_above_entry():
     assert pipeline.orders.paper_orders == []
 
 
-def test_manual_entry_rejects_quantity_above_risk_limit():
+def test_manual_entry_rejects_quantity_above_deployment_limit():
     pipeline = TradingPipeline(build_settings(), {1: "AAA"}, BuyStrategy())
 
-    event = pipeline.submit_manual_entry("AAA", 100, 95, quantity=101)
+    event = pipeline.submit_manual_entry("AAA", 100, 95, quantity=801)
 
     assert event.kind == "entry_rejected"
-    assert "risk limit" in event.reason
+    assert "capital deployment limit" in event.reason
     assert pipeline.orders.paper_orders == []
 
 

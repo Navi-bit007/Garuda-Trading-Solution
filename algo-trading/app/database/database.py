@@ -181,7 +181,18 @@ class Database:
             instrument_token INTEGER,
             position_type TEXT NOT NULL DEFAULT 'INTRADAY',
             atr_multiplier REAL,
-            strategy_name TEXT NOT NULL DEFAULT ''
+            strategy_name TEXT NOT NULL DEFAULT '',
+            trading_mode TEXT NOT NULL DEFAULT 'LIVE'
+        );
+        CREATE TABLE IF NOT EXISTS agent_heartbeat (
+            engine_name TEXT PRIMARY KEY,
+            last_run_at TEXT NOT NULL,
+            last_error TEXT NOT NULL DEFAULT '',
+            heartbeat_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_preferences (
+            user_id TEXT PRIMARY KEY,
+            auto_start_trailing_agent INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS strategy_presets (
             name TEXT PRIMARY KEY,
@@ -243,6 +254,8 @@ class Database:
             self.connection.execute("ALTER TABLE positions ADD COLUMN atr_multiplier REAL")
         if "strategy_name" not in columns:
             self.connection.execute("ALTER TABLE positions ADD COLUMN strategy_name TEXT NOT NULL DEFAULT ''")
+        if "trading_mode" not in columns:
+            self.connection.execute("ALTER TABLE positions ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'LIVE'")
 
     def _migrate_trades(self) -> None:
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(trades)").fetchall()}

@@ -6,7 +6,7 @@ from app.database.database import Database
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.database.models import ActivityRecord, DynamicWatchlistRecord, NotificationRecord, OrderRecord, PositionRecord, PreSpikeEventRecord, ProgressiveEmaCycleRecord, SignalEngineStatus, SignalRecord, StrategyPresetRecord, TradeRecord, WatchlistRecord
+from app.database.models import ActivityRecord, AgentHeartbeat, DynamicWatchlistRecord, NotificationRecord, OrderRecord, PositionRecord, PreSpikeEventRecord, ProgressiveEmaCycleRecord, SignalEngineStatus, SignalRecord, StrategyPresetRecord, TradeRecord, WatchlistRecord
 
 EXPORT_TIMEZONE = ZoneInfo("Asia/Kolkata")
 EXPORT_TIMESTAMP_KEYS = {
@@ -697,28 +697,77 @@ class Repository:
         heartbeat_at = datetime.fromisoformat(row["heartbeat_at"]) if row["heartbeat_at"] else datetime.fromisoformat(row["last_run_at"])
         return SignalEngineStatus(row["user_id"], datetime.fromisoformat(row["last_run_at"]), row["last_error"], heartbeat_at)
 
+    def save_agent_heartbeat(self, status: AgentHeartbeat) -> None:
+        heartbeat_at = status.heartbeat_at or status.last_run_at
+        with self.database.lock:
+            self.database.connection.execute(
+                """
+                INSERT INTO agent_heartbeat (engine_name, last_run_at, last_error, heartbeat_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(engine_name) DO UPDATE SET
+                    last_run_at=excluded.last_run_at,
+                    last_error=excluded.last_error,
+                    heartbeat_at=excluded.heartbeat_at
+                """,
+                (status.engine_name, status.last_run_at.isoformat(), status.last_error, heartbeat_at.isoformat()),
+            )
+            self.database.connection.commit()
+
+    def load_agent_heartbeat(self, engine_name: str) -> AgentHeartbeat | None:
+        with self.database.lock:
+            row = self.database.connection.execute(
+                "SELECT engine_name, last_run_at, last_error, heartbeat_at FROM agent_heartbeat WHERE engine_name = ?",
+                (engine_name,),
+            ).fetchone()
+        if row is None:
+            return None
+        heartbeat_at = datetime.fromisoformat(row["heartbeat_at"]) if row["heartbeat_at"] else datetime.fromisoformat(row["last_run_at"])
+        return AgentHeartbeat(row["engine_name"], datetime.fromisoformat(row["last_run_at"]), row["last_error"], heartbeat_at)
+
+    def set_auto_start_trailing_agent(self, user_id: str, enabled: bool) -> None:
+        with self.database.lock:
+            self.database.connection.execute(
+                """
+                INSERT INTO agent_preferences (user_id, auto_start_trailing_agent)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET auto_start_trailing_agent=excluded.auto_start_trailing_agent
+                """,
+                (user_id, int(enabled)),
+            )
+            self.database.connection.commit()
+
+    def get_auto_start_trailing_agent(self, user_id: str) -> bool:
+        with self.database.lock:
+            row = self.database.connection.execute(
+                "SELECT auto_start_trailing_agent FROM agent_preferences WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return bool(row["auto_start_trailing_agent"]) if row is not None else False
+
     def save_position(self, position: PositionRecord) -> None:
         with self.database.lock:
             self.database.connection.execute(
                 """
             INSERT INTO positions (
                 symbol, side, quantity, entry_price, stop_loss, entry_time, target_1, target_2,
-                protective_order_id, target_1_hit, instrument_token, position_type, atr_multiplier, strategy_name
+                protective_order_id, target_1_hit, instrument_token, position_type, atr_multiplier, strategy_name,
+                trading_mode
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 side=excluded.side, quantity=excluded.quantity, entry_price=excluded.entry_price,
                 stop_loss=excluded.stop_loss, entry_time=excluded.entry_time, target_1=excluded.target_1,
                 target_2=excluded.target_2, protective_order_id=excluded.protective_order_id,
                 target_1_hit=excluded.target_1_hit, instrument_token=excluded.instrument_token,
                 position_type=excluded.position_type, atr_multiplier=excluded.atr_multiplier,
-                strategy_name=excluded.strategy_name
+                strategy_name=excluded.strategy_name, trading_mode=excluded.trading_mode
                 """,
                 (
                     position.symbol, position.side, position.quantity, position.entry_price, position.stop_loss,
                     position.entry_time.isoformat(), position.target_1, position.target_2,
                     position.protective_order_id, int(position.target_1_hit), position.instrument_token,
                     position.position_type, position.atr_multiplier, position.strategy_name,
+                    position.trading_mode,
                 ),
             )
             self.database.connection.commit()
@@ -755,6 +804,7 @@ class Repository:
                 position_type=row["position_type"] if row["position_type"] is not None else "INTRADAY",
                 atr_multiplier=float(row["atr_multiplier"]) if row["atr_multiplier"] is not None else None,
                 strategy_name=row["strategy_name"] if row["strategy_name"] is not None else "",
+                trading_mode=row["trading_mode"] if row["trading_mode"] is not None else "LIVE",
             )
             for row in rows
         ]

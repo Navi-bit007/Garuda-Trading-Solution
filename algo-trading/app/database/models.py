@@ -176,6 +176,15 @@ class PositionRecord:
     position_type: str = "INTRADAY"
     atr_multiplier: float | None = None
     strategy_name: str = ""
+    trading_mode: str = "PAPER"
+
+
+@dataclass(frozen=True)
+class AgentHeartbeat:
+    engine_name: str
+    last_run_at: datetime
+    last_error: str = ""
+    heartbeat_at: datetime | None = None
 
 
 @dataclass(frozen=True)

@@ -12,7 +12,7 @@ import pandas as pd
 from app.broker.market_data import MarketData
 from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import Side
-from app.database.models import PositionRecord, TradeRecord
+from app.database.models import AgentHeartbeat, PositionRecord, TradeRecord
 from app.database.repository import Repository
 from app.execution.swing_trailing import compute_ema_swing_stop, compute_trend_breakout_stop
 from app.execution.trailing_stop import TrailingStop
@@ -120,17 +120,34 @@ class TrailingStopAgent:
 
     def run_once(self, now: datetime | None = None) -> None:
         timestamp = now or datetime.now()
-        self.load_positions()
-        self._process_intraday(timestamp)
-        due = self._last_swing_recompute_at is None or (timestamp - self._last_swing_recompute_at).total_seconds() >= self.swing_recompute_seconds
-        if due:
-            self._process_swing(timestamp)
-            self._last_swing_recompute_at = timestamp
+        last_error = ""
+        try:
+            self.load_positions()
+            self._process_intraday(timestamp)
+            due = self._last_swing_recompute_at is None or (timestamp - self._last_swing_recompute_at).total_seconds() >= self.swing_recompute_seconds
+            if due:
+                self._process_swing(timestamp)
+                self._last_swing_recompute_at = timestamp
+        except Exception as error:
+            last_error = str(error)
+            raise
+        finally:
+            try:
+                self.repository.save_agent_heartbeat(AgentHeartbeat("trailing_stop_agent", timestamp, last_error, timestamp))
+            except Exception:
+                logger.exception("Failed to record trailing-stop agent heartbeat")
 
     # -- position bookkeeping -------------------------------------------------
 
     def load_positions(self) -> None:
-        records = {record.symbol: record for record in self.repository.load_positions()}
+        # PAPER-mode positions have no real broker order to protect -- and the shared `positions`
+        # table carries no other guarantee that a row is safe for this process to act on -- so
+        # anything not explicitly tagged LIVE is left alone entirely.
+        records = {
+            record.symbol: record
+            for record in self.repository.load_positions()
+            if record.trading_mode == "LIVE"
+        }
         for symbol in list(self.positions):
             if symbol not in records:
                 del self.positions[symbol]

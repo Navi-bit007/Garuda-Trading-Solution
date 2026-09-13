@@ -1,0 +1,29 @@
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\scripts\run_trailing_stop_agent.py", line 8, in <module>
+    from app.broker.authentication import AccessToken, require_credentials
+ModuleNotFoundError: No module named 'app'
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\scripts\run_trailing_stop_agent.py", line 8, in <module>
+    from app.broker.authentication import AccessToken, require_credentials
+ModuleNotFoundError: No module named 'app'
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\scripts\run_trailing_stop_agent.py", line 8, in <module>
+    from app.broker.authentication import AccessToken, require_credentials
+ModuleNotFoundError: No module named 'app'
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\scripts\run_trailing_stop_agent.py", line 8, in <module>
+    from app.broker.authentication import AccessToken, require_credentials
+ModuleNotFoundError: No module named 'app'
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\scripts\run_trailing_stop_agent.py", line 8, in <module>
+    from app.broker.authentication import AccessToken, require_credentials
+ModuleNotFoundError: No module named 'app'
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\scripts\run_trailing_stop_agent.py", line 8, in <module>
+    from app.broker.authentication import AccessToken, require_credentials
+ModuleNotFoundError: No module named 'app'
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\scripts\run_trailing_stop_agent.py", line 8, in <module>
+    from app.broker.authentication import AccessToken, require_credentials
+ModuleNotFoundError: No module named 'app'
+2026-09-13 12:49:19,241 INFO Trailing stop agent started

@@ -37,6 +37,41 @@ def test_dashboard_settings_round_trip_in_sqlite(tmp_path):
     database.close()
 
 
+def test_swing_settings_round_trip_in_sqlite(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    values = {
+        "swing_capital_limit": 5_000.0,
+        "swing_quantity_limit": 3,
+        "swing_trailing_atr_multiplier": 2.5,
+        "swing_max_open_positions": 15,
+    }
+
+    repository.save_dashboard_settings("alice", serialize_frontend_settings(values))
+    stored = repository.load_dashboard_settings("alice")
+    restored = deserialize_frontend_settings(stored)
+
+    assert restored == values
+    database.close()
+
+
+def test_intraday_settings_round_trip_in_sqlite(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    values = {
+        "intraday_capital_limit": 10_000.0,
+    }
+
+    repository.save_dashboard_settings("alice", serialize_frontend_settings(values))
+    stored = repository.load_dashboard_settings("alice")
+    restored = deserialize_frontend_settings(stored)
+
+    assert restored == values
+    database.close()
+
+
 def test_dashboard_settings_are_scoped_by_user(tmp_path):
     database = Database(str(tmp_path / "trading.sqlite3"))
     database.initialize()

@@ -160,6 +160,76 @@ def test_strategy_signal_scanner_keeps_invalid_kite_token_local():
     assert result.errors == ("BBB: invalid token",)
 
 
+def test_strategy_signal_scanner_reports_progress_per_symbol_in_order():
+    progress_calls: list[tuple[int, int, str]] = []
+
+    StrategySignalScanner(buy_limit=5, sell_limit=5).scan(
+        candidates().iloc[:2],
+        VwapEmaBreakoutStrategy(),
+        lambda symbol: breakout_frame("bullish"),
+        neutral_regime(),
+        lambda symbol: confirmations("bullish"),
+        on_progress=lambda index, total, symbol: progress_calls.append((index, total, symbol)),
+    )
+
+    assert progress_calls == [(1, 2, "AAA"), (2, 2, "BBB")]
+
+
+def test_strategy_signal_scanner_records_insufficient_history_separately_from_errors():
+    def load_candles(symbol: str) -> pd.DataFrame:
+        return breakout_frame("bullish").iloc[:10]
+
+    result = StrategySignalScanner(buy_limit=5, sell_limit=5).scan(
+        candidates().iloc[:1],
+        VwapEmaBreakoutStrategy(),
+        load_candles,
+        neutral_regime(),
+        lambda symbol: confirmations("bullish"),
+    )
+
+    assert result.errors == ()
+    assert result.insufficient_history == ("AAA",)
+    assert result.no_signal == ()
+
+
+class LowScoreStrategy:
+    name = "LOW_SCORE"
+
+    def generate_signal(self, symbol, candles):
+        from app.config.constants import SignalAction
+        from app.strategy.signal import Signal
+
+        latest = candles.iloc[-1]
+        return Signal(symbol, SignalAction.BUY, latest["timestamp"].to_pydatetime(), float(latest["close"]), float(latest["close"] - 5), "test", score=10)
+
+
+def test_strategy_signal_scanner_records_no_signal_reason_for_low_score():
+    result = StrategySignalScanner(buy_limit=5, sell_limit=5, minimum_score=80).scan(
+        candidates().iloc[:1],
+        LowScoreStrategy(),
+        lambda symbol: breakout_frame("bullish"),
+    )
+
+    assert result.buy.empty
+    assert len(result.no_signal) == 1
+    symbol, reason = result.no_signal[0]
+    assert symbol == "AAA"
+    assert "below threshold" in reason
+
+
+def test_strategy_signal_scanner_result_defaults_are_empty_tuples():
+    result = StrategySignalScanner(buy_limit=5, sell_limit=5).scan(
+        candidates().iloc[:1],
+        VwapEmaBreakoutStrategy(),
+        lambda symbol: breakout_frame("bullish"),
+        neutral_regime(),
+        lambda symbol: confirmations("bullish"),
+    )
+
+    assert isinstance(result.insufficient_history, tuple)
+    assert isinstance(result.no_signal, tuple)
+
+
 def test_strategy_signal_scanner_preserves_previous_day_high_metadata():
     previous_day = pd.date_range("2026-01-05 09:15", periods=3, freq="5min")
     current_day = pd.date_range("2026-01-06 09:15", periods=2, freq="5min")

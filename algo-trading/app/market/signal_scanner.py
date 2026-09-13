@@ -27,6 +27,8 @@ class SignalScanResult:
     sell: pd.DataFrame
     errors: tuple[str, ...]
     scanned: int
+    insufficient_history: tuple[str, ...] = ()
+    no_signal: tuple[tuple[str, str], ...] = ()
 
 
 class StrategySignalScanner:
@@ -46,12 +48,18 @@ class StrategySignalScanner:
         candle_loader: Callable[[str], pd.DataFrame],
         market_regime: MarketRegimeContext | None = None,
         confirmation_loader: Callable[[str], TimeframeConfirmation] | None = None,
+        on_progress: Callable[[int, int, str], None] | None = None,
     ) -> SignalScanResult:
         candidates = self._normalise_selected_stocks(selected_stocks)
         buys: list[dict] = []
         sells: list[dict] = []
         errors: list[str] = []
-        for symbol, token in candidates:
+        insufficient_history: list[str] = []
+        no_signal: list[tuple[str, str]] = []
+        total = len(candidates)
+        for index, (symbol, token) in enumerate(candidates, start=1):
+            if on_progress is not None:
+                on_progress(index, total, symbol)
             try:
                 candles = candle_loader(symbol)
                 confirmation = confirmation_loader(symbol) if confirmation_loader else None
@@ -68,8 +76,16 @@ class StrategySignalScanner:
                     signal = evaluation.signal
                     row = self._evaluation_row(evaluation, strategy, token)
                 if signal.score < self.minimum_score:
+                    no_signal.append((symbol, f"score {signal.score} below threshold {self.minimum_score}"))
                     continue
-            except NoSignal:
+            except NoSignal as no_signal_error:
+                no_signal.append((symbol, str(no_signal_error) or "no qualifying signal"))
+                continue
+            except ValueError as error:
+                if str(error).startswith("not enough"):
+                    insufficient_history.append(symbol)
+                else:
+                    errors.append(f"{symbol}: {error}")
                 continue
             except Exception as error:
                 errors.append(f"{symbol}: {error}")
@@ -83,6 +99,8 @@ class StrategySignalScanner:
             sell=self._rank(sells, self.sell_limit),
             errors=tuple(errors),
             scanned=len(candidates),
+            insufficient_history=tuple(insufficient_history),
+            no_signal=tuple(no_signal),
         )
 
     @staticmethod

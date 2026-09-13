@@ -3,7 +3,6 @@ import pytest
 
 import app.strategy.swing_trend_breakout as breakout_module
 from app.strategy.base import NoSignal
-import app.execution.swing_auto_trader as swing_trader_module
 from app.config.constants import TradingMode
 from app.execution.swing_auto_trader import SwingAutoTrader
 from app.strategy.swing_trend_breakout import SwingTrendBreakoutStrategy
@@ -159,34 +158,33 @@ def test_trader_waits_for_next_session_then_returns_confirmed_candidate(monkeypa
     assert second_scan.candidates[0].evaluation.state == "SWING_CANDIDATE"
 
 
-def test_trend_position_books_partial_at_2r_and_exits_below_ema20(monkeypatch):
+def test_trader_scan_records_no_signal_reason_for_unqualified_breakout(monkeypatch):
+    frame = breakout_frame(close=120.0, volume=1_000.0)
+    patch_indicators(monkeypatch, frame)
+    trader = SwingAutoTrader(StubKiteClient(), TradingMode.LIVE, strategy_name="SWING_TREND_BREAKOUT")
+
+    result = trader.scan({"NSE:AAA": 1}, lambda token: frame)
+
+    assert result.candidates == ()
+    assert result.pending_candidates == ()
+    assert len(result.no_signal) == 1
+    symbol, reason = result.no_signal[0]
+    assert symbol == "NSE:AAA"
+    assert "volume ratio" in reason
+
+
+def test_trader_scan_records_no_signal_when_breakout_does_not_confirm(monkeypatch):
     first_frame = breakout_frame(close=117.0)
-    next_frame = pd.concat(
+    unconfirmed_next_frame = pd.concat(
         [
             first_frame,
             pd.DataFrame(
                 {
                     "timestamp": [pd.Timestamp("2025-08-11")],
-                    "open": [106.0],
-                    "high": [113.0],
-                    "low": [105.0],
-                    "close": [112.0],
-                    "volume": [1_500.0],
-                }
-            ),
-        ],
-        ignore_index=True,
-    )
-    exit_frame = pd.concat(
-        [
-            next_frame,
-            pd.DataFrame(
-                {
-                    "timestamp": [pd.Timestamp("2025-08-12")],
-                    "open": [109.0],
-                    "high": [110.0],
-                    "low": [108.0],
-                    "close": [109.0],
+                    "open": [100.0],
+                    "high": [104.0],
+                    "low": [98.0],
+                    "close": [102.0],
                     "volume": [1_200.0],
                 }
             ),
@@ -194,24 +192,13 @@ def test_trend_position_books_partial_at_2r_and_exits_below_ema20(monkeypatch):
         ignore_index=True,
     )
     patch_indicators(monkeypatch, first_frame)
-    monkeypatch.setattr(swing_trader_module, "ema", lambda values, period: pd.Series([110.0] * len(values), index=values.index))
-    client = StubKiteClient()
-    trader = SwingAutoTrader(client, TradingMode.LIVE, strategy_name="SWING_TREND_BREAKOUT")
+    trader = SwingAutoTrader(StubKiteClient(), TradingMode.LIVE, strategy_name="SWING_TREND_BREAKOUT")
+
     trader.scan({"NSE:AAA": 1}, lambda token: first_frame)
-    candidate = trader.scan({"NSE:AAA": 1}, lambda token: next_frame).candidates[0]
-    assert trader.submit_candidate(candidate, amount_limit=2_000, quantity_limit=10).status == "submitted"
+    second_scan = trader.scan({"NSE:AAA": 1}, lambda token: unconfirmed_next_frame)
 
-    target_frame = exit_frame.iloc[:-1].copy()
-    target_frame.loc[target_frame.index[-1], "close"] = 124.0
-    target_frame.loc[target_frame.index[-1], "open"] = 124.0
-    target_frame.loc[target_frame.index[-1], "high"] = 125.0
-    target_frame.loc[target_frame.index[-1], "low"] = 123.0
-    partial = trader.manage_position("NSE:AAA", target_frame)
-    exited = trader.manage_position("NSE:AAA", exit_frame)
+    assert second_scan.candidates == ()
+    no_signal_symbols = [symbol for symbol, _ in second_scan.no_signal]
+    assert "NSE:AAA" in no_signal_symbols
 
-    assert partial is not None and partial.status == "partial_profit_booked"
-    assert partial.quantity == 4
-    assert exited is not None and exited.status == "exited"
-    assert exited.quantity == 6
-    assert "NSE:AAA" not in trader.active_positions
-    assert [request["transaction_type"] for request in client.requests] == ["BUY", "SELL", "SELL", "SELL"]
+

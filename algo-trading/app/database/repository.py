@@ -873,6 +873,38 @@ class Repository:
             )
             self.database.connection.commit()
 
+    def save_kite_access_token(self, user_id: str, access_token: str) -> None:
+        """Persist the day's Kite access token so a new browser tab/session (which starts with
+        empty st.session_state -- Streamlit does not share session state across tabs, even
+        duplicated ones) can pick it up without re-running the Kite login flow. Cleared on
+        logout via clear_kite_access_token; a token from a previous trading day is naturally
+        stale (Zerodha invalidates it) rather than actively expired here."""
+        with self.database.lock:
+            self.database.connection.execute(
+                """
+                INSERT INTO kite_session (user_id, access_token, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    access_token=excluded.access_token,
+                    updated_at=excluded.updated_at
+                """,
+                (user_id, access_token, datetime.now().isoformat()),
+            )
+            self.database.connection.commit()
+
+    def load_kite_access_token(self, user_id: str) -> str:
+        with self.database.lock:
+            row = self.database.connection.execute(
+                "SELECT access_token FROM kite_session WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+
+    def clear_kite_access_token(self, user_id: str) -> None:
+        with self.database.lock:
+            self.database.connection.execute("DELETE FROM kite_session WHERE user_id = ?", (user_id,))
+            self.database.connection.commit()
+
     def load_dashboard_settings(self, user_id: str) -> dict:
         with self.database.lock:
             row = self.database.connection.execute(

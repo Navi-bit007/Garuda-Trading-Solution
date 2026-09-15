@@ -7,11 +7,13 @@ from app.strategy.signal import Signal
 
 
 class StubKiteClient:
-    def __init__(self, instruments=None, protective_rejections=None, instrument_batches=None):
+    def __init__(self, instruments=None, protective_rejections=None, instrument_batches=None, margin_response=None):
         self.requests = []
         self.instrument_rows = instruments if instruments is not None else [{"tradingsymbol": "TEST", "tick_size": 0.05}]
         self.instrument_batches = list(instrument_batches or [])
         self.protective_rejections = list(protective_rejections or [])
+        self.margin_response = margin_response
+        self.margin_requests = []
 
     def place_order(self, **request):
         self.request = request
@@ -24,6 +26,10 @@ class StubKiteClient:
         if self.instrument_batches:
             return self.instrument_batches.pop(0)
         return self.instrument_rows
+
+    def order_margins(self, params):
+        self.margin_requests.append(params)
+        return self.margin_response
 
 
 def test_paper_order_is_recorded_without_broker():
@@ -152,3 +158,29 @@ def test_live_protective_stop_fails_closed_when_tick_size_is_unavailable():
         api.place_protective_stop(OrderRequest("NSE:PWL", Side.SELL, 1, 100, 99.997))
 
     assert client.requests == []
+
+
+def test_required_intraday_margin_reads_the_brokers_margin_calculator():
+    client = StubKiteClient(margin_response=[{"total": 94.13}])
+    api = OrderAPI(TradingMode.LIVE, client)
+
+    margin = api.required_intraday_margin("NSE:ZENSARTECH")
+
+    assert margin == 94.13
+    [request] = client.margin_requests
+    [order] = request
+    assert order["exchange"] == "NSE"
+    assert order["tradingsymbol"] == "ZENSARTECH"
+    assert order["product"] == "MIS"
+    assert order["quantity"] == 1
+
+
+def test_required_intraday_margin_is_none_without_a_live_client():
+    api = OrderAPI(TradingMode.PAPER)
+    assert api.required_intraday_margin("NSE:ZENSARTECH") is None
+
+
+def test_required_intraday_margin_is_none_for_a_non_positive_result():
+    client = StubKiteClient(margin_response=[{"total": 0}])
+    api = OrderAPI(TradingMode.LIVE, client)
+    assert api.required_intraday_margin("NSE:ZENSARTECH") is None

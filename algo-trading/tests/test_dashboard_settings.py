@@ -85,6 +85,82 @@ def test_dashboard_settings_are_scoped_by_user(tmp_path):
     database.close()
 
 
+def test_kite_access_token_round_trip_in_sqlite(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+
+    assert repository.load_kite_access_token("alice") == ""
+    repository.save_kite_access_token("alice", "token-one")
+    assert repository.load_kite_access_token("alice") == "token-one"
+    repository.save_kite_access_token("alice", "token-two")
+    assert repository.load_kite_access_token("alice") == "token-two"
+    repository.clear_kite_access_token("alice")
+    assert repository.load_kite_access_token("alice") == ""
+    database.close()
+
+
+def test_kite_access_token_is_scoped_by_user(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+
+    repository.save_kite_access_token("alice", "alice-token")
+    repository.save_kite_access_token("bob", "bob-token")
+
+    assert repository.load_kite_access_token("alice") == "alice-token"
+    assert repository.load_kite_access_token("bob") == "bob-token"
+    database.close()
+
+
+def test_runtime_access_token_falls_back_to_a_token_persisted_by_another_tab(tmp_path):
+    """Streamlit gives every browser tab its own st.session_state -- even a duplicated tab
+    starts empty. A tab that has never logged in should still pick up the day's access token
+    once another tab has generated one, instead of forcing the Kite login flow to repeat."""
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    repository.save_kite_access_token("alice", "token-from-tab-one")
+    settings = SimpleNamespace(user_id="alice", kite_access_token=SimpleNamespace(get_secret_value=lambda: ""))
+    session_state = _SessionState(dashboard_repository=repository)
+    streamlit = SimpleNamespace(session_state=session_state)
+
+    token = dashboard_app.runtime_access_token(streamlit, settings)
+
+    assert token == "token-from-tab-one"
+    assert session_state["kite_access_token"] == "token-from-tab-one"
+    database.close()
+
+
+def test_runtime_access_token_ignores_persisted_token_after_explicit_logout(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    repository.save_kite_access_token("alice", "token-from-tab-one")
+    settings = SimpleNamespace(user_id="alice", kite_access_token=SimpleNamespace(get_secret_value=lambda: ""))
+    session_state = _SessionState(dashboard_repository=repository, kite_logged_out=True)
+    streamlit = SimpleNamespace(session_state=session_state)
+
+    token = dashboard_app.runtime_access_token(streamlit, settings)
+
+    assert token == ""
+    database.close()
+
+
+def test_log_out_of_kite_clears_the_persisted_token(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    repository.save_kite_access_token("alice", "token-from-tab-one")
+    session_state = _SessionState(kite_access_token="token-from-tab-one")
+    streamlit = SimpleNamespace(session_state=session_state, query_params=SimpleNamespace(clear=lambda: None))
+
+    dashboard_app.log_out_of_kite(streamlit, repository, "alice")
+
+    assert repository.load_kite_access_token("alice") == ""
+    database.close()
+
+
 def test_dashboard_repository_rebuilds_stale_session_instance(monkeypatch, tmp_path):
     database = Database(str(tmp_path / "trading.sqlite3"))
     stale_repository = SimpleNamespace(database=SimpleNamespace(thread_safe=True))

@@ -1,0 +1,7 @@
+2026-09-15 11:24:05,445 INFO app.execution.trading_pipeline Entry order 260915190727583 for NSE:ZENSARTECH confirmed by broker: status=COMPLETE average_price=475.9 protective_stop=260915190727590
+2026-09-15 11:24:05,450 INFO app.execution.trading_pipeline Entry price for NSE:ZENSARTECH adjusted from signal price 478.45 to broker fill price 475.9
+2026-09-15 12:12:49,558 INFO app.execution.trading_pipeline Entry order 260915190860468 for NSE:RAYMONDREL confirmed by broker: status=COMPLETE average_price=609.2682926800001 protective_stop=260915190860469
+2026-09-15 12:12:49,558 INFO app.execution.trading_pipeline Entry price for NSE:RAYMONDREL adjusted from signal price 609.0 to broker fill price 609.2682926800001
+2026-09-15 12:18:16,124 WARNING app.execution.trading_pipeline Live margin lookup failed for NSE:INDRAMEDCO; using the configured 1.0x fallback: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+2026-09-15 12:23:47,076 WARNING app.execution.trading_pipeline Live margin lookup failed for NSE:ROSSTECH; using the configured 1.0x fallback: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+2026-09-15 12:32:16,267 INFO app.execution.trading_pipeline Correcting entry price for NSE:JUBLPHARMA from 1025.20 to broker average price 1018.40

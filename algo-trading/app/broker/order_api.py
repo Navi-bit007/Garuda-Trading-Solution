@@ -94,6 +94,35 @@ class OrderAPI:
             raise RuntimeError("live order cancellation requires a connected Kite client")
         self.client.cancel_order(variety="regular", order_id=order_id)
 
+    def required_intraday_margin(self, symbol: str) -> float | None:
+        """Ask the broker for the real per-share MIS margin it requires for `symbol` right now,
+        via Kite's order-margin calculator -- the same endpoint the order ticket UI uses to show
+        e.g. "Required Rs94.13 (5x)". This reflects the actual, current leverage Zerodha is
+        granting for this specific stock (SEBI peak-margin category, volatility, liquidity),
+        rather than a single number assumed for every stock. Returns None if the client can't
+        answer (PAPER mode, no client, or the endpoint call fails) so callers can fall back.
+        """
+        if self.client is None or not hasattr(self.client, "order_margins"):
+            return None
+        exchange, tradingsymbol = self._split_symbol(symbol, "NSE")
+        response = self.client.order_margins(
+            [
+                {
+                    "exchange": exchange,
+                    "tradingsymbol": tradingsymbol,
+                    "transaction_type": "BUY",
+                    "variety": "regular",
+                    "product": "MIS",
+                    "order_type": "MARKET",
+                    "quantity": 1,
+                    "price": 0,
+                    "trigger_price": 0,
+                }
+            ]
+        )
+        margin_per_share = float(response[0]["total"])
+        return margin_per_share if margin_per_share > 0 else None
+
     def register_tick_size(self, symbol: str, tick_size: float) -> None:
         exchange, tradingsymbol = self._split_symbol(symbol, "NSE")
         if tick_size <= 0:

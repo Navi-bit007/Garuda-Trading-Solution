@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pandas as pd
@@ -117,7 +118,7 @@ def test_swing_trader_caps_quantity_by_amount():
     result = trader.submit_candidate(candidate, amount_limit=100, quantity_limit=100)
 
     assert result.status == "rejected"
-    assert result.reason == "amount limit is smaller than one share"
+    assert "amount limit" in result.reason and "100.00" in result.reason
     assert client.requests == []
 
 
@@ -216,6 +217,29 @@ def test_swing_scan_skips_symbols_without_ema_warmup_history():
     assert result.candidates == ()
     assert result.errors == ()
     assert result.insufficient_history == ("NSE:NEWSTOCK",)
+
+
+def test_evaluate_symbol_is_safe_under_concurrent_use():
+    """The dashboard now fetches candles for many symbols in a ThreadPoolExecutor and calls
+    evaluate_symbol() for each as its fetch completes, submitting a candidate the moment it's
+    found instead of waiting for the whole universe. This proves each thread's captured candles
+    never leak across symbols."""
+    client = StubKiteClient()
+    trader = SwingAutoTrader(client, TradingMode.LIVE)
+    frames = {1: swing_frame(last_close=130.0), 2: swing_frame(last_close=100.0)}
+    selected = {"NSE:AAA": 1, "NSE:FLAT": 2}
+
+    def evaluate(symbol: str, token: int):
+        return trader.evaluate_symbol(symbol, token, lambda _token, frame=frames[token]: frame)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {symbol: executor.submit(evaluate, symbol, token) for symbol, token in selected.items()}
+        results = {symbol: future.result() for symbol, future in futures.items()}
+
+    assert results["NSE:AAA"].candidate is not None
+    assert results["NSE:AAA"].candidate.symbol == "NSE:AAA"
+    assert results["NSE:FLAT"].candidate is None
+    assert results["NSE:FLAT"].no_signal_reasons and "freshly cross" in results["NSE:FLAT"].no_signal_reasons[0]
 
 
 def test_swing_scan_records_no_signal_reason_for_unmatched_symbols():

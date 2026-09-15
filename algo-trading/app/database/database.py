@@ -206,6 +206,11 @@ class Database:
             settings TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS kite_session (
+            user_id TEXT PRIMARY KEY,
+            access_token TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """)
             self._run_migration_with_retry(self._migrate_notifications)
             self._migrate_signals()

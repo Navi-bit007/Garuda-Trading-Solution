@@ -42,6 +42,20 @@ class SwingScanResult:
     no_signal: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class SwingSymbolEvaluation:
+    """The outcome of evaluating a single symbol -- lets a caller (e.g. a parallel scan that
+    submits an order the moment a qualifying candidate is found, rather than waiting for the
+    whole universe to finish) act on one symbol without needing the full SwingScanResult."""
+
+    symbol: str
+    candidate: SwingCandidate | None = None
+    pending_candidate: SwingCandidate | None = None
+    no_signal_reasons: tuple[str, ...] = ()
+    insufficient_history: bool = False
+    error: str | None = None
+
+
 @dataclass
 class SwingPosition:
     symbol: str
@@ -118,6 +132,45 @@ class SwingAutoTrader:
             return
         raise ValueError(f"unsupported swing strategy: {strategy_name}")
 
+    def evaluate_symbol(self, symbol: str, instrument_token: int, candle_loader: Callable[[int], pd.DataFrame]) -> SwingSymbolEvaluation:
+        """Evaluate one symbol in isolation -- the per-symbol body of scan()'s loop, pulled out
+        so a caller can run it the moment that symbol's candles are ready (e.g. from a
+        ThreadPoolExecutor future) instead of only after every other symbol has also been
+        fetched and scored. Mutates self.pending_breakouts for SWING_TREND_BREAKOUT exactly as
+        scan() did -- callers must call this from a single thread (candle *fetching* can be
+        parallelized, but this evaluation step is stateful and not thread-safe).
+        """
+        try:
+            candles = candle_loader(instrument_token)
+            if isinstance(self.strategy, SwingTrendBreakoutStrategy):
+                candidate = None
+                no_signal_reasons: list[str] = []
+                pending = self.pending_breakouts.pop(symbol, None)
+                if pending is not None:
+                    confirmed_signal = self.strategy.confirm_entry(pending, candles)
+                    if confirmed_signal is not None:
+                        candidate = SwingCandidate(symbol, int(instrument_token), pending, confirmed_signal)
+                    else:
+                        no_signal_reasons.append("breakout did not confirm on the next completed candle")
+                evaluation = self.strategy.evaluate(symbol, candles)
+                pending_candidate = None
+                if evaluation.qualified:
+                    self.pending_breakouts[symbol] = evaluation
+                    pending_candidate = SwingCandidate(symbol, int(instrument_token), evaluation)
+                else:
+                    no_signal_reasons.append("; ".join(evaluation.rejection_reasons) or "conditions not met")
+                return SwingSymbolEvaluation(symbol, candidate=candidate, pending_candidate=pending_candidate, no_signal_reasons=tuple(no_signal_reasons))
+            evaluation = self.strategy.evaluate(symbol, candles, instrument_token)
+        except NoSignal as no_signal_error:
+            return SwingSymbolEvaluation(symbol, no_signal_reasons=(str(no_signal_error) or "no qualifying signal",))
+        except ValueError as error:
+            if "not enough completed daily candles" in str(error):
+                return SwingSymbolEvaluation(symbol, insufficient_history=True)
+            return SwingSymbolEvaluation(symbol, error=str(error))
+        except Exception as error:
+            return SwingSymbolEvaluation(symbol, error=str(error))
+        return SwingSymbolEvaluation(symbol, candidate=SwingCandidate(symbol, int(instrument_token), evaluation))
+
     def scan(
         self,
         selected_symbols: dict[str, int],
@@ -133,37 +186,19 @@ class SwingAutoTrader:
         for index, (symbol, instrument_token) in enumerate(selected_symbols.items(), start=1):
             if on_progress is not None:
                 on_progress(index, total, symbol)
-            try:
-                candles = candle_loader(instrument_token)
-                if isinstance(self.strategy, SwingTrendBreakoutStrategy):
-                    pending = self.pending_breakouts.pop(symbol, None)
-                    if pending is not None:
-                        confirmed_signal = self.strategy.confirm_entry(pending, candles)
-                        if confirmed_signal is not None:
-                            candidates.append(SwingCandidate(symbol, int(instrument_token), pending, confirmed_signal))
-                        else:
-                            no_signal.append((symbol, "breakout did not confirm on the next completed candle"))
-                    evaluation = self.strategy.evaluate(symbol, candles)
-                    if evaluation.qualified:
-                        self.pending_breakouts[symbol] = evaluation
-                        pending_candidates.append(SwingCandidate(symbol, int(instrument_token), evaluation))
-                    else:
-                        no_signal.append((symbol, "; ".join(evaluation.rejection_reasons) or "conditions not met"))
-                    continue
-                evaluation = self.strategy.evaluate(symbol, candles, instrument_token)
-            except NoSignal as no_signal_error:
-                no_signal.append((symbol, str(no_signal_error) or "no qualifying signal"))
+            result = self.evaluate_symbol(symbol, instrument_token, candle_loader)
+            if result.error is not None:
+                errors.append(f"{symbol}: {result.error}")
                 continue
-            except ValueError as error:
-                if "not enough completed daily candles" in str(error):
-                    insufficient_history.append(symbol)
-                    continue
-                errors.append(f"{symbol}: {error}")
+            if result.insufficient_history:
+                insufficient_history.append(symbol)
                 continue
-            except Exception as error:
-                errors.append(f"{symbol}: {error}")
-                continue
-            candidates.append(SwingCandidate(symbol, int(instrument_token), evaluation))
+            if result.candidate is not None:
+                candidates.append(result.candidate)
+            if result.pending_candidate is not None:
+                pending_candidates.append(result.pending_candidate)
+            for reason in result.no_signal_reasons:
+                no_signal.append((symbol, reason))
         candidates.sort(key=lambda item: item.signal.timestamp, reverse=True)
         return SwingScanResult(
             tuple(candidates),
@@ -192,7 +227,11 @@ class SwingAutoTrader:
             return SwingOrderResult(candidate.symbol, "skipped", "signal was already submitted")
         quantity = min(quantity_limit, floor(amount_limit / signal.price))
         if quantity < 1:
-            return SwingOrderResult(candidate.symbol, "rejected", "amount limit is smaller than one share")
+            return SwingOrderResult(
+                candidate.symbol,
+                "rejected",
+                f"amount limit ₹{amount_limit:,.2f} is smaller than one share at ₹{signal.price:,.2f} (quantity limit {quantity_limit})",
+            )
         if self.mode != TradingMode.LIVE:
             return SwingOrderResult(candidate.symbol, "rejected", "swing orders require LIVE trading mode", quantity)
 

@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     user_id: str = "default"
     signal_timeframe: str = "5minute"
-    signal_poll_seconds: int = Field(default=30, ge=5)
+    signal_poll_seconds: int = Field(default=300, ge=5)
     pre_spike_cooldown_minutes: int = Field(default=30, ge=0)
     enable_ema_progressive_strategy: bool = True
     swing_capital_limit: float = Field(default=2_000.0, gt=0)
@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     swing_trailing_atr_multiplier: float = Field(default=2.0, gt=0)
     swing_max_open_positions: int = Field(default=10, ge=1)
     intraday_capital_limit: float = Field(default=5_000.0, gt=0)
+    intraday_leverage_multiplier: float = Field(default=1.0, ge=1.0)
 
     if PYDANTIC_V2:
         @field_validator("entry_end")

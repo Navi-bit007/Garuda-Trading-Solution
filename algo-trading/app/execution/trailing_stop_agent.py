@@ -12,7 +12,7 @@ import pandas as pd
 from app.broker.market_data import MarketData
 from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import Side
-from app.database.models import AgentHeartbeat, PositionRecord, TradeRecord
+from app.database.models import ActivityRecord, AgentHeartbeat, PositionRecord, TradeRecord
 from app.database.repository import Repository
 from app.execution.swing_trailing import compute_ema_swing_stop, compute_trend_breakout_stop
 from app.execution.trailing_stop import TrailingStop
@@ -89,6 +89,8 @@ class TrailingStopAgent:
         self._last_swing_recompute_at: datetime | None = None
         self._stop_event = Event()
         self._thread: Thread | None = None
+        self.user_id = str(getattr(settings, "user_id", "default"))
+        self._broker_error = ""
 
     @property
     def running(self) -> bool:
@@ -121,7 +123,9 @@ class TrailingStopAgent:
     def run_once(self, now: datetime | None = None) -> None:
         timestamp = now or datetime.now()
         last_error = ""
+        self._broker_error = ""
         try:
+            self._refresh_broker_session()
             self.load_positions()
             self._process_intraday(timestamp)
             due = self._last_swing_recompute_at is None or (timestamp - self._last_swing_recompute_at).total_seconds() >= self.swing_recompute_seconds
@@ -132,10 +136,38 @@ class TrailingStopAgent:
             last_error = str(error)
             raise
         finally:
+            # A broker call failing inside _process_intraday/_process_swing (e.g. an expired
+            # Kite session) is caught and logged there so one bad symbol can't block the rest of
+            # the cycle -- but that means it would otherwise never reach here, and the heartbeat
+            # would keep reporting a clean "RUNNING" state while every broker call is silently
+            # failing. Surface it on the heartbeat too so a stale/expired session is visible on
+            # the dashboard instead of looking identical to a healthy agent.
             try:
-                self.repository.save_agent_heartbeat(AgentHeartbeat("trailing_stop_agent", timestamp, last_error, timestamp))
+                self.repository.save_agent_heartbeat(AgentHeartbeat("trailing_stop_agent", timestamp, last_error or self._broker_error, timestamp))
             except Exception:
                 logger.exception("Failed to record trailing-stop agent heartbeat")
+
+    def _refresh_broker_session(self) -> None:
+        """Pick up a newly generated Kite access token without needing a process restart.
+
+        Zerodha access tokens expire once every trading day; this agent is meant to run for as
+        long as any position (especially a multi-day swing one) stays open, so it will always
+        outlive its token. Rather than requiring a manual kill-and-relaunch each morning, check
+        the same `kite_session` row the dashboard writes to on every login and hot-swap the
+        broker client's token the moment it changes.
+        """
+        if self.broker_client is None or not hasattr(self.broker_client, "set_access_token"):
+            return
+        try:
+            latest_token = self.repository.load_kite_access_token(self.user_id)
+        except Exception:
+            logger.exception("Failed to check for a refreshed Kite access token")
+            return
+        current_token = getattr(self.broker_client, "access_token", None)
+        if latest_token and latest_token != current_token:
+            self.broker_client.set_access_token(latest_token)
+            logger.info("Trailing-stop agent picked up a refreshed Kite access token")
+            self.notifier.send("Trailing-stop agent refreshed its Kite session with a newly generated access token")
 
     # -- position bookkeeping -------------------------------------------------
 
@@ -211,11 +243,20 @@ class TrailingStopAgent:
         positions = [position for position in self.positions.values() if position.record.position_type == "INTRADAY"]
         if not positions:
             return
+        try:
+            self._reconcile_intraday_positions(positions, timestamp)
+        except Exception as error:
+            logger.exception("Intraday broker reconciliation failed")
+            self._broker_error = f"intraday reconciliation failed: {error}"
+        positions = [position for position in self.positions.values() if position.record.position_type == "INTRADAY"]
+        if not positions:
+            return
         keys = [f"{self._exchange(p.record.symbol)}:{self._tradingsymbol(p.record.symbol)}" for p in positions]
         try:
             quotes = self.market_data.ltp(keys)
-        except Exception:
+        except Exception as error:
             logger.exception("LTP fetch failed for intraday positions")
+            self._broker_error = f"LTP fetch failed: {error}"
             return
         for position, key in zip(positions, keys):
             quote = quotes.get(key)
@@ -236,6 +277,108 @@ class TrailingStopAgent:
                 candidate = max(candidate, entry_price) if position.record.side == "BUY" else min(candidate, entry_price)
                 position.trailing_stop.stop = candidate
             self._maybe_apply(position, candidate, price)
+
+    def _reconcile_intraday_positions(self, positions: list[AgentPosition], timestamp: datetime) -> None:
+        """Detect an intraday position that closed at the broker -- a protective SL-M fill, a
+        manual exit placed directly at Zerodha, or an entry order that was accepted (and
+        briefly persisted as a position) but then rejected moments later -- without any other
+        code path in this app catching it.
+
+        Previously the only code that did this for intraday positions was
+        TradingPipeline.sync_broker_positions(), and it only ran while a Streamlit dashboard
+        session happened to be open and rerunning. This process is always running once
+        launched, independent of the dashboard, so it's the right place for the safety net.
+        Checked every cycle (unlike swing, which is reconciled once a day) since an intraday
+        position can close at any moment during the session. Mirrors
+        _reconcile_swing_positions.
+        """
+        if self.broker_client is None or not hasattr(self.broker_client, "positions"):
+            return
+        try:
+            broker_positions = self.broker_client.positions().get("net", [])
+        except Exception as error:
+            logger.exception("Broker position lookup failed during intraday reconciliation")
+            self._broker_error = f"broker position lookup failed: {error}"
+            return
+        broker_by_tradingsymbol = {str(entry.get("tradingsymbol", "")).strip().upper(): entry for entry in broker_positions}
+        for position in positions:
+            # One symbol's lookup/DB error must never block reconciliation of the others in
+            # this cycle -- otherwise a single persistently-failing position (e.g. a broker
+            # order_history call that keeps erroring for it) would leave every other closed
+            # position stuck showing as open indefinitely, not just the one at fault.
+            try:
+                self._reconcile_one_intraday_position(position, broker_by_tradingsymbol, timestamp)
+            except Exception:
+                logger.exception("Reconciliation failed for %s; will retry next cycle", position.record.symbol)
+
+    def _reconcile_one_intraday_position(self, position: AgentPosition, broker_by_tradingsymbol: dict, timestamp: datetime) -> None:
+        record = position.record
+        broker_position = broker_by_tradingsymbol.get(self._tradingsymbol(record.symbol))
+        broker_quantity = int(broker_position.get("quantity", 0) or 0) if broker_position else 0
+        if broker_quantity != 0:
+            self._reconcile_entry_price(position, broker_position)
+            return
+        exit_price = self._broker_exit_fill_price(record)
+        multiplier = 1 if record.side == "BUY" else -1
+        pnl = multiplier * (exit_price - record.entry_price) * record.quantity
+        reason = "broker-side position closed; detected by the standalone trailing-stop agent"
+        self.repository.save_trade(
+            TradeRecord(
+                symbol=record.symbol,
+                entry_time=record.entry_time,
+                exit_time=timestamp,
+                entry_price=record.entry_price,
+                exit_price=exit_price,
+                quantity=record.quantity,
+                pnl=pnl,
+                side=record.side,
+                position_type="INTRADAY",
+                strategy_name=record.strategy_name,
+                exit_reason=reason,
+            )
+        )
+        self.repository.delete_position(record.symbol)
+        self.positions.pop(record.symbol, None)
+        exit_side = "SELL" if record.side == "BUY" else "BUY"
+        self.repository.save_activity(
+            ActivityRecord(
+                event_kind="broker_exit_detected",
+                symbol=record.symbol,
+                timestamp=timestamp,
+                mode="LIVE",
+                price=exit_price,
+                order_id=record.protective_order_id,
+                side=exit_side,
+                quantity=record.quantity,
+                entry_price=record.entry_price,
+                stop_loss=record.stop_loss,
+                pnl=pnl,
+                reason=reason,
+            )
+        )
+        logger.info("broker_exit_detected %s side=%s price=%.2f pnl=%.2f", record.symbol, exit_side, exit_price, pnl)
+        self.notifier.send(f"broker_exit_detected {record.symbol} side={exit_side} price={exit_price:.2f} pnl={pnl:.2f} reason={reason}")
+
+    def _reconcile_entry_price(self, position: AgentPosition, broker_position: dict) -> None:
+        """Correct a persisted position's entry price to match Zerodha's own average price.
+
+        A MARKET entry can fill a little away from the price it was signalled/logged at, and
+        nothing else ever revisits a position's entry price once it's open -- without this, the
+        dashboard's monitoring page and PnL keep showing a stale figure for as long as the
+        position stays open, even after the reconciliation flagged the actual accepted fill.
+        Runs every cycle, independent of whether a dashboard session is open.
+        """
+        record = position.record
+        try:
+            broker_entry_price = float(broker_position.get("average_price", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if broker_entry_price <= 0 or abs(broker_entry_price - record.entry_price) < 0.01:
+            return
+        logger.info("Correcting entry price for %s from %.2f to broker average price %.2f", record.symbol, record.entry_price, broker_entry_price)
+        updated = replace(record, entry_price=broker_entry_price)
+        self.repository.save_position(updated)
+        position.record = updated
 
     def _resolve_atr(self, position: AgentPosition, timestamp: datetime) -> float:
         symbol = position.record.symbol
@@ -266,13 +409,15 @@ class TrailingStopAgent:
             return
         try:
             self._reconcile_swing_positions(timestamp)
-        except Exception:
+        except Exception as error:
             logger.exception("Swing broker reconciliation failed")
+            self._broker_error = f"swing reconciliation failed: {error}"
         for position in [p for p in self.positions.values() if p.record.position_type == "SWING"]:
             try:
                 self._process_swing_position(position, timestamp)
-            except Exception:
+            except Exception as error:
                 logger.exception("Swing trailing update failed for %s", position.record.symbol)
+                self._broker_error = f"swing trailing update failed for {position.record.symbol}: {error}"
 
     def _reconcile_swing_positions(self, timestamp: datetime) -> None:
         """Detect an exchange-expired overnight SL-M and re-place it, and drop positions the
@@ -286,13 +431,15 @@ class TrailingStopAgent:
             return
         try:
             broker_positions = self.broker_client.positions().get("net", [])
-        except Exception:
+        except Exception as error:
             logger.exception("Broker position lookup failed during swing reconciliation")
+            self._broker_error = f"broker position lookup failed: {error}"
             return
-        open_tradingsymbols = {str(entry.get("tradingsymbol")) for entry in broker_positions if int(entry.get("quantity", 0) or 0) != 0}
+        broker_by_tradingsymbol = {str(entry.get("tradingsymbol")): entry for entry in broker_positions if int(entry.get("quantity", 0) or 0) != 0}
         for position in positions:
             record = position.record
-            if self._tradingsymbol(record.symbol) not in open_tradingsymbols:
+            broker_position = broker_by_tradingsymbol.get(self._tradingsymbol(record.symbol))
+            if broker_position is None:
                 exit_price = self._broker_exit_fill_price(record)
                 self.repository.save_trade(
                     TradeRecord(
@@ -312,6 +459,7 @@ class TrailingStopAgent:
                 self.repository.delete_position(record.symbol)
                 self.positions.pop(record.symbol, None)
                 continue
+            self._reconcile_entry_price(position, broker_position)
             if self._protective_stop_needs_rearm(record.protective_order_id):
                 self._rearm_protective_stop(position)
 
@@ -418,8 +566,24 @@ class TrailingStopAgent:
         if not self._modify_with_retry(record.protective_order_id or "", request):
             return
         self.repository.update_stop_price(record.symbol, candidate_stop)
+        previous_stop = record.stop_loss
         position.record = replace(record, stop_loss=candidate_stop)
         position.trailing_stop.stop = candidate_stop
+        self.repository.save_activity(
+            ActivityRecord(
+                event_kind="stop_trailed",
+                symbol=record.symbol,
+                timestamp=datetime.now(),
+                mode="LIVE",
+                price=candidate_stop,
+                order_id=record.protective_order_id,
+                side=exit_side.value,
+                quantity=record.quantity,
+                entry_price=record.entry_price,
+                stop_loss=candidate_stop,
+                reason=f"trailing stop moved from {previous_stop:.2f} to {candidate_stop:.2f}",
+            )
+        )
         self.notifier.send(f"Trailing stop moved: {record.symbol} -> {candidate_stop:.2f}")
 
     def _modify_with_retry(self, order_id: str, request: OrderRequest) -> bool:

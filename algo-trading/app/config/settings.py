@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     entry_start: time = time(9, 20)
     entry_end: time = time(14, 45)
     force_exit: time = time(15, 15)
+    agent_shutdown_time: time = time(15, 40)
     trailing_atr_multiplier: float = Field(default=1.5, gt=0)
     enable_telegram: bool = False
     telegram_bot_token: SecretStr = SecretStr("")
@@ -69,6 +70,14 @@ class Settings(BaseSettings):
             if value <= market_open:
                 raise ValueError("force_exit must be after market_open")
             return value
+
+        @field_validator("agent_shutdown_time")
+        @classmethod
+        def agent_shutdown_after_force_exit(cls, value: time, info):
+            force_exit = info.data.get("force_exit", time(15, 15))
+            if value <= force_exit:
+                raise ValueError("agent_shutdown_time must be after force_exit")
+            return value
     else:
         @validator("entry_end", allow_reuse=True)
         def entry_end_after_start(cls, value: time, values):
@@ -82,6 +91,13 @@ class Settings(BaseSettings):
             market_open = values.get("market_open", time(9, 15))
             if value <= market_open:
                 raise ValueError("force_exit must be after market_open")
+            return value
+
+        @validator("agent_shutdown_time", allow_reuse=True)
+        def agent_shutdown_after_force_exit(cls, value: time, values):
+            force_exit = values.get("force_exit", time(15, 15))
+            if value <= force_exit:
+                raise ValueError("agent_shutdown_time must be after force_exit")
             return value
 
 

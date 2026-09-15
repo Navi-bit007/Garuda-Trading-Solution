@@ -56,9 +56,19 @@ def main() -> None:
 
     agent.start()
     logging.info("Trailing stop agent started")
-    stop_event.wait()
-    logging.info("Stopping trailing stop agent")
-    agent.stop()
+    # Block until either an external stop request arrives (Ctrl+C, the dashboard's "Stop agent"
+    # button) or the agent decides on its own that the trading day is over (see
+    # TrailingStopAgent.run_once's shutdown-time check) and its background thread ends by
+    # itself -- polling agent.running lets either path actually terminate this process, instead
+    # of only reacting to external signals and leaving the process resident with nothing left
+    # to do overnight.
+    while not stop_event.is_set() and agent.running:
+        stop_event.wait(5)
+    if stop_event.is_set():
+        logging.info("Stopping trailing stop agent")
+        agent.stop()
+    else:
+        logging.info("Trailing stop agent shut down for the day; exiting process")
 
 
 if __name__ == "__main__":

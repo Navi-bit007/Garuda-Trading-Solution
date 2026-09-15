@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -95,6 +96,7 @@ def launch_trailing_stop_agent(
         popen_kwargs["start_new_session"] = True
     process = subprocess.Popen([sys.executable, str(AGENT_SCRIPT_PATH)], **popen_kwargs)
     if repository is not None:
+        repository.save_agent_pid(TRAILING_STOP_AGENT_ENGINE_NAME, process.pid)
         _record_startup_failure_if_any(repository, process)
     return process
 
@@ -108,3 +110,29 @@ def maybe_autostart_trailing_agent(repository, api_key: str, api_secret: str, ac
     if agent_heartbeat_is_fresh(repository):
         return None
     return launch_trailing_stop_agent(api_key, api_secret, access_token, repository)
+
+
+def stop_trailing_stop_agent(repository) -> bool:
+    """Stop the standalone trailing-stop agent process from the dashboard, so a code/config
+    change doesn't require hunting the process down in Task Manager or a terminal.
+
+    The agent is intentionally launched detached (see `launch_trailing_stop_agent`) precisely so
+    it survives the dashboard closing -- which also means the dashboard has no live handle to it
+    across reruns/sessions, so its PID (recorded at launch, see `save_agent_pid`) is the only way
+    back to it. Returns False if there's no recorded PID or it's already gone.
+    """
+    pid = repository.get_agent_pid(TRAILING_STOP_AGENT_ENGINE_NAME)
+    if pid is None:
+        return False
+    stopped = False
+    if os.name == "nt":
+        result = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True)
+        stopped = result.returncode == 0
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped = True
+        except ProcessLookupError:
+            stopped = False
+    repository.clear_agent_heartbeat(TRAILING_STOP_AGENT_ENGINE_NAME)
+    return stopped

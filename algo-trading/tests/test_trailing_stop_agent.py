@@ -529,6 +529,68 @@ def test_position_closed_at_broker_is_dropped_from_tracking(tmp_path):
     assert trade.position_type == "SWING"
 
 
+def test_agent_stops_itself_past_the_configured_shutdown_time(tmp_path):
+    """Kite tokens expire daily and there's nothing left to trail once the market's closed for
+    the day (Zerodha's own SL-M orders expire at close regardless of this process), so running
+    overnight is pointless -- the agent should exit on its own rather than sit idle until someone
+    notices and restarts it the next morning. Default agent_shutdown_time (via getattr fallback
+    on the plain `object()` settings used in these tests) is 15:40."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    repository.save_position(
+        PositionRecord(
+            symbol="NSE:AAA",
+            side="BUY",
+            quantity=10,
+            entry_price=100.0,
+            stop_loss=90.0,
+            entry_time=datetime(2026, 1, 1, 9, 20),
+            protective_order_id="PAPER-STOP-000001",
+            instrument_token=111,
+            position_type="INTRADAY",
+            atr_multiplier=1.5,
+            trading_mode="LIVE",
+        )
+    )
+    agent = build_agent(repository, client)
+
+    agent.run_once(now=datetime(2026, 1, 1, 15, 41))
+
+    assert agent.shut_down_for_the_day is True
+    assert agent._stop_event.is_set() is True
+    # No broker work should have happened this cycle -- positions were never even reloaded.
+    assert agent.positions == {}
+    database.close()
+
+
+def test_agent_clears_its_heartbeat_on_end_of_day_shutdown(tmp_path):
+    """A heartbeat left to simply age out reads on the dashboard as "stalled: check the process",
+    which is alarming for what is actually an intentional, clean end-of-day exit -- clearing it
+    immediately gives the calmer "not started yet" state instead."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    agent = build_agent(repository, client)
+    agent.run_once(now=datetime(2026, 1, 1, 9, 20))
+    assert repository.load_agent_heartbeat("trailing_stop_agent") is not None
+
+    agent.run_once(now=datetime(2026, 1, 1, 15, 41))
+
+    assert repository.load_agent_heartbeat("trailing_stop_agent") is None
+    database.close()
+
+
+def test_agent_keeps_running_before_the_shutdown_time(tmp_path):
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    agent = build_agent(repository, client)
+
+    agent.run_once(now=datetime(2026, 1, 1, 15, 39))
+
+    assert agent.shut_down_for_the_day is False
+    assert agent._stop_event.is_set() is False
+    database.close()
+
+
 def test_agent_picks_up_a_refreshed_access_token_without_a_restart(tmp_path):
     """Kite access tokens expire once every trading day, but this agent is meant to keep running
     for as long as any position (especially a multi-day swing one) stays open -- it will always

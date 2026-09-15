@@ -219,6 +219,7 @@ class Database:
             self._migrate_dynamic_watchlists()
             self._migrate_positions()
             self._migrate_trades()
+            self._migrate_agent_heartbeat()
             self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_user_signal ON signals(user_id, signal_id)")
             self.connection.execute("CREATE INDEX IF NOT EXISTS ix_pre_spike_events_lookup ON pre_spike_events(user_id, strategy, symbol, timeframe, trading_date, latest_time)")
             self.connection.commit()
@@ -261,6 +262,11 @@ class Database:
             self.connection.execute("ALTER TABLE positions ADD COLUMN strategy_name TEXT NOT NULL DEFAULT ''")
         if "trading_mode" not in columns:
             self.connection.execute("ALTER TABLE positions ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'LIVE'")
+
+    def _migrate_agent_heartbeat(self) -> None:
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(agent_heartbeat)").fetchall()}
+        if "pid" not in columns:
+            self.connection.execute("ALTER TABLE agent_heartbeat ADD COLUMN pid INTEGER")
 
     def _migrate_trades(self) -> None:
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(trades)").fetchall()}

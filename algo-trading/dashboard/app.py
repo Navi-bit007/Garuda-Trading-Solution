@@ -46,7 +46,7 @@ from app.database.models import ActivityRecord, DynamicWatchlistRecord, Notifica
 from app.database.repository import Repository
 from app.execution.position_manager import Position, PositionManager
 from app.execution.reconciliation import reconcile
-from app.execution.agent_launcher import agent_heartbeat_is_fresh, launch_trailing_stop_agent, maybe_autostart_trailing_agent
+from app.execution.agent_launcher import agent_heartbeat_is_fresh, launch_trailing_stop_agent, maybe_autostart_trailing_agent, stop_trailing_stop_agent
 from app.execution.swing_auto_trader import SwingAutoTrader, SwingOrderResult, SwingScanResult
 from app.market.candles import validate_ohlcv
 from app.market.indicators import atr as compute_atr
@@ -1714,9 +1714,19 @@ def render_kite_authentication(st, settings) -> None:
             else:
                 st.caption("Trailing-stop agent is not currently running.")
         with action_column:
-            if st.button("Start agent now", icon=":material/play_arrow:", disabled=agent_running, width="stretch"):
-                launch_trailing_stop_agent(settings.kite_api_key, settings.kite_api_secret.get_secret_value(), runtime_token, repository)
-                st.rerun()
+            if agent_running:
+                if st.button("Stop agent", icon=":material/stop:", width="stretch"):
+                    stopped = stop_trailing_stop_agent(repository)
+                    st.session_state.kite_auth_notice = (
+                        "Trailing-stop agent stopped. Open positions will not be protected or trailed until it's started again."
+                        if stopped
+                        else "No running trailing-stop agent process was found to stop; its status has been cleared."
+                    )
+                    st.rerun()
+            else:
+                if st.button("Start agent now", icon=":material/play_arrow:", width="stretch"):
+                    launch_trailing_stop_agent(settings.kite_api_key, settings.kite_api_secret.get_secret_value(), runtime_token, repository)
+                    st.rerun()
         if st.button("Log out", icon=":material/logout:"):
             log_out_of_kite(st, repository, user_id)
             st.rerun()

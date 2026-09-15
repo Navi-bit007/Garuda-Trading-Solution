@@ -9,6 +9,7 @@ from app.execution.agent_launcher import (
     agent_heartbeat_is_fresh,
     launch_trailing_stop_agent,
     maybe_autostart_trailing_agent,
+    stop_trailing_stop_agent,
 )
 
 
@@ -69,8 +70,9 @@ def test_autostart_launches_when_heartbeat_is_stale_or_missing(tmp_path, monkeyp
 
 
 class FakeProcess:
-    def __init__(self, returncode: int | None):
+    def __init__(self, returncode: int | None, pid: int = 4242):
         self.returncode = returncode
+        self.pid = pid
 
     def poll(self) -> int | None:
         return self.returncode
@@ -115,7 +117,11 @@ def test_launch_records_error_heartbeat_on_immediate_crash(tmp_path, monkeypatch
     database.close()
 
 
-def test_launch_does_not_record_heartbeat_when_process_stays_alive(tmp_path, monkeypatch):
+def test_launch_does_not_record_an_error_heartbeat_when_process_stays_alive(tmp_path, monkeypatch):
+    """A process that's still running after the startup grace period shouldn't have an error
+    heartbeat written for it -- a heartbeat row now does exist immediately on launch (it records
+    the PID so the "Stop agent" button can find it later, see save_agent_pid), but its last_error
+    must stay empty until/unless the agent's own real heartbeat says otherwise."""
     monkeypatch.setattr("app.execution.agent_launcher.AGENT_LOG_PATH", tmp_path / "agent.log")
     monkeypatch.setattr("app.execution.agent_launcher.STARTUP_GRACE_SECONDS", 0)
     monkeypatch.setattr(
@@ -127,7 +133,48 @@ def test_launch_does_not_record_heartbeat_when_process_stays_alive(tmp_path, mon
 
     launch_trailing_stop_agent("key", "secret", "token", repository)
 
+    heartbeat = repository.load_agent_heartbeat("trailing_stop_agent")
+    assert heartbeat is not None
+    assert heartbeat.last_error == ""
+    assert repository.get_agent_pid("trailing_stop_agent") == 4242
+    database.close()
+
+
+def test_stop_agent_kills_the_recorded_pid_and_clears_the_heartbeat(tmp_path, monkeypatch):
+    """The "Stop agent" button on the Kite authentication page needs a way back to a process that
+    was deliberately launched detached (see launch_trailing_stop_agent's docstring) -- its PID,
+    recorded at launch by save_agent_pid, is the only handle available. After stopping it, the
+    heartbeat is cleared immediately so the dashboard shows "not running" right away instead of
+    waiting for the old heartbeat to age out."""
+    database, repository = build_repository(tmp_path)
+    repository.save_agent_pid("trailing_stop_agent", 4242)
+    repository.save_agent_heartbeat(AgentHeartbeat("trailing_stop_agent", datetime.now(), "", datetime.now()))
+
+    killed = {}
+
+    class FakeResult:
+        returncode = 0
+
+    def fake_run(command, **kwargs):
+        killed["command"] = command
+        return FakeResult()
+
+    monkeypatch.setattr("app.execution.agent_launcher.os.name", "nt")
+    monkeypatch.setattr("app.execution.agent_launcher.subprocess.run", fake_run)
+
+    stopped = stop_trailing_stop_agent(repository)
+
+    assert stopped is True
+    assert killed["command"] == ["taskkill", "/PID", "4242", "/F"]
     assert repository.load_agent_heartbeat("trailing_stop_agent") is None
+    assert repository.get_agent_pid("trailing_stop_agent") is None
+    database.close()
+
+
+def test_stop_agent_is_a_no_op_when_no_pid_is_recorded(tmp_path):
+    database, repository = build_repository(tmp_path)
+
+    assert stop_trailing_stop_agent(repository) is False
     database.close()
 
 

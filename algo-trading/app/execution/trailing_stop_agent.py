@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, time as time_of_day, timedelta
 from threading import Event, Lock, Thread, current_thread
 from time import sleep
 from typing import Any
@@ -91,6 +91,8 @@ class TrailingStopAgent:
         self._thread: Thread | None = None
         self.user_id = str(getattr(settings, "user_id", "default"))
         self._broker_error = ""
+        self.shutdown_time = getattr(settings, "agent_shutdown_time", time_of_day(15, 40))
+        self.shut_down_for_the_day = False
 
     @property
     def running(self) -> bool:
@@ -122,6 +124,26 @@ class TrailingStopAgent:
 
     def run_once(self, now: datetime | None = None) -> None:
         timestamp = now or datetime.now()
+        if timestamp.time() >= self.shutdown_time:
+            # There's nothing left to do once the trading day is over -- Zerodha's own SL-M
+            # orders are day orders that expire at market close regardless of whether this
+            # process is alive, and swing stops only need re-arming once trading resumes
+            # tomorrow (handled fresh by _reconcile_swing_positions on that day's first cycle).
+            # Rather than sit idle overnight burning an OS process and racing tomorrow's Kite
+            # token expiry, exit for the day; the dashboard's auto-start-on-login relaunches a
+            # fresh process the next time the user actually opens the app and signs in.
+            logger.info("Past today's shutdown time (%s); trailing stop agent is exiting for the day", self.shutdown_time)
+            self.shut_down_for_the_day = True
+            self._stop_event.set()
+            try:
+                # Clear rather than leave a stale heartbeat behind -- an aged-out heartbeat
+                # reads on the dashboard as "stalled: positions may not be protected, check the
+                # process", which is alarming for what is actually an intentional, clean
+                # end-of-day exit. No heartbeat at all reads as the calmer "not started yet".
+                self.repository.clear_agent_heartbeat("trailing_stop_agent")
+            except Exception:
+                logger.exception("Failed to clear the heartbeat on end-of-day shutdown")
+            return
         last_error = ""
         self._broker_error = ""
         try:

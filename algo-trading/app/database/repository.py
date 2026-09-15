@@ -724,6 +724,39 @@ class Repository:
         heartbeat_at = datetime.fromisoformat(row["heartbeat_at"]) if row["heartbeat_at"] else datetime.fromisoformat(row["last_run_at"])
         return AgentHeartbeat(row["engine_name"], datetime.fromisoformat(row["last_run_at"]), row["last_error"], heartbeat_at)
 
+    def save_agent_pid(self, engine_name: str, pid: int) -> None:
+        """Record the OS process id of a just-launched agent so it can be stopped from the UI
+        later without the operator having to hunt it down in Task Manager. Upserts a placeholder
+        heartbeat row if none exists yet -- the agent's own first real heartbeat (within
+        STARTUP_GRACE_SECONDS) overwrites the placeholder timestamps immediately."""
+        now = datetime.now().isoformat()
+        with self.database.lock:
+            self.database.connection.execute(
+                """
+                INSERT INTO agent_heartbeat (engine_name, last_run_at, last_error, heartbeat_at, pid)
+                VALUES (?, ?, '', ?, ?)
+                ON CONFLICT(engine_name) DO UPDATE SET pid=excluded.pid
+                """,
+                (engine_name, now, now, pid),
+            )
+            self.database.connection.commit()
+
+    def get_agent_pid(self, engine_name: str) -> int | None:
+        with self.database.lock:
+            row = self.database.connection.execute(
+                "SELECT pid FROM agent_heartbeat WHERE engine_name = ?",
+                (engine_name,),
+            ).fetchone()
+        return int(row["pid"]) if row and row["pid"] is not None else None
+
+    def clear_agent_heartbeat(self, engine_name: str) -> None:
+        """Drop the heartbeat row after deliberately stopping an agent, so the dashboard reflects
+        "not running" immediately instead of waiting up to HEARTBEAT_STALE_SECONDS for the last
+        heartbeat to age out."""
+        with self.database.lock:
+            self.database.connection.execute("DELETE FROM agent_heartbeat WHERE engine_name = ?", (engine_name,))
+            self.database.connection.commit()
+
     def set_auto_start_trailing_agent(self, user_id: str, enabled: bool) -> None:
         with self.database.lock:
             self.database.connection.execute(

@@ -195,13 +195,18 @@ Where you define *which stocks the whole system pays attention to*. Create named
 ### 5.6 Scanner & signals
 Controls the **always-on background signal engine** — a separate scanning loop (distinct from the two auto-trading engines) that continuously looks for signals across your watchlists and just *records* them (it never places orders). You pick one of five "live strategies," start/stop the engine, and watch a live health banner. Also has a one-off "Historical day scan" tool to replay any single past trading day against a chosen strategy.
 
-### 5.7 Swing auto trading
+### 5.7 Backtesting
+The research-only replay page uses Kite Connect historical candles and requires a valid Kite access token. Select one symbol or the active watchlists, choose a strategy and Daily or 5-minute candles, set the date range, fees, slippage, and sizing, then run the replay. Results include aggregate and per-symbol metrics, an equity curve, exit reasons, and downloadable trades. The page never submits orders, writes trading activity, or changes live positions.
+
+The page supports the Scanner & signals, Intratrading, and Swing auto trading strategies. EMA 9/200 progressive backtests enter only when the lifecycle reaches STRONG; LIGHT remains lifecycle context and EMA9 <= EMA200 invalidates the cycle. Swing trend breakout candidates require the same next-session confirmation used by the live page. If Kite cannot return data for a symbol or date range, that symbol is reported separately and successful symbols still finish.
+
+### 5.8 Swing auto trading
 See [§4.2](#42-swing-auto-trading-multi-day-trades--layman-version). UI: a strategy dropdown, a live-order confirmation checkbox, a "Trading Live Start/End" toggle, a manual "Scan" button, a live progress bar during scanning, a color-coded engine-health banner, a rolling "Recent scan cycles" log, a "Recent swing activity" log, and a results table of qualifying candidates plus a table of currently-open swing positions.
 
-### 5.8 Intratrading
+### 5.9 Intratrading
 See [§4.1](#41-intratrading-same-day-trades--layman-version). Same UX pattern as Swing (confirmation checkbox, Start/End toggle, Scan button, progress bar, health banner, cycle log, activity log), plus an embedded live position monitor that checks for profit-target exits every 5 seconds.
 
-### 5.9 Risk & settings
+### 5.10 Risk & settings
 The one settings page. Three sections, saved together:
 - **Global** — Trading mode (PAPER/LIVE), Initial capital, Maximum capital deployment %.
 - **Intratrading** — Maximum capital per position, Maximum open positions, Trailing stop ATR multiplier, Maximum trades per day, Market open/Entry window/Force exit times.
@@ -354,7 +359,7 @@ algo-trading/
 Kept here on purpose, in plain sight, so future work doesn't rediscover the same surprises from scratch:
 
 - **Dead page**: `render_automatic_feed` in `dashboard/app.py` defines a full "Automatic trading" page (reviews persisted signals, submits via a `CrossoverStrategy`), but it's never called from anywhere — superseded by today's Intratrading page and left in place unused.
-- **Unused imports**: `BacktestEngine`/`calculate_metrics` and `calculate_quantity` are imported at the top of `dashboard/app.py` but not called directly there (sizing is done with inline arithmetic instead; there's no dashboard "Backtest" page despite the import).
+- **CLI backtest remains separate**: `scripts/run_backtest.py` still accepts local OHLCV CSV input for reproducible command-line research; the dashboard Backtesting page intentionally uses Kite Connect only.
 - **`SQLAlchemy` dependency is unused** — `requirements.txt` lists it, but the database layer uses raw `sqlite3` directly. Likely leftover from an earlier plan or reserved for future use.
 - **Stale `.env` variables**: `RISK_PER_TRADE` and `MAX_DAILY_LOSS` (and historically the removed Intratrading quantity/entries-per-run settings) may still be defined in `.env` — they're silently ignored now (`extra="ignore"` on the Settings model), not an error, but worth cleaning up eventually.
 - **`PositionRecord.trading_mode` default mismatch**: the Python dataclass defaults this field to `"PAPER"`, but the database column's own default is `'LIVE'`, and `Repository.load_positions()` falls back to `"LIVE"` for `None` values. Minor inconsistency, unlikely to bite in practice but worth knowing about if you ever see an unexpected trading_mode on an old row.

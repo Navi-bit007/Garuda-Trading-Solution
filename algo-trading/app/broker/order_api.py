@@ -214,11 +214,14 @@ class OrderAPI:
         )
 
     def _modify_live_protective_stop(self, order_id: str, request: OrderRequest) -> None:
+        # Kite Connect's modify_order() has no `product` parameter at all -- product type isn't
+        # something you change on an existing order, only on a fresh place_order() -- so passing
+        # it here always raised a TypeError and silently killed every trailing-stop update at
+        # the broker (retried 3x, then given up on, every single cycle, for every live position).
         self.client.modify_order(
             variety="regular",
             order_id=order_id,
             quantity=request.quantity,
-            product=request.product,
             order_type="SL-M",
             trigger_price=request.stop_loss,
             market_protection=-1,

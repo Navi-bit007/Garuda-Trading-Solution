@@ -22,6 +22,8 @@ class StubKiteClient:
         self.order_history_by_id: dict = {}
         self.access_token = "initial-token"
         self.positions_error: Exception | None = None
+        self.broker_holdings_list: list = []
+        self.todays_orders: list = []
 
     def instruments(self, exchange=None):
         return self.instrument_rows
@@ -42,6 +44,12 @@ class StubKiteClient:
 
     def set_access_token(self, access_token):
         self.access_token = access_token
+
+    def holdings(self):
+        return self.broker_holdings_list
+
+    def orders(self):
+        return self.todays_orders
 
 
 def intraday_candles(rows: int = 30, base: float = 100.0, spread: float = 4.0) -> list[dict]:
@@ -479,8 +487,10 @@ def test_expired_overnight_stop_is_rearmed(tmp_path):
     repository.save_position(swing_position_record())
     agent = build_agent(repository, client)
     agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "CNC", "NSE")
-    # The exchange cancels "regular" day orders at market close: simulate that overnight expiry.
-    client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "CANCELLED"}]
+    # The exchange cancels "regular" day orders at market close: simulate that overnight expiry
+    # via today's order book (see _protective_stop_needs_rearm's docstring for why order_history
+    # isn't used for this check).
+    client.todays_orders = [{"order_id": "PAPER-STOP-000001", "status": "CANCELLED"}]
     client.ltp_response = {"NSE:AAA": {"last_price": 105.0}}
     client.historical_rows[(111, "day")] = []
 
@@ -499,11 +509,38 @@ def test_live_overnight_stop_is_left_alone(tmp_path):
     repository.save_position(swing_position_record())
     agent = build_agent(repository, client)
     agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "CNC", "NSE")
-    client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "TRIGGER PENDING"}]
+    client.todays_orders = [{"order_id": "PAPER-STOP-000001", "status": "TRIGGER PENDING"}]
     client.historical_rows[(111, "day")] = []
 
     agent.run_once(now=datetime(2025, 2, 1, 9, 20))
 
+    [saved] = repository.load_positions()
+    assert saved.protective_order_id == "PAPER-STOP-000001"
+    database.close()
+
+
+def test_rearm_failure_is_surfaced_on_the_heartbeat_instead_of_looking_healthy(tmp_path):
+    """A re-arm failure (confirmed live: Zerodha rejecting a sell on a T1 holding pending CDSL
+    authorisation) used to be swallowed into a Telegram notification only -- the heartbeat stayed
+    clean, so the dashboard kept showing a healthy green "RUNNING" banner while a real position
+    sat genuinely unprotected. That's worse than any other broker-call failure, not less severe,
+    so it must surface the same way."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    repository.save_position(swing_position_record())
+    agent = build_agent(repository, client)
+    client.ltp_response = {"NSE:AAA": {"last_price": 105.0}}
+    client.historical_rows[(111, "day")] = []
+
+    def failing_place_protective_stop(request):
+        raise RuntimeError("1 shares need to be authorised at CDSL (your demat depository) to sell")
+
+    agent.orders.place_protective_stop = failing_place_protective_stop
+
+    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+
+    heartbeat = repository.load_agent_heartbeat("trailing_stop_agent")
+    assert "CDSL" in heartbeat.last_error
     [saved] = repository.load_positions()
     assert saved.protective_order_id == "PAPER-STOP-000001"
     database.close()
@@ -527,6 +564,85 @@ def test_position_closed_at_broker_is_dropped_from_tracking(tmp_path):
     assert trade.symbol == "NSE:AAA"
     assert trade.exit_price == 89.5
     assert trade.position_type == "SWING"
+
+
+def test_settled_swing_holding_is_not_wrongly_closed(tmp_path):
+    """A CNC buy drops out of positions() once it settles into a holding (commonly the next
+    trading day or two) even though nothing was ever sold -- confirmed live against Zerodha for
+    a real position (NSE:JUBLPHARMA, bought 11 Sep, still shown in holdings() with t1_quantity=1
+    on 16 Sep but completely absent from positions().net). Relying on positions() alone would
+    make _reconcile_swing_positions fabricate a close for every swing position a few days after
+    entry, purely from settlement -- kite.holdings() must be checked before concluding "closed"."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    repository.save_position(swing_position_record())
+    agent = build_agent(repository, client)
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "CNC", "NSE")
+    client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "TRIGGER PENDING"}]
+    client.broker_holdings = []  # absent from positions() -- looks closed by that check alone
+    client.broker_holdings_list = [{"tradingsymbol": "AAA", "quantity": 0, "t1_quantity": 10}]
+    client.historical_rows[(111, "day")] = []
+
+    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+
+    [saved] = repository.load_positions()
+    assert saved.symbol == "NSE:AAA"
+    assert "NSE:AAA" in agent.positions
+    assert repository.load_trades() == []
+    database.close()
+
+
+def test_settled_swing_holding_still_gets_its_overnight_expired_stop_rearmed(tmp_path):
+    """The daily SL-M re-arm exists precisely for a position that's a day or more past entry --
+    which, in practice, is exactly when it has already settled out of positions() and into
+    holdings(). The re-arm check must not be silently skipped just because the position is now
+    only visible via holdings() rather than positions()."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    repository.save_position(swing_position_record())
+    agent = build_agent(repository, client)
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "CNC", "NSE")
+    # This order id is from a previous day, so -- confirmed live against Zerodha -- it's simply
+    # absent from today's order book entirely (client.todays_orders stays empty), the same as any
+    # other "regular" day order once its trading day has passed.
+    client.ltp_response = {"NSE:AAA": {"last_price": 105.0}}
+    client.broker_holdings = []  # settled -- absent from positions()
+    client.broker_holdings_list = [{"tradingsymbol": "AAA", "quantity": 10, "t1_quantity": 0}]
+    client.historical_rows[(111, "day")] = []
+
+    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+
+    [saved] = repository.load_positions()
+    assert saved.protective_order_id != "PAPER-STOP-000001"
+    assert saved.protective_order_id in agent.orders.paper_protective_orders
+    assert agent.orders.paper_protective_orders[saved.protective_order_id].stop_loss == 90.0
+    database.close()
+
+
+def test_swing_holding_lookup_failure_does_not_wrongly_close_a_position(tmp_path):
+    """If the holdings() call itself fails, there's no reliable way to distinguish "genuinely
+    closed" from "settled into a holding" that cycle -- better to leave the position tracked and
+    retry next cycle than risk fabricating a close for something still owned."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    repository.save_position(swing_position_record())
+    agent = build_agent(repository, client)
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "CNC", "NSE")
+    client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "TRIGGER PENDING"}]
+    client.broker_holdings = []
+    client.historical_rows[(111, "day")] = []
+
+    def failing_holdings():
+        raise RuntimeError("network error")
+
+    client.holdings = failing_holdings
+
+    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+
+    [saved] = repository.load_positions()
+    assert saved.symbol == "NSE:AAA"
+    assert repository.load_trades() == []
+    database.close()
 
 
 def test_agent_stops_itself_past_the_configured_shutdown_time(tmp_path):

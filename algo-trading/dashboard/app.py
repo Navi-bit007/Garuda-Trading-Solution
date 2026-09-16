@@ -1426,6 +1426,16 @@ def render_live_monitor(st, settings) -> None:
             stop_trail_events = activity.loc[activity["event_kind"] == "stop_trailed", ["timestamp", "symbol", "reason", "stop_loss"]].copy()
             stop_trail_events["timestamp"] = pd.to_datetime(stop_trail_events["timestamp"], errors="coerce")
         stop_trail_counts = stop_trail_events["symbol"].value_counts().to_dict() if not stop_trail_events.empty else {}
+        # st.dataframe has no per-cell hover tooltip -- column_config "help" is one static string
+        # for the whole column -- so instead of a hover, show the latest move's from/to prices
+        # directly as a column: the most recent "stop_trailed" activity row per symbol, already
+        # phrased as "trailing stop moved from X to Y" by the trailing-stop agent.
+        latest_stop_move: dict[str, str] = {}
+        if not stop_trail_events.empty:
+            for _, event_row in stop_trail_events.sort_values("timestamp").iterrows():
+                move = re.search(r"from ([\d.]+) to ([\d.]+)", str(event_row["reason"]))
+                if move:
+                    latest_stop_move[event_row["symbol"]] = f"₹{float(move.group(1)):,.2f} → ₹{float(move.group(2)):,.2f}"
 
         access_token = runtime_access_token(st, settings)
         quotes: dict = {}
@@ -1442,6 +1452,14 @@ def render_live_monitor(st, settings) -> None:
                     for position in broker_positions
                     if int(position.get("quantity", 0) or 0) != 0
                 }
+                # A CNC (swing) buy drops out of positions() once it settles into a holding --
+                # commonly the next trading day or two -- even though nothing was ever sold.
+                # Without also checking holdings(), every swing position would eventually show
+                # as "Not found at broker" here purely from settlement, a few days after entry.
+                for holding in client.client.holdings():
+                    total_quantity = int(holding.get("quantity", 0) or 0) + int(holding.get("t1_quantity", 0) or 0)
+                    if total_quantity > 0:
+                        broker_open_tradingsymbols.add(str(holding.get("tradingsymbol", "")).strip().upper())
             except Exception as error:
                 st.warning(f"Live broker data unavailable right now: {error}")
             else:
@@ -1472,6 +1490,8 @@ def render_live_monitor(st, settings) -> None:
                 last_price = float(quote.get("last_price", 0) or 0) or record.entry_price
                 direction = 1 if record.side == "BUY" else -1
                 pnl = (last_price - record.entry_price) * record.quantity * direction
+                invested = record.entry_price * record.quantity
+                pnl_pct = (pnl / invested * 100) if invested else 0.0
                 stop_distance_pct = abs(last_price - record.stop_loss) / last_price * 100 if last_price else 0.0
                 if broker_open_tradingsymbols is None:
                     broker_status = "Unknown"
@@ -1492,9 +1512,11 @@ def render_live_monitor(st, settings) -> None:
                         "ATR": atr_values.get(record.symbol),
                         "ATR mult.": record.atr_multiplier,
                         "P&L": pnl,
+                        "P&L %": pnl_pct,
                         "Target 1": record.target_1,
                         "Target 1 hit": "Yes" if record.target_1_hit else "No",
                         "Stop updates": int(stop_trail_counts.get(record.symbol, 0)),
+                        "Last stop move": latest_stop_move.get(record.symbol, "-"),
                         "Protective order": record.protective_order_id or "Unavailable",
                         "Broker status": broker_status,
                         "Entered": record.entry_time,
@@ -1510,8 +1532,10 @@ def render_live_monitor(st, settings) -> None:
             "ATR": st.column_config.NumberColumn(format="₹%.2f", help="The current ATR14 value in rupees -- the average true range over the last 14 completed candles (15-minute for intraday, daily for swing). Blank if there isn't enough candle history or live broker data yet."),
             "ATR mult.": st.column_config.NumberColumn(format="%.2f", help="The trailing-stop agent's ATR multiplier for this position. Its candidate stop is Last price minus (ATR14 x this multiplier) for a BUY, calculated on 15-minute candles for intraday and daily candles for swing -- and it only ever moves in your favor, never back toward the entry."),
             "P&L": st.column_config.NumberColumn(format="₹%.2f"),
+            "P&L %": st.column_config.NumberColumn(format="%.2f%%", help="P&L as a percentage of entry price x quantity: (Last - Entry) / Entry x 100, signed for the trade's side."),
             "Target 1": st.column_config.NumberColumn(format="₹%.2f", help="The price that triggers the target-1 action (move stop to breakeven, or close the position, depending on strategy). Blank means the strategy didn't set one."),
-            "Stop updates": st.column_config.NumberColumn(help="How many times the trailing-stop agent has moved this position's SL-M since entry. See 'Recent stop-loss updates' below for the price history."),
+            "Stop updates": st.column_config.NumberColumn(help="How many times the trailing-stop agent has moved this position's SL-M since entry. See 'Recent stop-loss updates' below for the full price history."),
+            "Last stop move": st.column_config.TextColumn(help="The most recent trailing-stop move for this position (old price → new price)."),
             "Entered": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
         }
 
@@ -1593,44 +1617,88 @@ def render_pnl_statement(st, settings) -> None:
             except Exception as error:
                 st.warning(f"Live quotes unavailable right now: {error}")
 
-        status_filter = st.radio("Show", ["All", "Open", "Closed"], horizontal=True, key="pnl_statement_filter")
+        def _pnl_pct(pnl: float, entry_price: float, quantity: int) -> float:
+            invested = entry_price * quantity
+            return (pnl / invested * 100) if invested else 0.0
+
+        # Built once (independent of the Show filter below) so the totals summarized at the
+        # top of the page always reflect every position/trade, not just the ones the radio
+        # currently displays -- switching the filter to "Open" or "Closed" shouldn't make the
+        # portfolio's total P&L appear to change.
+        open_rows = []
+        for record in open_records:
+            key = record.symbol if ":" in record.symbol else f"NSE:{record.symbol}"
+            quote = quotes.get(key) or {}
+            ltp = float(quote.get("last_price", 0) or 0) or record.entry_price
+            direction = 1 if record.side == "BUY" else -1
+            pnl = (ltp - record.entry_price) * record.quantity * direction
+            open_rows.append(
+                {
+                    "Stock Name": record.symbol,
+                    "Current Position": "OPEN",
+                    "Entry Price": record.entry_price,
+                    "Exit Price": None,
+                    "LTP": ltp,
+                    "P&L": pnl,
+                    "P&L %": _pnl_pct(pnl, record.entry_price, record.quantity),
+                    "SL Current Price": record.stop_loss,
+                    "Used Strategy Name": record.strategy_name or "-",
+                    "Entered": record.entry_time,
+                    "Exited": None,
+                    "Activity time": record.entry_time,
+                }
+            )
+        closed_rows = []
+        for trade in closed_records:
+            closed_rows.append(
+                {
+                    "Stock Name": trade.symbol,
+                    "Current Position": "CLOSED",
+                    "Entry Price": trade.entry_price,
+                    "Exit Price": trade.exit_price,
+                    "LTP": None,
+                    "P&L": trade.pnl,
+                    "P&L %": _pnl_pct(trade.pnl, trade.entry_price, trade.quantity),
+                    "SL Current Price": None,
+                    "Used Strategy Name": trade.strategy_name or "-",
+                    "Entered": trade.entry_time,
+                    "Exited": trade.exit_time,
+                    "Activity time": trade.exit_time,
+                }
+            )
+
+        realized_pnl = sum(trade.pnl for trade in closed_records)
+        unrealized_pnl = sum(row["P&L"] for row in open_rows)
+        total_invested = sum(record.entry_price * record.quantity for record in open_records) + sum(
+            trade.entry_price * trade.quantity for trade in closed_records
+        )
+        total_pnl = realized_pnl + unrealized_pnl
+        total_pnl_pct = (total_pnl / total_invested * 100) if total_invested else 0.0
+
+        summary_columns = st.columns(4)
+        # The delta arg on st.metric renders as an extra pill line below the value, which would
+        # make only this one card taller than the other three -- folding the % into the value
+        # string instead keeps all four cards the same single-line height.
+        summary_columns[0].metric("Total P&L", f"₹{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)")
+        summary_columns[1].metric("Realized P&L", f"₹{realized_pnl:,.2f}")
+        summary_columns[2].metric("Unrealized P&L", f"₹{unrealized_pnl:,.2f}")
+        summary_columns[3].metric("Positions", f"{len(open_records)} open · {len(closed_records)} closed")
+
+        show_label_column, show_radio_column = st.columns([1, 11], vertical_alignment="center")
+        show_label_column.markdown("**Show**")
+        status_filter = show_radio_column.radio(
+            "Show",
+            ["All", "Open", "Closed"],
+            horizontal=True,
+            key="pnl_statement_filter",
+            label_visibility="collapsed",
+        )
 
         rows = []
         if status_filter in ("All", "Open"):
-            for record in open_records:
-                key = record.symbol if ":" in record.symbol else f"NSE:{record.symbol}"
-                quote = quotes.get(key) or {}
-                ltp = float(quote.get("last_price", 0) or 0) or record.entry_price
-                direction = 1 if record.side == "BUY" else -1
-                pnl = (ltp - record.entry_price) * record.quantity * direction
-                rows.append(
-                    {
-                        "Stock Name": record.symbol,
-                        "Current Position": "OPEN",
-                        "Entry Price": record.entry_price,
-                        "Exit Price": None,
-                        "LTP": ltp,
-                        "P&L": pnl,
-                        "SL Current Price": record.stop_loss,
-                        "Used Strategy Name": record.strategy_name or "-",
-                        "Activity time": record.entry_time,
-                    }
-                )
+            rows.extend(open_rows)
         if status_filter in ("All", "Closed"):
-            for trade in closed_records:
-                rows.append(
-                    {
-                        "Stock Name": trade.symbol,
-                        "Current Position": "CLOSED",
-                        "Entry Price": trade.entry_price,
-                        "Exit Price": trade.exit_price,
-                        "LTP": None,
-                        "P&L": trade.pnl,
-                        "SL Current Price": None,
-                        "Used Strategy Name": trade.strategy_name or "-",
-                        "Activity time": trade.exit_time,
-                    }
-                )
+            rows.extend(closed_rows)
 
         if not rows:
             st.markdown('<div class="empty">No trades match this filter.</div>', unsafe_allow_html=True)
@@ -1656,14 +1724,11 @@ def render_pnl_statement(st, settings) -> None:
                 "Exit Price": st.column_config.NumberColumn(format="₹%.2f"),
                 "LTP": st.column_config.NumberColumn(format="₹%.2f"),
                 "P&L": st.column_config.NumberColumn(format="₹%.2f"),
+                "P&L %": st.column_config.NumberColumn(format="%.2f%%"),
                 "SL Current Price": st.column_config.NumberColumn(format="₹%.2f"),
+                "Entered": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
+                "Exited": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
             },
-        )
-        realized_pnl = sum(trade.pnl for trade in closed_records)
-        unrealized_pnl = sum(row["P&L"] for row in rows if row["Current Position"] == "OPEN")
-        st.caption(
-            f"{len(open_records)} open · {len(closed_records)} closed · "
-            f"Realized P&L ₹{realized_pnl:,.2f} · Unrealized P&L ₹{unrealized_pnl:,.2f}"
         )
 
     render_pnl_statement_content()
@@ -3130,14 +3195,28 @@ def render_swing_auto_trading(st, settings) -> None:
             swing_engine_state = "stopped"
         elif swing_last_error:
             swing_engine_state = "error"
+        elif already_scanned_today:
+            # Today's daily candle is fixed once formed, so the auto scan already ran and
+            # submitted anything qualifying for today -- there is nothing left for it to do
+            # until tomorrow's candle closes. Keep showing "armed / LIVE" here would read as
+            # if a scan were still in progress or about to happen again today, which is the
+            # same confusion intraday avoids by dropping out of "armed" the moment its cycle
+            # halts on a filled position or a risk-limit hit instead of staying "LIVE" forever.
+            swing_engine_state = "scanned_today"
         else:
             swing_engine_state = "running"
         state_copy = {
             "running": (
                 "Swing scanner armed",
                 f"{selected_strategy_label} · monitoring {len(selected_symbols)} stocks · "
-                f"{'scanned today already' if already_scanned_today else 'scans once when this page is next opened today'} · "
+                "scans once when this page is next opened today · "
                 f"{open_swing_positions}/{int(max_open_swing_positions)} positions open · last scan {last_scan_label}",
+            ),
+            "scanned_today": (
+                "Swing scan complete for today",
+                f"{selected_strategy_label} · today's daily scan already ran at {last_scan_label} · "
+                f"{open_swing_positions}/{int(max_open_swing_positions)} positions open · "
+                "next scan when tomorrow's candle closes (use Scan to force a rescan now)",
             ),
             "stopped": (
                 "Swing scanner stopped",
@@ -3151,13 +3230,14 @@ def render_swing_auto_trading(st, settings) -> None:
         }[swing_engine_state]
         swing_badge = {
             "running": "LIVE",
+            "scanned_today": "DONE FOR TODAY",
             "stopped": "STOPPED",
             "limit_reached": "LIMIT REACHED",
             "error": "NEEDS ATTENTION",
         }[swing_engine_state]
         render_scan_activity_banner(
             st,
-            "stalled" if swing_engine_state in {"limit_reached", "stopped"} else swing_engine_state,
+            "stalled" if swing_engine_state in {"limit_reached", "stopped", "scanned_today"} else swing_engine_state,
             *state_copy,
             badge=swing_badge,
         )
@@ -4112,6 +4192,41 @@ def render_automatic_trading(st, settings) -> None:
             log_box.code("\n".join(live_log[-300:]), language=None)
 
         try:
+            # Check the position cap first, before any regime lookup, progress bar, or scan
+            # log gets created -- if the cap is already hit, no entry could ever be accepted
+            # this cycle regardless of what the scan finds, so scanning 600+ stocks (and the
+            # API calls that costs) is pure waste. Halting here also means only the top status
+            # banner (driven by automatic_last_error) reports the halt, instead of the same
+            # message repeating across the log box, a stuck 0%-complete progress bar, and a
+            # separate error box. automatic_last_error isn't sticky -- it's reset at the top of
+            # every cycle, so the very next scheduled run re-checks automatically and clears
+            # itself the moment a position closes or the limit is raised, with no manual
+            # restart needed.
+            pipeline = get_dashboard_pipeline(st, settings, access_token, token_to_symbol, strategy) if execute_entries else None
+            if pipeline is not None and pipeline.managed_positions:
+                # The Intraday page no longer shows a live position table (removed on request),
+                # but this pipeline's own in-memory managed_positions is still what the position
+                # count and capital-deployment limits below are checked against. Without this
+                # sync, a position closed at the broker (SL-M fill) keeps counting as "open"
+                # here even though the standalone trailing-stop agent already reconciled it out
+                # of the database -- silently blocking new entries with "maximum open positions
+                # reached" even when real headroom exists. See the Live monitor page for the
+                # authoritative, always-reconciled position list.
+                try:
+                    pipeline.sync_broker_positions()
+                except Exception:
+                    logger.exception("Silent broker position sync failed before the automatic scan; position/capital limits may use stale counts this cycle")
+            if execute_entries and pipeline is not None:
+                open_position_count = len(pipeline.managed_positions)
+                if open_position_count >= settings.max_open_positions:
+                    message = (
+                        f"maximum open positions already reached ({open_position_count}/{settings.max_open_positions}); "
+                        "scan halted for this cycle -- close a position or raise the limit on the Risk & settings page"
+                    )
+                    st.session_state.automatic_last_error = message
+                    record_automatic_cycle(f"{datetime.now().strftime('%I:%M:%S %p')} — scan halted: {message}")
+                    return
+
             if uses_market_filters or uses_market_confirmation:
                 status_caption.caption("Loading NIFTY 50 market regime...")
                 regime = load_live_nifty_regime(client.client)
@@ -4137,20 +4252,6 @@ def render_automatic_trading(st, settings) -> None:
             progress_bar = st.progress(0.0, text=f"Scanning {selected_strategy}: 0/{total_symbols} complete")
 
             scanner = StrategySignalScanner(buy_limit=5, sell_limit=5, minimum_score=int(getattr(strategy, "minimum_score", 80)))
-            pipeline = get_dashboard_pipeline(st, settings, access_token, token_to_symbol, strategy) if execute_entries else None
-            if pipeline is not None and pipeline.managed_positions:
-                # The Intraday page no longer shows a live position table (removed on request),
-                # but this pipeline's own in-memory managed_positions is still what the position
-                # count and capital-deployment limits below are checked against. Without this
-                # sync, a position closed at the broker (SL-M fill) keeps counting as "open"
-                # here even though the standalone trailing-stop agent already reconciled it out
-                # of the database -- silently blocking new entries with "maximum open positions
-                # reached" even when real headroom exists. See the Live monitor page for the
-                # authoritative, always-reconciled position list.
-                try:
-                    pipeline.sync_broker_positions()
-                except Exception:
-                    logger.exception("Silent broker position sync failed before the automatic scan; position/capital limits may use stale counts this cycle")
             entry_window_open = settings.entry_start <= datetime.now().time() <= settings.entry_end
             if execute_entries and not entry_window_open:
                 log_line("Entry window is closed -- signals will be scanned but not submitted this cycle.")
@@ -4363,7 +4464,17 @@ def render_automatic_trading(st, settings) -> None:
     @st.fragment(run_every="300s")
     def automatic_scheduler_fragment():
         if st.session_state.get("automatic_enabled", False):
+            # render_automatic_status() above is a *separate* fragment on its own independent
+            # 300s timer -- it has no way to know this cycle just changed automatic_last_error
+            # (e.g. a halt because the position cap is already reached) until its own timer next
+            # fires, which can lag this one by minutes. That's exactly how the top banner could
+            # keep showing "Auto trade armed / LIVE" while this fragment's own halted-scan
+            # message sits right below it, contradicting it. Forcing a full rerun the moment the
+            # error state actually changes keeps them in sync without rerunning on every tick.
+            error_before = st.session_state.get("automatic_last_error")
             run_automatic_cycle(True)
+            if st.session_state.get("automatic_last_error") != error_before:
+                st.rerun()
         else:
             st.caption("Scheduler is idle until auto trade is started.")
 
@@ -4605,7 +4716,7 @@ def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, ac
 
 
 def main() -> None:
-    st.set_page_config(page_title="ART Trading", page_icon=":material/candlestick_chart:", layout="wide")
+    st.set_page_config(page_title="Garuda Trading", page_icon=":material/candlestick_chart:", layout="wide")
     inject_styles(st)
     base_settings = get_settings()
     settings = get_frontend_settings(st, base_settings)
@@ -4638,7 +4749,7 @@ def main() -> None:
                 st.rerun()
         if not compact:
             with title_column:
-                st.markdown('<div class="sidebar-brand-title">ART Trading Solutions</div>', unsafe_allow_html=True)
+                st.markdown('<div class="sidebar-brand-title">Garuda Trading</div>', unsafe_allow_html=True)
         page = st.radio(
             "Workspace",
             pages,

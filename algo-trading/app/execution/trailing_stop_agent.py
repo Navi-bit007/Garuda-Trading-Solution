@@ -90,7 +90,14 @@ class TrailingStopAgent:
         self._stop_event = Event()
         self._thread: Thread | None = None
         self.user_id = str(getattr(settings, "user_id", "default"))
-        self._broker_error = ""
+        # Tracked separately, not as one shared flag: intraday reconciliation runs every cycle
+        # (DEFAULT_POLL_SECONDS) so it can safely reset its own error each time it re-checks, but
+        # swing reconciliation only gets a chance to re-check every swing_recompute_seconds -- a
+        # single shared flag reset every cycle would make a genuine, still-unresolved swing
+        # problem (like a position sitting unprotected) disappear from the heartbeat within
+        # seconds, long before the next swing check could confirm whether it's actually fixed.
+        self._intraday_broker_error = ""
+        self._swing_broker_error = ""
         self.shutdown_time = getattr(settings, "agent_shutdown_time", time_of_day(15, 40))
         self.shut_down_for_the_day = False
 
@@ -145,7 +152,6 @@ class TrailingStopAgent:
                 logger.exception("Failed to clear the heartbeat on end-of-day shutdown")
             return
         last_error = ""
-        self._broker_error = ""
         try:
             self._refresh_broker_session()
             self.load_positions()
@@ -165,7 +171,8 @@ class TrailingStopAgent:
             # failing. Surface it on the heartbeat too so a stale/expired session is visible on
             # the dashboard instead of looking identical to a healthy agent.
             try:
-                self.repository.save_agent_heartbeat(AgentHeartbeat("trailing_stop_agent", timestamp, last_error or self._broker_error, timestamp))
+                combined_error = last_error or self._intraday_broker_error or self._swing_broker_error
+                self.repository.save_agent_heartbeat(AgentHeartbeat("trailing_stop_agent", timestamp, combined_error, timestamp))
             except Exception:
                 logger.exception("Failed to record trailing-stop agent heartbeat")
 
@@ -208,14 +215,11 @@ class TrailingStopAgent:
         for symbol, record in records.items():
             existing = self.positions.get(symbol)
             if existing is not None:
+                record, instrument_token = self._ensure_instrument_token(symbol, record)
                 existing.record = record
+                existing.instrument_token = instrument_token
                 continue
-            instrument_token = record.instrument_token
-            if instrument_token is None:
-                instrument_token = self._resolve_instrument_token(symbol)
-                if instrument_token is not None:
-                    record = replace(record, instrument_token=instrument_token)
-                    self.repository.save_position(record)
+            record, instrument_token = self._ensure_instrument_token(symbol, record)
             atr_multiplier = record.atr_multiplier or float(getattr(self.settings, "trailing_atr_multiplier", 1.5))
             trailing_stop = TrailingStop(record.entry_price, record.stop_loss, atr_multiplier, record.side)
             self.positions[symbol] = AgentPosition(
@@ -224,6 +228,24 @@ class TrailingStopAgent:
                 trailing_stop=trailing_stop,
                 last_trailing_candle=record.entry_time,
             )
+
+    def _ensure_instrument_token(self, symbol: str, record: PositionRecord) -> tuple[PositionRecord, int | None]:
+        """Resolve and persist the instrument token if the position doesn't have one yet.
+
+        Called every load_positions() cycle for a still-unresolved position, not just once --
+        the lookup is a live Kite API call (see _resolve_instrument_token) that can fail on a
+        transient network blip (a dropped connection, a momentary timeout). Retrying only on
+        first load meant that one bad moment left a position permanently blind to price/ATR --
+        and therefore stuck with a frozen stop-loss -- for the rest of its lifetime, since
+        nothing ever tried the lookup again.
+        """
+        if record.instrument_token is not None:
+            return record, record.instrument_token
+        instrument_token = self._resolve_instrument_token(symbol)
+        if instrument_token is not None:
+            record = replace(record, instrument_token=instrument_token)
+            self.repository.save_position(record)
+        return record, instrument_token
 
     def _resolve_instrument_token(self, symbol: str) -> int | None:
         if self.broker_client is None or not hasattr(self.broker_client, "instruments"):
@@ -265,11 +287,15 @@ class TrailingStopAgent:
         positions = [position for position in self.positions.values() if position.record.position_type == "INTRADAY"]
         if not positions:
             return
+        # Reset right before actually attempting this cycle's intraday broker calls, not
+        # unconditionally at the top of run_once -- this method runs every poll_seconds, so a
+        # persisting problem re-sets itself immediately below if it's still there.
+        self._intraday_broker_error = ""
         try:
             self._reconcile_intraday_positions(positions, timestamp)
         except Exception as error:
             logger.exception("Intraday broker reconciliation failed")
-            self._broker_error = f"intraday reconciliation failed: {error}"
+            self._intraday_broker_error = f"intraday reconciliation failed: {error}"
         positions = [position for position in self.positions.values() if position.record.position_type == "INTRADAY"]
         if not positions:
             return
@@ -278,7 +304,7 @@ class TrailingStopAgent:
             quotes = self.market_data.ltp(keys)
         except Exception as error:
             logger.exception("LTP fetch failed for intraday positions")
-            self._broker_error = f"LTP fetch failed: {error}"
+            self._intraday_broker_error = f"LTP fetch failed: {error}"
             return
         for position, key in zip(positions, keys):
             quote = quotes.get(key)
@@ -290,6 +316,7 @@ class TrailingStopAgent:
                 continue
             if price <= 0:
                 continue
+            self._check_target_1(position, price)
             atr_value = self._resolve_atr(position, timestamp)
             if atr_value <= 0:
                 continue
@@ -299,6 +326,27 @@ class TrailingStopAgent:
                 candidate = max(candidate, entry_price) if position.record.side == "BUY" else min(candidate, entry_price)
                 position.trailing_stop.stop = candidate
             self._maybe_apply(position, candidate, price)
+
+    def _check_target_1(self, position: AgentPosition, price: float) -> None:
+        """Flip target_1_hit the moment live price reaches the strategy's target-1 level.
+
+        Nothing else does this for a position this agent manages: TradingPipeline.monitor_ticks()
+        is the only other code that ever sets this flag, and it only runs while the separate
+        "Intraday desk" dashboard page happens to be open in an active session. Without this
+        check, target_1_hit -- and the breakeven floor a few lines below that depends on it --
+        would sit permanently False for every LIVE position, no matter how far price ran.
+        """
+        record = position.record
+        if record.target_1_hit or record.target_1 is None:
+            return
+        reached = price >= record.target_1 if record.side == "BUY" else price <= record.target_1
+        if not reached:
+            return
+        updated = replace(record, target_1_hit=True)
+        self.repository.save_position(updated)
+        position.record = updated
+        logger.info("%s reached target 1 (%.2f); stop now floors at breakeven", record.symbol, record.target_1)
+        self.notifier.send(f"{record.symbol} reached target 1 (₹{record.target_1:.2f}) -- stop now floors at breakeven")
 
     def _reconcile_intraday_positions(self, positions: list[AgentPosition], timestamp: datetime) -> None:
         """Detect an intraday position that closed at the broker -- a protective SL-M fill, a
@@ -320,7 +368,7 @@ class TrailingStopAgent:
             broker_positions = self.broker_client.positions().get("net", [])
         except Exception as error:
             logger.exception("Broker position lookup failed during intraday reconciliation")
-            self._broker_error = f"broker position lookup failed: {error}"
+            self._intraday_broker_error = f"broker position lookup failed: {error}"
             return
         broker_by_tradingsymbol = {str(entry.get("tradingsymbol", "")).strip().upper(): entry for entry in broker_positions}
         for position in positions:
@@ -429,17 +477,23 @@ class TrailingStopAgent:
     def _process_swing(self, timestamp: datetime) -> None:
         if not any(position.record.position_type == "SWING" for position in self.positions.values()):
             return
+        # Reset right before actually attempting this cycle's swing broker calls -- this method
+        # only runs once every swing_recompute_seconds (unlike intraday's every-poll cadence), so
+        # a genuine, still-unresolved problem (e.g. a position sitting unprotected) must persist
+        # on the heartbeat across the many intraday-only cycles in between, not just the single
+        # cycle it was first detected on.
+        self._swing_broker_error = ""
         try:
             self._reconcile_swing_positions(timestamp)
         except Exception as error:
             logger.exception("Swing broker reconciliation failed")
-            self._broker_error = f"swing reconciliation failed: {error}"
+            self._swing_broker_error = f"swing reconciliation failed: {error}"
         for position in [p for p in self.positions.values() if p.record.position_type == "SWING"]:
             try:
                 self._process_swing_position(position, timestamp)
             except Exception as error:
                 logger.exception("Swing trailing update failed for %s", position.record.symbol)
-                self._broker_error = f"swing trailing update failed for {position.record.symbol}: {error}"
+                self._swing_broker_error = f"swing trailing update failed for {position.record.symbol}: {error}"
 
     def _reconcile_swing_positions(self, timestamp: datetime) -> None:
         """Detect an exchange-expired overnight SL-M and re-place it, and drop positions the
@@ -455,35 +509,81 @@ class TrailingStopAgent:
             broker_positions = self.broker_client.positions().get("net", [])
         except Exception as error:
             logger.exception("Broker position lookup failed during swing reconciliation")
-            self._broker_error = f"broker position lookup failed: {error}"
+            self._swing_broker_error = f"broker position lookup failed: {error}"
             return
         broker_by_tradingsymbol = {str(entry.get("tradingsymbol")): entry for entry in broker_positions if int(entry.get("quantity", 0) or 0) != 0}
+        held_tradingsymbols = self._broker_held_tradingsymbols()
         for position in positions:
             record = position.record
-            broker_position = broker_by_tradingsymbol.get(self._tradingsymbol(record.symbol))
-            if broker_position is None:
-                exit_price = self._broker_exit_fill_price(record)
-                self.repository.save_trade(
-                    TradeRecord(
-                        symbol=record.symbol,
-                        entry_time=record.entry_time,
-                        exit_time=datetime.now(),
-                        entry_price=record.entry_price,
-                        exit_price=exit_price,
-                        quantity=record.quantity,
-                        pnl=(exit_price - record.entry_price) * record.quantity,
-                        side=record.side,
-                        position_type="SWING",
-                        strategy_name=record.strategy_name,
-                        exit_reason="broker-side position closed (protective stop or manual exit)",
-                    )
-                )
-                self.repository.delete_position(record.symbol)
-                self.positions.pop(record.symbol, None)
+            tradingsymbol = self._tradingsymbol(record.symbol)
+            broker_position = broker_by_tradingsymbol.get(tradingsymbol)
+            if broker_position is not None:
+                self._reconcile_entry_price(position, broker_position)
+                if self._protective_stop_needs_rearm(record.protective_order_id):
+                    self._rearm_protective_stop(position)
                 continue
-            self._reconcile_entry_price(position, broker_position)
-            if self._protective_stop_needs_rearm(record.protective_order_id):
-                self._rearm_protective_stop(position)
+            if held_tradingsymbols is None:
+                # The holdings() lookup itself failed this cycle -- there's no reliable way to
+                # tell "genuinely closed" from "settled into a holding" right now, so skip this
+                # position (including its re-arm check) rather than risk closing one that's still
+                # owned. Retried next cycle.
+                continue
+            if tradingsymbol in held_tradingsymbols:
+                # A CNC buy drops out of positions() once it settles into a holding (commonly the
+                # next trading day or two) even though it's still fully owned -- kite.holdings()
+                # is what actually reflects that. It doesn't carry a comparable average_price to
+                # reconcile against, but the daily re-arm check doesn't depend on `broker_position`
+                # at all (it only reads order_history via the stored protective_order_id and a
+                # fresh LTP quote) -- and this is exactly the case (a position a day or more past
+                # entry) the re-arm check exists for, so it must still run here.
+                if self._protective_stop_needs_rearm(record.protective_order_id):
+                    self._rearm_protective_stop(position)
+                continue
+            exit_price = self._broker_exit_fill_price(record)
+            self.repository.save_trade(
+                TradeRecord(
+                    symbol=record.symbol,
+                    entry_time=record.entry_time,
+                    exit_time=datetime.now(),
+                    entry_price=record.entry_price,
+                    exit_price=exit_price,
+                    quantity=record.quantity,
+                    pnl=(exit_price - record.entry_price) * record.quantity,
+                    side=record.side,
+                    position_type="SWING",
+                    strategy_name=record.strategy_name,
+                    exit_reason="broker-side position closed (protective stop or manual exit)",
+                )
+            )
+            self.repository.delete_position(record.symbol)
+            self.positions.pop(record.symbol, None)
+
+    def _broker_held_tradingsymbols(self) -> set[str] | None:
+        """Tradingsymbols Zerodha's kite.holdings() still shows as genuinely owned.
+
+        positions() only reflects the current day's activity -- a CNC buy drops out of it once
+        it settles into a holding (commonly T+1 or T+2), even though nothing was ever sold. Using
+        positions() alone to decide "did this close?" would eventually flag every swing position
+        as closed a few days after entry, purely from settlement. Returns None (rather than an
+        empty set) when the lookup itself fails, so callers can tell "confirmed not held" apart
+        from "couldn't check this cycle" and avoid treating a lookup failure as a closed position.
+        """
+        if self.broker_client is None or not hasattr(self.broker_client, "holdings"):
+            return set()
+        try:
+            holdings = self.broker_client.holdings()
+        except Exception:
+            logger.exception("Broker holdings lookup failed during swing reconciliation")
+            return None
+        held: set[str] = set()
+        for entry in holdings:
+            try:
+                total_quantity = int(entry.get("quantity", 0) or 0) + int(entry.get("t1_quantity", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if total_quantity > 0:
+                held.add(str(entry.get("tradingsymbol", "")).strip().upper())
+        return held
 
     def _broker_exit_fill_price(self, record: PositionRecord) -> float:
         order_id = record.protective_order_id
@@ -503,19 +603,35 @@ class TrailingStopAgent:
         return record.stop_loss
 
     def _protective_stop_needs_rearm(self, order_id: str | None) -> bool:
+        """True if the protective stop needs a fresh order placed today.
+
+        Deliberately checks today's order book (orders()) rather than order_history(order_id):
+        Kite's order_history endpoint reliably answers for an order from earlier today, but for
+        one placed on a previous day it can raise "Couldn't find that order_id" instead of
+        returning its terminal status -- confirmed live against a real multi-day swing position,
+        whose stop had silently gone unprotected for days because that failure was being read as
+        "no re-arm needed". Kite's regular order book (and a "regular" SL-M's day-order lifetime)
+        are both scoped to the current trading day, so checking membership there is the reliable
+        signal regardless of how old the order id is.
+        """
         if not order_id:
             return True
-        if self.broker_client is None or not hasattr(self.broker_client, "order_history"):
+        if self.broker_client is None or not hasattr(self.broker_client, "orders"):
             return False
         try:
-            history = self.broker_client.order_history(order_id)
+            todays_orders = self.broker_client.orders()
         except Exception:
-            logger.exception("order_history lookup failed for %s", order_id)
+            logger.exception("Order book lookup failed while checking whether %s needs re-arming", order_id)
             return False
-        if not history:
-            return True
-        status = str(history[-1].get("status", "")).strip().upper()
-        return status in TERMINAL_INACTIVE_ORDER_STATUSES
+        for order in todays_orders:
+            if str(order.get("order_id")) == str(order_id):
+                status = str(order.get("status", "")).strip().upper()
+                return status in TERMINAL_INACTIVE_ORDER_STATUSES
+        # Not present in today's order book at all -- true both for an order the exchange
+        # cancelled today and for one placed on any previous day (the normal case for a
+        # multi-day swing holding), since a "regular" SL-M is a day order either way and this
+        # position needs a freshly placed one today regardless of why yesterday's is gone.
+        return True
 
     def _rearm_protective_stop(self, position: AgentPosition) -> None:
         record = position.record
@@ -534,6 +650,10 @@ class TrailingStopAgent:
         except Exception as error:
             logger.error("Failed to re-arm protective stop for %s: %s", record.symbol, error)
             self.notifier.send(f"critical_unprotected: could not re-arm overnight-expired stop for {record.symbol}: {error}")
+            # A silently swallowed failure here means a position sits genuinely unprotected while
+            # the dashboard keeps showing a healthy green "RUNNING" banner -- this needs to surface
+            # as clearly as any other broker-call failure, not less, since the consequence is worse.
+            self._swing_broker_error = f"could not re-arm the protective stop for {record.symbol}: {error}"
             return
         updated = replace(record, protective_order_id=new_order_id)
         self.repository.save_position(updated)
@@ -585,7 +705,18 @@ class TrailingStopAgent:
         exit_side = Side.SELL if record.side == "BUY" else Side.BUY
         product = "CNC" if record.position_type == "SWING" else "MIS"
         request = OrderRequest(record.symbol, exit_side, record.quantity, reference_price, candidate_stop, product, self._exchange(record.symbol))
-        if not self._modify_with_retry(record.protective_order_id or "", request):
+        error_message = self._modify_with_retry(record.protective_order_id or "", request)
+        if error_message:
+            # Previously swallowed entirely (only logged to a file + a Telegram notifier
+            # message no one necessarily has configured) -- so the dashboard's own "Trailing-stop
+            # agent" banner kept reading as a healthy green RUNNING state while a position's stop
+            # was silently stuck. Routing it into the same _intraday_broker_error/_swing_broker_error
+            # fields the heartbeat already reports surfaces it there instead, with no new UI needed.
+            friendly = f"Could not update the broker-side stop for {record.symbol}: {error_message}"
+            if record.position_type == "SWING":
+                self._swing_broker_error = friendly
+            else:
+                self._intraday_broker_error = friendly
             return
         self.repository.update_stop_price(record.symbol, candidate_stop)
         previous_stop = record.stop_loss
@@ -608,16 +739,17 @@ class TrailingStopAgent:
         )
         self.notifier.send(f"Trailing stop moved: {record.symbol} -> {candidate_stop:.2f}")
 
-    def _modify_with_retry(self, order_id: str, request: OrderRequest) -> bool:
+    def _modify_with_retry(self, order_id: str, request: OrderRequest) -> str:
+        """Returns an empty string on success, otherwise a human-readable failure reason."""
         attempts = self.modify_retry_attempts
         if not order_id:
             logger.error("No protective order id on file for %s; cannot trail stop", request.symbol)
-            return False
+            return "no protective stop order is on file for this position"
         last_error: Exception | None = None
         for attempt in range(attempts):
             try:
                 self.orders.modify_protective_stop(order_id, request)
-                return True
+                return ""
             except Exception as error:
                 last_error = error
                 logger.warning("modify_protective_stop failed for %s (attempt %s/%s): %s", request.symbol, attempt + 1, attempts, error)
@@ -625,4 +757,4 @@ class TrailingStopAgent:
                     sleep(min(self.modify_retry_backoff_seconds * (2**attempt), 5))
         logger.error("modify_protective_stop permanently failed for %s: %s", request.symbol, last_error)
         self.notifier.send(f"critical_unprotected: could not trail stop for {request.symbol}: {last_error}")
-        return False
+        return str(last_error) or "unknown error"

@@ -55,7 +55,8 @@ class Database:
             entry_price REAL,
             stop_loss REAL,
             pnl REAL,
-            reason TEXT NOT NULL DEFAULT ''
+            reason TEXT NOT NULL DEFAULT '',
+            previous_stop REAL
         );
         CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,6 +202,26 @@ class Database:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS decision_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            strategy_name TEXT NOT NULL DEFAULT '',
+            mode TEXT NOT NULL DEFAULT 'LIVE',
+            decision TEXT NOT NULL DEFAULT '',
+            rationale TEXT NOT NULL DEFAULT '',
+            inputs TEXT NOT NULL DEFAULT '{}',
+            outputs TEXT NOT NULL DEFAULT '{}',
+            confidence REAL,
+            correlation_id TEXT NOT NULL DEFAULT '',
+            outcome TEXT,
+            source_table TEXT NOT NULL DEFAULT '',
+            source_id TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS ix_decision_log_symbol_timestamp ON decision_log(symbol, timestamp);
+        CREATE INDEX IF NOT EXISTS ix_decision_log_correlation ON decision_log(correlation_id);
+        CREATE INDEX IF NOT EXISTS ix_decision_log_event_type ON decision_log(event_type);
         CREATE TABLE IF NOT EXISTS dashboard_settings (
             user_id TEXT PRIMARY KEY,
             settings TEXT NOT NULL,
@@ -220,6 +241,7 @@ class Database:
             self._migrate_positions()
             self._migrate_trades()
             self._migrate_agent_heartbeat()
+            self._migrate_activity()
             self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_user_signal ON signals(user_id, signal_id)")
             self.connection.execute("CREATE INDEX IF NOT EXISTS ix_pre_spike_events_lookup ON pre_spike_events(user_id, strategy, symbol, timeframe, trading_date, latest_time)")
             self.connection.commit()
@@ -267,6 +289,11 @@ class Database:
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(agent_heartbeat)").fetchall()}
         if "pid" not in columns:
             self.connection.execute("ALTER TABLE agent_heartbeat ADD COLUMN pid INTEGER")
+
+    def _migrate_activity(self) -> None:
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(activity)").fetchall()}
+        if "previous_stop" not in columns:
+            self.connection.execute("ALTER TABLE activity ADD COLUMN previous_stop REAL")
 
     def _migrate_trades(self) -> None:
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(trades)").fetchall()}

@@ -7,7 +7,7 @@ from app.broker.market_data import MarketData
 from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import Side, TradingMode
 from app.database.database import Database
-from app.database.models import PositionRecord
+from app.database.models import DecisionLogRecord, PositionRecord
 from app.database.repository import Repository
 from app.execution.trailing_stop_agent import TrailingStopAgent
 from app.monitoring.notifications import Notifier
@@ -176,6 +176,100 @@ def test_intraday_trailing_stop_move_is_logged_to_activity(tmp_path):
     assert tuple(activity_row)[:2] == ("stop_trailed", "NSE:AAA")
     assert activity_row["price"] == saved.stop_loss
     assert activity_row["stop_loss"] == saved.stop_loss
+    database.close()
+
+
+def test_intraday_trailing_stop_move_is_recorded_to_the_unified_decision_log(tmp_path):
+    """The decision log is the LLM-facing layer: every stop trail must land there with the
+    exact calculation as its rationale, not just the "from X to Y" activity row, so a future
+    training/forecasting pass can see *why* the stop moved, not just that it moved."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    entry_time = datetime(2026, 1, 1, 9, 20)
+    repository.save_position(
+        PositionRecord(
+            symbol="NSE:AAA",
+            side="BUY",
+            quantity=10,
+            entry_price=100.0,
+            stop_loss=90.0,
+            entry_time=entry_time,
+            protective_order_id="PAPER-STOP-000001",
+            instrument_token=111,
+            position_type="INTRADAY",
+            atr_multiplier=1.5,
+            strategy_name="PRE_SPIKE_MOMENTUM",
+            trading_mode="LIVE",
+        )
+    )
+    agent = build_agent(repository, client)
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "MIS", "NSE")
+    client.ltp_response = {"NSE:AAA": {"last_price": 110.0}}
+    client.historical_rows[(111, "15minute")] = intraday_candles()
+
+    agent.run_once(now=entry_time + timedelta(minutes=5))
+
+    [saved] = repository.load_positions()
+    [decision] = repository.load_decisions(symbol="NSE:AAA", event_type="stop_trailed")
+    assert decision.strategy_name == "PRE_SPIKE_MOMENTUM"
+    assert decision.decision == "TRAIL_STOP"
+    assert "ATR14" in decision.rationale
+    assert decision.outputs["new_stop"] == saved.stop_loss
+    assert decision.correlation_id == f"NSE:AAA:{entry_time.isoformat()}"
+    assert decision.outcome is None
+    database.close()
+
+
+def test_force_exit_closes_intraday_position_and_cancels_stop(tmp_path):
+    """Zerodha charges an auto square-off penalty for any MIS position still open past its own
+    RMS cutoff -- once the configured force-exit time (Risk & settings) passes, an intraday
+    position must be market-closed and its SL-M cancelled by the standalone agent itself,
+    since it's the only process guaranteed to be running all day (the tick-driven pipeline's
+    own force-exit only fires while a dashboard session happens to be open and streaming)."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    entry_time = datetime(2026, 1, 1, 9, 20)
+    repository.save_position(
+        PositionRecord(
+            symbol="NSE:AAA",
+            side="BUY",
+            quantity=10,
+            entry_price=100.0,
+            stop_loss=90.0,
+            entry_time=entry_time,
+            protective_order_id="PAPER-STOP-000001",
+            instrument_token=111,
+            position_type="INTRADAY",
+            atr_multiplier=1.5,
+            strategy_name="PRE_SPIKE_MOMENTUM",
+            trading_mode="LIVE",
+        )
+    )
+    agent = build_agent(repository, client)
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "MIS", "NSE")
+    client.ltp_response = {"NSE:AAA": {"last_price": 105.0}}
+    client.historical_rows[(111, "15minute")] = intraday_candles()
+
+    agent.run_once(now=datetime(2026, 1, 1, 15, 20))
+
+    assert repository.load_positions() == []
+    assert "NSE:AAA" not in agent.positions
+    assert "PAPER-STOP-000001" not in agent.orders.paper_protective_orders
+
+    [trade] = repository.load_trades()
+    assert trade.exit_reason == "Force close; Auto Square off"
+    assert trade.exit_price == 105.0
+    assert trade.pnl == 50.0
+
+    [activity_row] = database.connection.execute(
+        "SELECT event_kind, reason FROM activity WHERE event_kind = 'force_exit'"
+    ).fetchall()
+    assert tuple(activity_row) == ("force_exit", "Force close; Auto Square off")
+
+    [decision] = repository.load_decisions(symbol="NSE:AAA", event_type="exit")
+    assert decision.decision == "FORCE_CLOSE"
+    assert decision.rationale == "Force close; Auto Square off"
+    assert decision.outcome["pnl"] == 50.0
     database.close()
 
 
@@ -361,6 +455,79 @@ def test_permanent_modify_failure_leaves_db_untouched_and_notifies(tmp_path):
     database.close()
 
 
+def test_modification_limit_hit_replaces_the_stop_with_a_fresh_order(tmp_path):
+    """Zerodha rejects a modify_order() past its per-order cap (25, confirmed live) with
+    "Maximum allowed order modifications exceeded" regardless of how valid the new trigger
+    price is -- there's no way to reset that count on the same order_id, so the agent must
+    cancel the capped order and place a fresh one rather than keep retrying (and leaving the
+    stop stuck at its old price) or reporting a false "agent needs attention" error forever."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    entry_time = datetime(2026, 1, 1, 9, 20)
+    repository.save_position(
+        PositionRecord(
+            symbol="NSE:AAA",
+            side="BUY",
+            quantity=10,
+            entry_price=100.0,
+            stop_loss=90.0,
+            entry_time=entry_time,
+            protective_order_id="PAPER-STOP-000001",
+            instrument_token=111,
+            position_type="INTRADAY",
+            atr_multiplier=1.5,
+            trading_mode="LIVE",
+        )
+    )
+    sent_messages: list[str] = []
+
+    class RecordingNotifier(Notifier):
+        def send(self, message: str) -> None:
+            sent_messages.append(message)
+
+    agent = TrailingStopAgent(
+        object(),
+        repository,
+        OrderAPI(TradingMode.PAPER, client),
+        MarketData(client),
+        broker_client=client,
+        notifier=RecordingNotifier(),
+        atr_refresh_seconds=0,
+        swing_recompute_seconds=0,
+        modify_retry_attempts=3,
+        modify_retry_backoff_seconds=0.01,
+    )
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.0, "MIS", "NSE")
+
+    def failing_modify(order_id, request):
+        raise RuntimeError("Maximum allowed order modifications exceeded.")
+
+    cancelled_order_ids: list[str] = []
+    original_cancel = agent.orders.cancel
+
+    def spying_cancel(order_id):
+        cancelled_order_ids.append(order_id)
+        return original_cancel(order_id)
+
+    agent.orders.modify_protective_stop = failing_modify
+    agent.orders.cancel = spying_cancel
+    client.ltp_response = {"NSE:AAA": {"last_price": 110.0}}
+    client.historical_rows[(111, "15minute")] = intraday_candles()
+
+    agent.run_once(now=entry_time + timedelta(minutes=5))
+
+    [saved] = repository.load_positions()
+    assert saved.stop_loss > 90.0
+    assert cancelled_order_ids == ["PAPER-STOP-000001"]
+    assert saved.protective_order_id in agent.orders.paper_protective_orders
+    assert agent.orders.paper_protective_orders[saved.protective_order_id].stop_loss == saved.stop_loss
+    assert any("modification cap" in message for message in sent_messages)
+    assert not any("critical_unprotected" in message for message in sent_messages)
+    heartbeat = repository.load_agent_heartbeat("trailing_stop_agent")
+    assert not heartbeat.last_error
+    database.close()
+
+
 def test_intraday_position_closed_at_broker_is_dropped_and_logged(tmp_path):
     """The always-on agent must catch an intraday position that closed at the broker (a
     protective SL-M fill, a manual exit at Zerodha, or an entry that was accepted then
@@ -403,6 +570,148 @@ def test_intraday_position_closed_at_broker_is_dropped_and_logged(tmp_path):
         "SELECT event_kind, symbol, price, pnl FROM activity ORDER BY id"
     ).fetchall()
     assert tuple(activity_row) == ("broker_exit_detected", "NSE:AAA", 94.5, -55.0)
+    database.close()
+
+
+def test_broker_exit_finds_real_fill_via_order_book_when_protective_order_never_filled(tmp_path):
+    """Confirmed live incident (NSE:HAPPYFORGE): a position manually closed at Zerodha -- not
+    via the tracked SL-M -- left order_history(protective_order_id) showing no fill at all, so
+    the exit price silently fell back to the stale last-trailed stop price, making the P&L page
+    show a wrong number. Today's order book must be checked for a different completed order on
+    the same symbol before falling back to that estimate."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    entry_time = datetime(2026, 1, 1, 9, 20)
+    repository.save_position(
+        PositionRecord(
+            symbol="NSE:AAA",
+            side="BUY",
+            quantity=10,
+            entry_price=100.0,
+            stop_loss=95.0,
+            entry_time=entry_time,
+            protective_order_id="PAPER-STOP-000001",
+            instrument_token=111,
+            position_type="INTRADAY",
+            atr_multiplier=1.5,
+            trading_mode="LIVE",
+        )
+    )
+    agent = build_agent(repository, client)
+    client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "OPEN", "average_price": 0}]
+    client.todays_orders = [
+        {
+            "order_id": "MANUAL-000999",
+            "tradingsymbol": "AAA",
+            "transaction_type": "SELL",
+            "status": "COMPLETE",
+            "average_price": 105.0,
+            "order_timestamp": "2026-01-01 09:25:00",
+        }
+    ]
+    client.broker_holdings = []  # flattened -- closed at the broker
+    client.historical_rows[(111, "15minute")] = intraday_candles()
+
+    agent.run_once(now=entry_time + timedelta(minutes=5))
+
+    [trade] = repository.load_trades()
+    assert trade.exit_price == 105.0
+    assert trade.pnl == 50.0
+    assert "manual square-off" in trade.exit_reason
+    database.close()
+
+
+def test_failed_stop_trail_is_logged_to_the_decision_log(tmp_path):
+    """A stop-trail attempt the broker rejects (for a reason other than the modification cap)
+    must still show up in the decision log, not just get folded into the heartbeat's single
+    last_error string -- otherwise a user reviewing a position's history sees no sign it was
+    ever attempted, only that the stop never moved."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    entry_time = datetime(2026, 1, 1, 9, 20)
+    repository.save_position(
+        PositionRecord(
+            symbol="NSE:AAA",
+            side="BUY",
+            quantity=10,
+            entry_price=100.0,
+            stop_loss=90.0,
+            entry_time=entry_time,
+            protective_order_id="PAPER-STOP-000001",
+            instrument_token=111,
+            position_type="INTRADAY",
+            atr_multiplier=1.5,
+            trading_mode="LIVE",
+        )
+    )
+    agent = build_agent(repository, client, modify_retry_backoff_seconds=0.01)
+
+    def failing_modify(order_id, request):
+        raise RuntimeError("Order not open")
+
+    agent.orders.modify_protective_stop = failing_modify
+    client.ltp_response = {"NSE:AAA": {"last_price": 110.0}}
+    client.historical_rows[(111, "15minute")] = intraday_candles()
+
+    agent.run_once(now=entry_time + timedelta(minutes=5))
+
+    [saved] = repository.load_positions()
+    assert saved.stop_loss == 90.0
+
+    [decision] = repository.load_decisions(symbol="NSE:AAA", event_type="stop_trailed")
+    assert decision.decision == "TRAIL_STOP_FAILED"
+    assert "Order not open" in decision.rationale
+    database.close()
+
+
+def test_intraday_exit_logs_decision_and_backfills_outcome_onto_earlier_decisions(tmp_path):
+    """Exit is the moment the real result becomes known -- it must both log its own decision
+    row and backfill `outcome` onto every earlier decision (signal, stop trails) sharing the
+    same correlation_id, so a future LLM pass can see what a stop-trail decision actually led
+    to, not just what it decided in isolation."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    entry_time = datetime(2026, 1, 1, 9, 20)
+    repository.save_position(
+        PositionRecord(
+            symbol="NSE:AAA",
+            side="BUY",
+            quantity=10,
+            entry_price=100.0,
+            stop_loss=95.0,
+            entry_time=entry_time,
+            protective_order_id="PAPER-STOP-000001",
+            instrument_token=111,
+            position_type="INTRADAY",
+            atr_multiplier=1.5,
+            trading_mode="LIVE",
+        )
+    )
+    correlation_id = f"NSE:AAA:{entry_time.isoformat()}"
+    repository.save_decision(
+        DecisionLogRecord(
+            timestamp=entry_time,
+            symbol="NSE:AAA",
+            event_type="stop_trailed",
+            decision="TRAIL_STOP",
+            rationale="earlier trail",
+            correlation_id=correlation_id,
+        )
+    )
+    agent = build_agent(repository, client)
+    client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "COMPLETE", "average_price": 94.5}]
+    client.broker_holdings = []  # the SL-M already filled and flattened the holding
+    client.historical_rows[(111, "15minute")] = intraday_candles()
+
+    agent.run_once(now=entry_time + timedelta(minutes=5))
+
+    [exit_decision] = repository.load_decisions(symbol="NSE:AAA", event_type="exit")
+    assert exit_decision.decision == "EXIT"
+    assert exit_decision.outputs["pnl"] == -55.0
+    assert exit_decision.correlation_id == correlation_id
+
+    [earlier_decision] = repository.load_decisions(symbol="NSE:AAA", event_type="stop_trailed")
+    assert earlier_decision.outcome["pnl"] == -55.0
     database.close()
 
 

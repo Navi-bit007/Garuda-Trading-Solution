@@ -540,7 +540,6 @@ def inject_styles(st) -> None:
         .status { display: inline-flex; align-items: center; gap: 8px; border: 1px solid #9bc9ac; background: var(--mint); color: #1d5434; border-radius: 999px; padding: 5px 10px; font-size: .78rem; font-weight: 700; }
         .status-dot { width: 7px; height: 7px; background: #20844b; border-radius: 50%; }
         .empty { border: 1px dashed #b6c4b7; padding: 22px; border-radius: 7px; color: var(--muted); background: rgba(255,255,255,.38); }
-        .last-refreshed { text-align: right; color: var(--muted); font-size: .78rem; margin-bottom: 6px; }
         .watchlist-card { min-height: 220px; }
         .watchlist-card h3 { margin: 0; font-size: 1.15rem; }
         .watchlist-count { color: var(--muted); font-size: .86rem; margin: 4px 0 14px; }
@@ -1413,10 +1412,6 @@ def render_position_monitor(st, settings, access_token: str) -> None:
 def render_live_monitor(st, settings) -> None:
     @st.fragment(run_every=10)
     def render_live_monitor_content() -> None:
-        st.markdown(
-            f'<div class="last-refreshed">Last refreshed: {pd.Timestamp.now(tz="Asia/Kolkata"):%d %b %Y, %I:%M:%S %p} IST</div>',
-            unsafe_allow_html=True,
-        )
         st.markdown('<div class="eyebrow">Unified position tracker</div>', unsafe_allow_html=True)
         st.title("Live monitor")
         st.caption(
@@ -1461,21 +1456,22 @@ def render_live_monitor(st, settings) -> None:
             return
 
         activity = load_activity()[2]
-        stop_trail_events = pd.DataFrame(columns=["timestamp", "symbol", "reason", "stop_loss"])
+        stop_trail_events = pd.DataFrame(columns=["timestamp", "symbol", "reason", "stop_loss", "previous_stop"])
         if not activity.empty:
-            stop_trail_events = activity.loc[activity["event_kind"] == "stop_trailed", ["timestamp", "symbol", "reason", "stop_loss"]].copy()
+            stop_trail_events = activity.loc[
+                activity["event_kind"] == "stop_trailed", ["timestamp", "symbol", "reason", "stop_loss", "previous_stop"]
+            ].copy()
             stop_trail_events["timestamp"] = pd.to_datetime(stop_trail_events["timestamp"], errors="coerce")
         stop_trail_counts = stop_trail_events["symbol"].value_counts().to_dict() if not stop_trail_events.empty else {}
         # st.dataframe has no per-cell hover tooltip -- column_config "help" is one static string
         # for the whole column -- so instead of a hover, show the latest move's from/to prices
-        # directly as a column: the most recent "stop_trailed" activity row per symbol, already
-        # phrased as "trailing stop moved from X to Y" by the trailing-stop agent.
+        # directly as a column: the most recent "stop_trailed" activity row per symbol.
         latest_stop_move: dict[str, str] = {}
         if not stop_trail_events.empty:
             for _, event_row in stop_trail_events.sort_values("timestamp").iterrows():
-                move = re.search(r"from ([\d.]+) to ([\d.]+)", str(event_row["reason"]))
-                if move:
-                    latest_stop_move[event_row["symbol"]] = f"₹{float(move.group(1)):,.2f} → ₹{float(move.group(2)):,.2f}"
+                previous_stop = event_row["previous_stop"]
+                if pd.notna(previous_stop):
+                    latest_stop_move[event_row["symbol"]] = f"₹{float(previous_stop):,.2f} → ₹{float(event_row['stop_loss']):,.2f}"
 
         access_token = runtime_access_token(st, settings)
         quotes: dict = {}
@@ -1526,8 +1522,8 @@ def render_live_monitor(st, settings) -> None:
                 if record.position_type != position_type:
                     continue
                 key = record.symbol if ":" in record.symbol else f"NSE:{record.symbol}"
-                quote = quotes.get(key) or {}
-                last_price = float(quote.get("last_price", 0) or 0) or record.entry_price
+                live_quote = quotes.get(key) or {}
+                last_price = float(live_quote.get("last_price", 0) or 0) or record.entry_price
                 direction = 1 if record.side == "BUY" else -1
                 pnl = (last_price - record.entry_price) * record.quantity * direction
                 invested = record.entry_price * record.quantity
@@ -1574,42 +1570,82 @@ def render_live_monitor(st, settings) -> None:
             "P&L": st.column_config.NumberColumn(format="₹%.2f"),
             "P&L %": st.column_config.NumberColumn(format="%.2f%%", help="P&L as a percentage of entry price x quantity: (Last - Entry) / Entry x 100, signed for the trade's side."),
             "Target 1": st.column_config.NumberColumn(format="₹%.2f", help="The price that triggers the target-1 action (move stop to breakeven, or close the position, depending on strategy). Blank means the strategy didn't set one."),
-            "Stop updates": st.column_config.NumberColumn(help="How many times the trailing-stop agent has moved this position's SL-M since entry. See 'Recent stop-loss updates' below for the full price history."),
+            "Stop updates": st.column_config.NumberColumn(
+                help="How many times the trailing-stop agent has moved this position's SL-M since entry. Select the row to filter 'Recent stop-loss updates' below to just this symbol."
+            ),
             "Last stop move": st.column_config.TextColumn(help="The most recent trailing-stop move for this position (old price → new price)."),
             "Entered": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
         }
 
-        def render_table(title: str, position_type: str) -> None:
+        def render_table(title: str, position_type: str, table_key: str) -> str:
             st.subheader(title)
             rows = build_rows(position_type)
             if not rows:
                 st.markdown('<div class="empty">No open positions.</div>', unsafe_allow_html=True)
-                return
-            frame = pd.DataFrame(rows).sort_values("Entered", ascending=False)
-            st.dataframe(frame, width="stretch", hide_index=True, column_config=column_config)
+                return ""
+            frame = pd.DataFrame(rows).sort_values("Entered", ascending=False).reset_index(drop=True)
+            # A LinkColumn ("?stop_symbol=...") used to drive this instead -- but Streamlit
+            # renders that as a real <a href>, so clicking it forced a full browser navigation
+            # to the bare query string. That tore down the whole app (new Streamlit session,
+            # sidebar navigation reset to its default page) instead of just re-running this
+            # fragment, which is why it flickered and dropped back to the very first workspace
+            # page. Row selection re-runs in place -- no navigation, no lost session state.
+            event = st.dataframe(
+                frame,
+                width="stretch",
+                hide_index=True,
+                column_config=column_config,
+                on_select="rerun",
+                selection_mode="single-row",
+                key=table_key,
+            )
+            selected_rows = event.selection.rows if event and event.selection else []
+            if selected_rows:
+                return str(frame.iloc[selected_rows[0]]["Symbol"])
+            return ""
 
         st.caption(
             "Stop distance % = |Last − Stop| ÷ Last × 100. Stop trailing = (ATR × ATR mult.) below the last price for a "
             "BUY (above it for a SELL) on 15-minute candles for intraday / daily candles for swing, moved only in your "
             "favor -- never back toward entry. ATR is the current ATR14 value in rupees, live from the same candles. "
             "Target 1 is the price that triggers that strategy's target-1 action (move stop to breakeven, or close "
-            "outright); hover any column header for its exact definition."
+            "outright); hover any column header for its exact definition. Select a row to filter its stop-loss "
+            "history below."
         )
-        render_table("Intraday positions", "INTRADAY")
-        render_table("Swing positions", "SWING")
+        selected_in_intraday = render_table("Intraday positions", "INTRADAY", "live_monitor_intraday_table")
+        selected_in_swing = render_table("Swing positions", "SWING", "live_monitor_swing_table")
+        selected_stop_symbol = selected_in_intraday or selected_in_swing
 
         if not stop_trail_events.empty:
             tracked_symbols = {record.symbol for record in records}
             recent_updates = stop_trail_events.loc[stop_trail_events["symbol"].isin(tracked_symbols)].sort_values("timestamp", ascending=False).head(30)
-            with st.expander(f"Recent stop-loss updates ({len(recent_updates)})", expanded=False):
-                st.caption("Every SL-M move the trailing-stop agent has made for a currently open position, most recent first.")
+            if selected_stop_symbol:
+                selected_updates = recent_updates.loc[recent_updates["symbol"] == selected_stop_symbol]
+                updates_title = f"SL-M stop updates: {selected_stop_symbol} ({len(selected_updates)})"
+            else:
+                selected_updates = recent_updates
+                updates_title = f"Recent stop-loss updates ({len(recent_updates)})"
+            with st.expander(updates_title, expanded=bool(selected_stop_symbol)):
+                st.caption("Every SL-M move the trailing-stop agent has made, most recent first. From and To are the broker trigger prices; Calculation details is the exact trailing-stop math that produced the new stop.")
+                detail_rows = selected_updates.copy()
+                # Rows logged before the calculation-detail upgrade have no previous_stop and
+                # phrase "reason" as "trailing stop moved from X to Y" instead of a formula --
+                # fall back to parsing that legacy text so "From" isn't blank for older history.
+                legacy_from = detail_rows["reason"].str.extract(r"from ([\d.]+)", expand=False).astype(float)
+                detail_rows["From"] = detail_rows["previous_stop"].fillna(legacy_from)
+                detail_rows["To"] = detail_rows["stop_loss"]
+                detail_rows["Calculation details"] = detail_rows["reason"]
                 st.dataframe(
-                    recent_updates.rename(columns={"timestamp": "Time", "symbol": "Symbol", "stop_loss": "New stop", "reason": "Detail"}),
+                    detail_rows.rename(columns={"timestamp": "Time", "symbol": "Symbol"})[
+                        ["Time", "Symbol", "From", "To", "Calculation details"]
+                    ],
                     width="stretch",
                     hide_index=True,
                     column_config={
                         "Time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
-                        "New stop": st.column_config.NumberColumn(format="₹%.2f"),
+                        "From": st.column_config.NumberColumn(format="₹%.2f"),
+                        "To": st.column_config.NumberColumn(format="₹%.2f"),
+                        "Calculation details": st.column_config.TextColumn(width="large"),
                     },
                 )
 
@@ -1632,10 +1668,6 @@ def render_live_monitor(st, settings) -> None:
 def render_pnl_statement(st, settings) -> None:
     @st.fragment(run_every=10)
     def render_pnl_statement_content() -> None:
-        st.markdown(
-            f'<div class="last-refreshed">Last refreshed: {pd.Timestamp.now(tz="Asia/Kolkata"):%d %b %Y, %I:%M:%S %p} IST</div>',
-            unsafe_allow_html=True,
-        )
         st.markdown('<div class="eyebrow">Trade record</div>', unsafe_allow_html=True)
         st.title("P&L statement")
         st.caption("Every open position (live) and every closed trade (realized), in one statement.")
@@ -1683,9 +1715,11 @@ def render_pnl_statement(st, settings) -> None:
                     "P&L %": _pnl_pct(pnl, record.entry_price, record.quantity),
                     "SL Current Price": record.stop_loss,
                     "Used Strategy Name": record.strategy_name or "-",
+                    "Exit reason": "-",
                     "Entered": record.entry_time,
                     "Exited": None,
                     "Activity time": record.entry_time,
+                    "_correlation_id": f"{record.symbol}:{record.entry_time.isoformat()}",
                 }
             )
         closed_rows = []
@@ -1701,9 +1735,11 @@ def render_pnl_statement(st, settings) -> None:
                     "P&L %": _pnl_pct(trade.pnl, trade.entry_price, trade.quantity),
                     "SL Current Price": None,
                     "Used Strategy Name": trade.strategy_name or "-",
+                    "Exit reason": trade.exit_reason or "-",
                     "Entered": trade.entry_time,
                     "Exited": trade.exit_time,
                     "Activity time": trade.exit_time,
+                    "_correlation_id": f"{trade.symbol}:{trade.entry_time.isoformat()}",
                 }
             )
 
@@ -1715,14 +1751,36 @@ def render_pnl_statement(st, settings) -> None:
         total_pnl = realized_pnl + unrealized_pnl
         total_pnl_pct = (total_pnl / total_invested * 100) if total_invested else 0.0
 
-        summary_columns = st.columns(4)
+        def _ist_date(value):
+            timestamp = pd.Timestamp(value)
+            if timestamp.tzinfo is not None:
+                timestamp = timestamp.tz_convert("Asia/Kolkata")
+            return timestamp.date()
+
+        today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+        today_closed_records = [trade for trade in closed_records if _ist_date(trade.exit_time) == today]
+        # Today's realized leg is trades exited today; unrealized is folded in as-is (any open
+        # position's P&L is inherently "as of today" regardless of which day it was entered).
+        today_realized_pnl = sum(trade.pnl for trade in today_closed_records)
+        today_pnl = today_realized_pnl + unrealized_pnl
+        today_invested = sum(record.entry_price * record.quantity for record in open_records) + sum(
+            trade.entry_price * trade.quantity for trade in today_closed_records
+        )
+        today_pnl_pct = (today_pnl / today_invested * 100) if today_invested else 0.0
+
+        summary_columns = st.columns(5)
         # The delta arg on st.metric renders as an extra pill line below the value, which would
-        # make only this one card taller than the other three -- folding the % into the value
-        # string instead keeps all four cards the same single-line height.
+        # make only this one card taller than the others -- folding the % into the value string
+        # instead keeps every card the same single-line height.
         summary_columns[0].metric("Total P&L", f"₹{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)")
-        summary_columns[1].metric("Realized P&L", f"₹{realized_pnl:,.2f}")
-        summary_columns[2].metric("Unrealized P&L", f"₹{unrealized_pnl:,.2f}")
-        summary_columns[3].metric("Positions", f"{len(open_records)} open · {len(closed_records)} closed")
+        summary_columns[1].metric(
+            "Today P&L",
+            f"₹{today_pnl:,.2f} ({today_pnl_pct:+.2f}%)",
+            help="Realized P&L from trades exited today, plus unrealized P&L on every still-open position.",
+        )
+        summary_columns[2].metric("Total Realized P&L", f"₹{realized_pnl:,.2f}")
+        summary_columns[3].metric("Total Unrealized P&L", f"₹{unrealized_pnl:,.2f}")
+        summary_columns[4].metric("Positions", f"{len(open_records)} open · {len(closed_records)} closed")
 
         show_label_column, show_radio_column = st.columns([1, 11], vertical_alignment="center")
         show_label_column.markdown("**Show**")
@@ -1754,11 +1812,18 @@ def render_pnl_statement(st, settings) -> None:
 
         frame = pd.DataFrame(rows)
         frame["Activity time"] = frame["Activity time"].apply(_normalize_activity_time)
-        frame = frame.sort_values("Activity time", ascending=False).drop(columns="Activity time")
-        st.dataframe(
+        frame = frame.sort_values("Activity time", ascending=False).drop(columns="Activity time").reset_index(drop=True)
+        # Row selection instead of a per-row link/button: a link column would force a full
+        # browser navigation (see the Live monitor page's own "Stop updates" column history --
+        # that's exactly what caused it to flicker and drop back to the wrong dashboard page).
+        # Selecting a row re-runs only this fragment.
+        event = st.dataframe(
             frame,
             width="stretch",
             hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="pnl_statement_table",
             column_config={
                 "Entry Price": st.column_config.NumberColumn(format="₹%.2f"),
                 "Exit Price": st.column_config.NumberColumn(format="₹%.2f"),
@@ -1768,8 +1833,60 @@ def render_pnl_statement(st, settings) -> None:
                 "SL Current Price": st.column_config.NumberColumn(format="₹%.2f"),
                 "Entered": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
                 "Exited": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
+                "_correlation_id": None,
             },
         )
+        st.caption("Select a row to see that trade's full activity below: entry, every SL-M update (and whether it succeeded), and why it closed.")
+
+        selected_rows = event.selection.rows if event and event.selection else []
+        if selected_rows:
+            selected = frame.iloc[selected_rows[0]]
+            decisions = repository.load_decisions(correlation_id=selected["_correlation_id"], limit=200)
+            decisions.sort(key=lambda decision: decision.timestamp.isoformat())
+            with st.expander(f"Trade activity: {selected['Stock Name']} ({len(decisions)})", expanded=True):
+                if not decisions:
+                    st.markdown(
+                        '<div class="empty">No recorded activity for this trade yet -- it may predate the activity log, '
+                        "or its entry wasn't made through the standalone trailing-stop agent.</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption(
+                        "Details shows each stop trail's actual ATR calculation (e.g. \"ATR14 ₹15.35 × mult 1.50 = ₹23.03; "
+                        "Last ₹2162.43 − ₹23.03 = ₹2139.40\") for anything trailed since this calculation-detail logging "
+                        "was added -- a small, uneven move (a handful of paise) is normal: it's whatever ATR14 × the "
+                        "multiplier came out to on that candle, not a rounded step. Older rows only have a plain "
+                        "\"moved from X to Y\" line, since the calculation itself wasn't being saved yet when they happened."
+                    )
+                    # Every row for a closed trade carries the same final `outcome` (it's
+                    # backfilled onto the whole correlation_id chain once the exit is known, so
+                    # a future LLM pass can see what each earlier decision led to) -- repeating
+                    # that identical number on all 20+ intermediate stop-trail rows reads as
+                    # noise here, so it's only shown once, on the row that actually closed the
+                    # trade. "Details" is where each stop trail's own math lives instead.
+                    activity_rows = [
+                        {
+                            "Time": decision.timestamp,
+                            "Event": decision.event_type,
+                            "Result": decision.decision,
+                            "Details": decision.rationale,
+                            "Final P&L": (
+                                f"₹{decision.outcome['pnl']:,.2f}"
+                                if decision.event_type in {"exit"} and decision.outcome and "pnl" in decision.outcome
+                                else "-"
+                            ),
+                        }
+                        for decision in decisions
+                    ]
+                    st.dataframe(
+                        pd.DataFrame(activity_rows),
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "Time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
+                            "Details": st.column_config.TextColumn(width="large"),
+                        },
+                    )
 
     render_pnl_statement_content()
 
@@ -5034,12 +5151,6 @@ def main() -> None:
     page_content = st.empty()
     page_content.empty()
     with page_content.container():
-        if page not in ("Live monitor", "P&L statement"):
-            last_refreshed = pd.Timestamp.now(tz="Asia/Kolkata")
-            st.markdown(
-                f'<div class="last-refreshed">Last refreshed: {last_refreshed:%d %b %Y, %I:%M:%S %p} IST</div>',
-                unsafe_allow_html=True,
-            )
         if page == "Kite authentication":
             render_kite_authentication(st, settings)
         elif page == "Overview":

@@ -6,7 +6,7 @@ from app.database.database import Database
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.database.models import ActivityRecord, AgentHeartbeat, DynamicWatchlistRecord, NotificationRecord, OrderRecord, PositionRecord, PreSpikeEventRecord, ProgressiveEmaCycleRecord, SignalEngineStatus, SignalRecord, StrategyPresetRecord, TradeRecord, WatchlistRecord
+from app.database.models import ActivityRecord, AgentHeartbeat, DecisionLogRecord, DynamicWatchlistRecord, NotificationRecord, OrderRecord, PositionRecord, PreSpikeEventRecord, ProgressiveEmaCycleRecord, SignalEngineStatus, SignalRecord, StrategyPresetRecord, TradeRecord, WatchlistRecord
 
 EXPORT_TIMEZONE = ZoneInfo("Asia/Kolkata")
 EXPORT_TIMESTAMP_KEYS = {
@@ -96,7 +96,7 @@ class Repository:
     def save_activity(self, activity: ActivityRecord) -> None:
         with self.database.lock:
             self.database.connection.execute(
-                "INSERT INTO activity (event_kind, symbol, timestamp, mode, price, order_id, side, quantity, entry_price, stop_loss, pnl, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO activity (event_kind, symbol, timestamp, mode, price, order_id, side, quantity, entry_price, stop_loss, pnl, reason, previous_stop) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     activity.event_kind,
                     activity.symbol,
@@ -110,9 +110,108 @@ class Repository:
                     activity.stop_loss,
                     activity.pnl,
                     activity.reason,
+                    activity.previous_stop,
                 ),
             )
             self.database.connection.commit()
+
+    def save_decision(self, decision: DecisionLogRecord) -> int:
+        """Append one row to the unified decision log and return its id.
+
+        The returned id is only useful as a `source_id` for something logged in the same
+        request; it is never used to look the row back up for mutation -- outcomes are joined
+        on `correlation_id` instead (see `link_decision_outcome`), since a single trade's
+        entry/trail/exit rows are written far apart in time by different callers that don't
+        share a row id.
+        """
+        with self.database.lock:
+            cursor = self.database.connection.execute(
+                """
+                INSERT INTO decision_log
+                (timestamp, symbol, event_type, strategy_name, mode, decision, rationale, inputs, outputs, confidence, correlation_id, outcome, source_table, source_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.timestamp.isoformat(),
+                    decision.symbol,
+                    decision.event_type,
+                    decision.strategy_name,
+                    decision.mode,
+                    decision.decision,
+                    decision.rationale,
+                    json.dumps(decision.inputs, sort_keys=True, default=str),
+                    json.dumps(decision.outputs, sort_keys=True, default=str),
+                    decision.confidence,
+                    decision.correlation_id,
+                    json.dumps(decision.outcome, sort_keys=True, default=str) if decision.outcome is not None else None,
+                    decision.source_table,
+                    decision.source_id,
+                ),
+            )
+            self.database.connection.commit()
+            return int(cursor.lastrowid)
+
+    def link_decision_outcome(self, correlation_id: str, outcome: dict[str, object]) -> int:
+        """Backfill `outcome` onto every decision-log row sharing `correlation_id` that doesn't
+        already have one -- called once a trade's real result is known (a fill, a close), so
+        earlier decisions (the signal that proposed it, every stop trail along the way) end up
+        labelled with what actually happened. Returns the number of rows updated."""
+        if not correlation_id:
+            return 0
+        with self.database.lock:
+            cursor = self.database.connection.execute(
+                "UPDATE decision_log SET outcome = ? WHERE correlation_id = ? AND outcome IS NULL",
+                (json.dumps(outcome, sort_keys=True, default=str), correlation_id),
+            )
+            self.database.connection.commit()
+            return cursor.rowcount
+
+    def load_decisions(
+        self,
+        symbol: str | None = None,
+        event_type: str | None = None,
+        correlation_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 200,
+    ) -> list[DecisionLogRecord]:
+        query = "SELECT * FROM decision_log WHERE 1=1"
+        parameters: list[object] = []
+        if symbol is not None:
+            query += " AND symbol = ?"
+            parameters.append(symbol)
+        if event_type is not None:
+            query += " AND event_type = ?"
+            parameters.append(event_type)
+        if correlation_id is not None:
+            query += " AND correlation_id = ?"
+            parameters.append(correlation_id)
+        if since is not None:
+            query += " AND timestamp >= ?"
+            parameters.append(since.isoformat())
+        query += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+        parameters.append(limit)
+        with self.database.lock:
+            rows = self.database.connection.execute(query, parameters).fetchall()
+        return [self._decision_from_row(row) for row in rows]
+
+    @staticmethod
+    def _decision_from_row(row) -> DecisionLogRecord:
+        return DecisionLogRecord(
+            timestamp=datetime.fromisoformat(row["timestamp"]),
+            symbol=row["symbol"],
+            event_type=row["event_type"],
+            strategy_name=row["strategy_name"] or "",
+            mode=row["mode"] or "LIVE",
+            decision=row["decision"] or "",
+            rationale=row["rationale"] or "",
+            inputs=json.loads(row["inputs"] or "{}"),
+            outputs=json.loads(row["outputs"] or "{}"),
+            confidence=float(row["confidence"]) if row["confidence"] is not None else None,
+            correlation_id=row["correlation_id"] or "",
+            outcome=json.loads(row["outcome"]) if row["outcome"] is not None else None,
+            source_table=row["source_table"] or "",
+            source_id=row["source_id"] or "",
+        )
 
     def save_notification(self, notification: NotificationRecord) -> bool:
         signal_id = f"{notification.instrument_token or notification.symbol}:{notification.side}:{notification.signal_timestamp.isoformat()}"

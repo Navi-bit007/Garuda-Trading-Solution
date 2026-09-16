@@ -21919,3 +21919,758 @@ kiteconnect.exceptions.NetworkException: Too many requests
 2026-09-16 12:46:51,830 INFO Trailing stop agent started
 2026-09-16 12:49:09,297 INFO broker_exit_detected NSE:COLPAL side=SELL price=1872.30 pnl=149.00
 2026-09-16 12:57:26,631 INFO Trailing stop agent started
+2026-09-16 14:10:35,994 INFO broker_exit_detected NSE:NPST side=SELL price=1796.10 pnl=-95.60
+2026-09-16 14:27:12,071 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:27:13,102 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:27:15,153 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:27:15,153 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:27:30,258 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:27:31,298 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:27:33,339 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:27:33,340 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:27:48,454 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:27:49,491 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:27:51,532 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:27:51,532 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:28:06,651 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:28:07,697 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:28:09,727 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:28:09,727 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:28:24,985 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:28:26,026 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:28:28,062 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:28:28,062 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:28:43,161 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:28:44,198 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:28:46,229 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:28:46,229 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:29:01,349 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:02,394 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:04,420 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:04,420 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:29:19,525 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:20,545 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:22,592 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:22,592 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:29:37,696 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:38,732 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:40,774 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:40,774 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:29:55,865 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:56,904 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:58,955 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:29:58,955 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:30:14,050 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:30:15,095 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:30:17,134 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:30:17,134 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:30:32,234 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:30:33,285 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:30:35,322 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:30:35,322 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:30:50,427 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:30:51,455 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:30:53,508 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:30:53,508 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:31:08,629 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:31:09,662 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:31:11,707 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:31:11,707 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:31:26,828 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:31:27,869 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:31:29,912 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:31:29,912 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:31:45,016 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:31:46,049 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:31:48,090 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:31:48,090 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:32:03,190 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:32:04,238 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:32:06,271 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:32:06,271 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:32:21,772 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:32:22,850 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:32:24,896 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:32:24,896 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:32:40,022 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:32:41,068 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:32:43,114 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:32:43,115 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:32:58,220 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:32:59,270 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:01,315 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:01,315 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:33:16,474 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:17,507 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:19,555 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:19,555 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:33:35,030 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:36,077 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:38,120 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:38,120 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:33:53,240 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:54,276 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:56,330 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:33:56,332 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:34:11,431 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:34:12,476 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:34:14,509 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:34:14,509 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:34:29,631 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:34:30,674 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:34:32,716 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:34:32,716 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:34:47,835 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:34:48,870 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:34:50,917 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:34:50,917 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:35:06,045 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:35:07,091 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:35:09,363 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:35:09,363 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:35:24,998 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:35:26,042 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:35:28,075 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:35:28,075 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:35:43,205 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:35:44,247 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:35:46,296 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:35:46,296 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:36:01,420 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:02,467 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:04,756 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:04,756 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:36:19,877 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:20,922 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:22,952 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:22,952 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:36:38,077 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:39,119 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:41,163 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:41,163 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:36:56,265 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:57,310 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:59,355 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:36:59,355 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:37:14,690 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:37:15,738 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:37:17,782 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:37:17,782 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:37:32,897 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:37:33,945 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:37:35,986 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:37:35,986 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:37:51,087 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:37:52,131 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:37:54,163 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:37:54,163 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:38:09,284 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:38:10,330 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:38:12,375 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:38:12,375 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:38:27,522 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:38:28,566 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:38:30,613 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:38:30,613 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:38:45,884 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:38:46,926 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:38:48,974 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:38:48,974 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:39:04,100 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:39:05,149 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:39:07,192 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:39:07,192 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:39:22,312 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:39:23,358 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:39:25,405 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:39:25,405 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:39:40,508 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:39:41,553 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:39:43,599 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:39:43,599 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:39:58,728 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:39:59,774 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:01,827 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:01,827 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:40:16,914 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:17,968 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:20,017 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:20,018 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:40:35,136 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:36,405 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:38,446 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:38,446 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:40:53,802 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:54,848 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:56,890 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:40:56,890 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:41:12,007 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:41:13,051 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:41:15,095 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:41:15,095 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:41:30,200 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:41:31,252 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:41:33,296 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:41:33,296 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:41:48,416 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:41:49,462 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:41:51,495 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:41:51,495 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:42:07,152 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:42:08,199 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:42:10,255 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:42:10,255 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:42:25,418 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:42:26,461 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:42:28,507 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:42:28,507 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:42:43,622 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:42:44,669 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:42:46,933 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:42:46,933 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:43:02,279 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:43:03,328 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:43:05,371 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:43:05,371 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:43:20,482 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:43:21,535 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:43:23,798 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:43:23,798 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:43:38,952 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:43:39,998 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:43:42,046 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:43:42,046 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:43:57,335 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:43:58,618 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:00,888 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:00,888 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:44:15,997 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:17,032 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:19,085 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:19,085 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:44:34,227 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:35,267 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:37,317 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:37,317 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:44:52,420 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:53,464 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:55,506 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:44:55,506 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:45:10,611 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:45:11,657 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:45:13,703 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:45:13,703 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:45:28,812 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:45:29,861 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:45:31,899 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:45:31,899 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:45:47,010 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:45:48,051 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:45:50,101 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:45:50,101 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:46:05,223 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:46:06,268 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:46:08,300 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:46:08,300 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:46:23,409 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:46:24,457 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:46:26,505 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:46:26,505 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:46:41,620 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:46:42,667 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:46:44,713 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:46:44,713 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:46:59,881 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:00,929 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:02,974 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:02,974 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:47:18,102 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:19,150 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:21,196 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:21,196 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:47:36,308 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:37,354 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:39,409 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:39,409 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:47:54,520 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:55,564 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:57,609 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:47:57,609 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:48:12,720 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:48:13,769 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:48:15,837 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:48:15,837 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:48:30,966 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:48:32,013 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:48:34,061 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:48:34,061 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:48:49,220 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:48:50,296 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:48:52,341 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:48:52,341 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:49:07,589 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:49:08,637 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:49:10,978 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:49:10,979 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:49:26,121 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:49:27,170 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:49:29,213 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:49:29,215 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:49:44,332 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:49:45,377 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:49:47,427 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:49:47,427 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:50:02,541 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:50:03,586 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:50:05,631 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:50:05,632 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:50:20,745 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:50:21,792 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:50:23,835 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:50:23,836 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:50:39,506 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:50:40,553 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:50:42,597 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:50:42,597 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:50:57,717 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:50:58,762 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:00,806 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:00,806 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:51:15,912 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:16,954 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:19,226 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:19,226 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:51:34,340 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:35,384 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:37,430 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:37,430 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:51:52,528 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:53,578 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:55,624 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:51:55,624 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:52:10,735 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:52:11,781 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:52:13,828 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:52:13,828 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:52:28,932 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:52:29,975 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:52:32,254 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:52:32,254 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:52:47,377 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:52:48,424 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:52:50,471 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:52:50,471 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:53:05,581 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:53:06,674 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:53:08,720 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:53:08,720 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:53:23,828 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:53:24,873 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:53:26,917 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:53:26,917 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:53:42,035 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:53:43,079 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:53:45,123 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:53:45,123 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:54:00,343 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:01,388 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:03,435 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:03,435 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:54:18,947 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:19,995 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:22,039 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:22,039 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:54:37,193 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:38,238 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:40,279 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:40,280 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:54:55,389 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:56,432 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:58,475 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:54:58,475 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:55:13,814 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:55:14,858 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:55:16,905 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:55:16,905 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:55:32,012 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:55:33,058 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:55:35,113 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:55:35,114 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:55:50,210 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:55:51,280 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:55:53,326 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:55:53,326 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:56:08,778 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:56:09,825 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:56:11,870 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:56:11,870 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:56:27,222 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:56:28,266 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:56:30,308 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:56:30,308 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:56:45,437 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:56:46,482 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:56:48,533 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:56:48,533 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:57:03,639 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:57:04,687 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:57:06,748 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:57:06,748 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:57:22,136 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:57:23,181 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:57:25,228 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:57:25,229 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:57:40,339 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:57:41,389 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:57:43,435 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:57:43,435 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:57:58,545 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:57:59,592 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:01,638 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:01,639 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:58:16,756 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:17,802 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:19,847 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:19,847 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:58:35,426 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:36,473 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:39,056 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:39,056 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:58:54,175 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:55,217 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:57,263 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:58:57,263 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:59:12,454 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:59:13,502 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:59:15,547 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:59:15,547 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:59:31,052 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:59:32,098 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:59:34,143 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:59:34,144 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 14:59:49,255 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:59:50,300 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:59:52,344 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 14:59:52,344 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:00:07,464 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:00:08,508 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:00:10,551 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:00:10,552 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:00:25,800 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:00:26,845 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:00:28,890 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:00:28,890 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:00:43,988 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:00:45,038 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:00:47,083 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:00:47,083 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:01:02,247 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:01:03,293 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:01:05,569 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:01:05,570 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:01:20,681 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:01:21,724 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:01:23,770 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:01:23,770 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:01:38,913 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:01:39,958 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:01:42,002 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:01:42,002 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:01:57,115 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:01:58,160 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:00,207 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:00,207 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:02:15,337 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:16,384 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:18,428 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:18,429 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:02:33,541 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:34,583 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:36,629 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:36,630 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:02:51,972 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:53,018 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:55,062 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:02:55,062 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:03:10,174 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:03:11,218 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:03:13,490 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:03:13,490 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:03:28,606 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:03:29,653 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:03:31,792 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:03:31,792 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:03:46,950 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:03:47,995 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:03:50,270 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:03:50,270 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:04:05,376 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:04:06,422 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:04:08,470 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:04:08,470 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:04:23,632 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:04:24,679 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:04:26,720 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:04:26,720 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:04:41,971 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:04:43,015 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:04:45,060 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:04:45,060 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:05:00,173 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:01,220 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:03,272 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:03,272 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:05:18,873 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:19,920 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:21,967 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:21,967 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:05:37,083 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:38,372 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:40,418 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:40,418 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:05:55,529 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:56,586 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:58,631 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:05:58,631 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:06:13,966 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:06:15,012 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:06:17,057 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:06:17,057 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:06:32,203 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:06:33,249 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:06:35,305 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:06:35,305 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:06:50,422 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:06:51,709 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:06:53,759 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:06:53,761 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:07:08,876 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:07:09,990 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:07:12,263 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:07:12,263 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:07:27,367 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:07:28,421 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:07:30,472 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:07:30,472 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:07:45,598 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:07:46,654 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:07:48,702 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:07:48,702 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:08:03,802 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:08:04,864 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:08:06,910 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:08:06,911 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:08:22,028 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:08:23,074 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:08:25,352 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:08:25,353 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:08:40,464 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:08:41,512 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:08:43,557 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:08:43,558 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:08:58,664 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:00,470 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:02,543 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:02,543 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:09:17,910 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:18,992 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:21,055 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:21,055 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:09:36,305 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:37,367 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:39,425 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:39,425 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:09:55,059 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:56,118 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:58,178 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:09:58,178 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:10:13,339 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:10:14,392 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:10:16,455 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:10:16,455 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:10:31,600 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:10:32,667 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:10:34,724 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:10:34,724 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:10:49,856 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:10:51,153 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:10:53,212 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:10:53,212 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:11:08,361 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:11:09,421 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:11:11,490 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:11:11,490 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:11:26,626 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:11:27,692 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:11:29,996 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:11:29,996 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:11:45,169 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:11:46,227 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:11:48,289 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:11:48,289 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:12:03,419 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 1/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:12:04,483 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 2/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:12:06,540 WARNING modify_protective_stop failed for NSE:HAPPYFORGE (attempt 3/3): Maximum allowed order modifications exceeded.
+2026-09-16 15:12:06,540 ERROR modify_protective_stop permanently failed for NSE:HAPPYFORGE: Maximum allowed order modifications exceeded.
+2026-09-16 15:12:25,539 INFO Trailing stop agent started
+2026-09-16 15:18:58,867 INFO broker_exit_detected NSE:HAPPYFORGE side=SELL price=2139.40 pnl=-47.83
+2026-09-16 15:27:49,856 ERROR Broker position lookup failed during swing reconciliation
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 788, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 534, in _make_request
+    response = conn.getresponse()
+               ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connection.py", line 571, in getresponse
+    httplib_response = super().getresponse()
+                       ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1430, in getresponse
+    response.begin()
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 331, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 300, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\adapters.py", line 696, in send
+    resp = conn.urlopen(
+           ^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 842, in urlopen
+    retries = retries.increment(
+              ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\util\retry.py", line 498, in increment
+    raise reraise(type(error), error, _stacktrace)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\util\util.py", line 38, in reraise
+    raise value.with_traceback(tb)
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 788, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 534, in _make_request
+    response = conn.getresponse()
+               ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connection.py", line 571, in getresponse
+    httplib_response = super().getresponse()
+                       ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1430, in getresponse
+    response.begin()
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 331, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 300, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+urllib3.exceptions.ProtocolError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\app\execution\trailing_stop_agent.py", line 524, in _reconcile_swing_positions
+    return cached[1]
+                     
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 500, in positions
+    return self._get("portfolio.positions")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 916, in _get
+    return self._request(route, "GET", url_args=url_args, params=params, is_json=is_json)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 971, in _request
+    raise e
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 959, in _request
+    r = self.reqsession.request(method,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\sessions.py", line 651, in request
+    resp = self.send(prep, **send_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\sessions.py", line 784, in send
+    r = adapter.send(request, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\adapters.py", line 711, in send
+    raise ConnectionError(err, request=request)
+requests.exceptions.ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+2026-09-16 15:30:48,728 INFO Trailing stop agent started
+2026-09-16 15:30:49,909 ERROR Failed to re-arm protective stop for NSE:JUBLPHARMA: Markets are closed right now. Post-market session will commence at 3:50PM. [Read more.](https://support.zerodha.com/category/trading-and-markets/trading-faqs/market-sessions/articles/what-are-pre-market-and-post-market-sessions-and-orders)
+2026-09-16 15:36:09,723 ERROR Broker position lookup failed during swing reconciliation
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 788, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 534, in _make_request
+    response = conn.getresponse()
+               ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connection.py", line 571, in getresponse
+    httplib_response = super().getresponse()
+                       ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1430, in getresponse
+    response.begin()
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 331, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 300, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\adapters.py", line 696, in send
+    resp = conn.urlopen(
+           ^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 842, in urlopen
+    retries = retries.increment(
+              ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\util\retry.py", line 498, in increment
+    raise reraise(type(error), error, _stacktrace)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\util\util.py", line 38, in reraise
+    raise value.with_traceback(tb)
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 788, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 534, in _make_request
+    response = conn.getresponse()
+               ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connection.py", line 571, in getresponse
+    httplib_response = super().getresponse()
+                       ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1430, in getresponse
+    response.begin()
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 331, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 300, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+urllib3.exceptions.ProtocolError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\app\execution\trailing_stop_agent.py", line 576, in _reconcile_swing_positions
+    broker_positions = self.broker_client.positions().get("net", [])
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 500, in positions
+    return self._get("portfolio.positions")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 916, in _get
+    return self._request(route, "GET", url_args=url_args, params=params, is_json=is_json)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 971, in _request
+    raise e
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 959, in _request
+    r = self.reqsession.request(method,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\sessions.py", line 651, in request
+    resp = self.send(prep, **send_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\sessions.py", line 784, in send
+    r = adapter.send(request, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\adapters.py", line 711, in send
+    raise ConnectionError(err, request=request)
+requests.exceptions.ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+2026-09-16 15:40:10,640 INFO Past today's shutdown time (15:40:00); trailing stop agent is exiting for the day
+2026-09-16 15:40:14,876 INFO Trailing stop agent shut down for the day; exiting process

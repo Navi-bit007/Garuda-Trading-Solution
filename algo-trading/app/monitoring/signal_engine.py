@@ -13,7 +13,7 @@ from app.broker.authentication import AccessToken, require_credentials
 from app.broker.kite_client import KiteClient
 from app.broker.market_data import MarketData
 from app.database.database import Database
-from app.database.models import NotificationRecord, PreSpikeEventRecord, SignalEngineStatus, SignalRecord
+from app.database.models import DecisionLogRecord, NotificationRecord, PreSpikeEventRecord, SignalEngineStatus, SignalRecord
 from app.database.repository import Repository
 from app.market.candles import validate_ohlcv
 from app.monitoring.notifications import Notifier, notification_message
@@ -171,6 +171,7 @@ class AlwaysOnSignalEngine:
                                 record = self._evaluate_pre_spike(user_id, symbol, instrument_token, candles)
                                 if record is not None:
                                     self._notify_signal(record)
+                                    self._log_signal_decision(record)
                                     generated += 1
                             elif not hasattr(self.strategy, "evaluate"):
                                 try:
@@ -196,6 +197,7 @@ class AlwaysOnSignalEngine:
                                     )
                                     if self.repository.save_signal(record):
                                         self._notify_signal(record)
+                                        self._log_signal_decision(record, signal=signal)
                                         generated += 1
                             else:
                                 try:
@@ -224,6 +226,7 @@ class AlwaysOnSignalEngine:
                                     )
                                     if self.repository.save_signal(record):
                                         self._notify_signal(record)
+                                        self._log_signal_decision(record, signal=signal, extra_inputs={"vwap": record.vwap, "ema20": record.ema20})
                                         generated += 1
                         if not symbol_failed:
                             self._last_candles.add(key)
@@ -263,6 +266,53 @@ class AlwaysOnSignalEngine:
         notification = notification.__class__(**{**notification.__dict__, "message": notification_message(notification) + f" reasons={signal.reason}"})
         if self.repository.save_notification(notification):
             self.notifier.send(notification.message)
+
+    def _log_signal_decision(self, record: SignalRecord, signal=None, extra_inputs: dict[str, object] | None = None) -> None:
+        """Record every generated signal to the unified decision log, not just the ones acted
+        on -- for later strategy review/forecasting, a rejected or unacted-on signal (what the
+        scanner saw and how it scored it) is just as informative as one that became a trade.
+
+        `signal` is the richer in-memory `Signal`/evaluation object (score breakdown, risk/reward,
+        historical probabilities) when the caller has one; pre-spike's persisted `SignalRecord`
+        alone is used otherwise, since that path doesn't produce a comparable object.
+
+        `correlation_id` uses the signal's own symbol+timestamp rather than a later position's
+        entry_time, since a signal doesn't know yet whether -- or exactly when -- an order will
+        actually fill; TradingPipeline/SwingAutoTrader's own entry decisions aren't logged here
+        yet (a natural next step), so this won't auto-join to a resulting trade's rows.
+        """
+        inputs: dict[str, object] = {"price": record.price, **(extra_inputs or {})}
+        if signal is not None:
+            for field_name in (
+                "risk_reward",
+                "expected_value",
+                "historical_probability_2_percent",
+                "historical_probability_3_percent",
+                "target_2_percent",
+                "target_3_percent",
+            ):
+                value = getattr(signal, field_name, None)
+                if value is not None:
+                    inputs[field_name] = value
+            if signal.signal_reasons:
+                inputs["signal_reasons"] = list(signal.signal_reasons)
+        self.repository.save_decision(
+            DecisionLogRecord(
+                timestamp=datetime.now(),
+                symbol=record.symbol,
+                event_type="signal_generated",
+                strategy_name=record.strategy,
+                mode="SCAN",
+                decision=record.side,
+                rationale=record.reason,
+                inputs=inputs,
+                outputs={"stop_loss": record.stop_loss, "target_1": record.target_1, "target_2": record.target_2, "entry_price": record.entry_price},
+                confidence=float(record.score) if record.score else None,
+                correlation_id=f"{record.symbol}:signal:{record.signal_timestamp.isoformat()}",
+                source_table="signals",
+                source_id=f"{record.strategy}:{record.instrument_token}:{record.side}:{record.signal_timestamp.isoformat()}",
+            )
+        )
 
     def _evaluate_pre_spike(self, user_id: str, symbol: str, instrument_token: int, candles: pd.DataFrame) -> SignalRecord | None:
         strategy = self.strategy

@@ -12,7 +12,7 @@ import pandas as pd
 from app.broker.market_data import MarketData
 from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import Side
-from app.database.models import ActivityRecord, AgentHeartbeat, PositionRecord, TradeRecord
+from app.database.models import ActivityRecord, AgentHeartbeat, DecisionLogRecord, PositionRecord, TradeRecord
 from app.database.repository import Repository
 from app.execution.swing_trailing import compute_ema_swing_stop, compute_trend_breakout_stop
 from app.execution.trailing_stop import TrailingStop
@@ -33,6 +33,11 @@ MAX_MODIFY_ATTEMPTS = 3
 # OPEN, ...) is treated as still live, since we'd rather risk one extra check next cycle than
 # place a duplicate protective order on ambiguous/transient data.
 TERMINAL_INACTIVE_ORDER_STATUSES = {"CANCELLED", "REJECTED"}
+# Zerodha caps the number of times a single order can be modified (25, confirmed live) --
+# after that every modify_order() call rejects with this message regardless of how valid the
+# new trigger price is. There's no way to reset that count on the same order_id, so once it's
+# hit, the only way to keep trailing is to cancel the capped order and place a fresh one.
+MODIFICATION_LIMIT_ERROR_TEXT = "maximum allowed order modification"
 
 
 @dataclass
@@ -99,6 +104,11 @@ class TrailingStopAgent:
         self._intraday_broker_error = ""
         self._swing_broker_error = ""
         self.shutdown_time = getattr(settings, "agent_shutdown_time", time_of_day(15, 40))
+        # Zerodha charges an auto square-off penalty for any MIS (intraday) position still open
+        # past its own RMS cutoff -- force_exit is always validated to fall before shutdown_time
+        # (see Settings.agent_shutdown_after_force_exit), so every open intraday position gets a
+        # market exit here well before the agent itself stops watching for the day.
+        self.force_exit_time = getattr(settings, "force_exit", time_of_day(15, 15))
         self.shut_down_for_the_day = False
 
     @property
@@ -281,6 +291,42 @@ class TrailingStopAgent:
             frame = frame.rename(columns={"date": "timestamp"})
         return validate_ohlcv(frame)
 
+    @staticmethod
+    def _correlation_id(record: PositionRecord) -> str:
+        """A stable id spanning one position's whole life, for joining every decision-log row
+        (entry, each stop trail, target hit, exit) even though `protective_order_id` itself
+        changes (an overnight re-arm, or a modification-cap replacement). `entry_time` never
+        changes once a position is open, so symbol+entry_time is the closest thing this app has
+        to a trade id.
+        """
+        return f"{record.symbol}:{record.entry_time.isoformat()}"
+
+    def _log_decision(
+        self,
+        record: PositionRecord,
+        event_type: str,
+        decision: str,
+        rationale: str,
+        inputs: dict[str, object] | None = None,
+        outputs: dict[str, object] | None = None,
+    ) -> None:
+        self.repository.save_decision(
+            DecisionLogRecord(
+                timestamp=datetime.now(),
+                symbol=record.symbol,
+                event_type=event_type,
+                strategy_name=record.strategy_name or "",
+                mode=record.trading_mode,
+                decision=decision,
+                rationale=rationale,
+                inputs=inputs or {},
+                outputs=outputs or {},
+                correlation_id=self._correlation_id(record),
+                source_table="positions",
+                source_id=record.symbol,
+            )
+        )
+
     # -- intraday: tick-price-driven ATR ratchet -------------------------------
 
     def _process_intraday(self, timestamp: datetime) -> None:
@@ -306,26 +352,49 @@ class TrailingStopAgent:
             logger.exception("LTP fetch failed for intraday positions")
             self._intraday_broker_error = f"LTP fetch failed: {error}"
             return
+        force_exit_due = timestamp.time() >= self.force_exit_time
         for position, key in zip(positions, keys):
             quote = quotes.get(key)
-            if not quote:
+            price = None
+            if quote:
+                try:
+                    price = float(quote["last_price"])
+                except (KeyError, TypeError, ValueError):
+                    price = None
+            if price is not None and price <= 0:
+                price = None
+            if force_exit_due:
+                self._force_exit_position(position, price or position.record.entry_price, timestamp)
                 continue
-            try:
-                price = float(quote["last_price"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if price <= 0:
+            if price is None:
                 continue
             self._check_target_1(position, price)
             atr_value = self._resolve_atr(position, timestamp)
             if atr_value <= 0:
                 continue
-            candidate = position.trailing_stop.update(price, atr_value)
+            previous_stop = position.record.stop_loss
+            side = position.record.side
+            raw_candidate = position.trailing_stop.update(price, atr_value)
+            distance = position.trailing_stop.atr_multiplier * atr_value
+            operator = "−" if side == "BUY" else "+"
+            candidate = raw_candidate
+            floored_note = ""
             if position.record.target_1_hit:
                 entry_price = position.record.entry_price
-                candidate = max(candidate, entry_price) if position.record.side == "BUY" else min(candidate, entry_price)
+                floored = max(raw_candidate, entry_price) if side == "BUY" else min(raw_candidate, entry_price)
+                if floored != raw_candidate:
+                    floored_note = f"; floored to breakeven entry ₹{entry_price:.2f} (target 1 hit)"
+                candidate = floored
                 position.trailing_stop.stop = candidate
-            self._maybe_apply(position, candidate, price)
+            # "moved from X to Y" is the actual new stop (post breakeven-floor, if that kicked
+            # in); "Calc" is always the raw ATR arithmetic that produced it, so the two numbers
+            # can legitimately differ by design, not by error, when the floor overrides it.
+            calculation = (
+                f"trailing stop moved from ₹{previous_stop:.2f} to ₹{candidate:.2f} - "
+                f"Calc: ATR14 ₹{atr_value:.2f} × mult {position.trailing_stop.atr_multiplier:.2f} = ₹{distance:.2f}; "
+                f"Last ₹{price:.2f} {operator} ₹{distance:.2f} = ₹{raw_candidate:.2f}{floored_note}"
+            )
+            self._maybe_apply(position, candidate, price, calculation)
 
     def _check_target_1(self, position: AgentPosition, price: float) -> None:
         """Flip target_1_hit the moment live price reaches the strategy's target-1 level.
@@ -347,6 +416,76 @@ class TrailingStopAgent:
         position.record = updated
         logger.info("%s reached target 1 (%.2f); stop now floors at breakeven", record.symbol, record.target_1)
         self.notifier.send(f"{record.symbol} reached target 1 (₹{record.target_1:.2f}) -- stop now floors at breakeven")
+        self._log_decision(
+            updated,
+            event_type="target_hit",
+            decision="FLOOR_TO_BREAKEVEN",
+            rationale=f"Live price ₹{price:.2f} reached target 1 (₹{record.target_1:.2f}); stop now floors at breakeven entry ₹{record.entry_price:.2f} instead of trailing below it.",
+            inputs={"price": price, "target_1": record.target_1, "entry_price": record.entry_price},
+        )
+
+    def _force_exit_position(self, position: AgentPosition, price: float, timestamp: datetime) -> None:
+        """Market-close an intraday position once the configured force-exit time (Risk &
+        settings) has passed, and cancel its resting SL-M -- a stale protective order left
+        behind after a market exit could otherwise fire against a position that no longer
+        exists. Without this, an intraday position that never hit its stop would sit open past
+        Zerodha's own RMS cutoff, and Zerodha charges an auto square-off penalty for closing it
+        instead of the client doing so first.
+        """
+        record = position.record
+        exit_side = Side.SELL if record.side == "BUY" else Side.BUY
+        reason = "Force close; Auto Square off"
+        try:
+            self.orders.place(OrderRequest(record.symbol, exit_side, record.quantity, price, product="MIS", exchange=self._exchange(record.symbol)))
+        except Exception as error:
+            logger.error("Force-exit market order failed for %s: %s", record.symbol, error)
+            self.notifier.send(f"critical_unprotected: force-exit order failed for {record.symbol}: {error}")
+            self._intraday_broker_error = f"force-exit order failed for {record.symbol}: {error}"
+            return
+        try:
+            if record.protective_order_id:
+                self.orders.cancel(record.protective_order_id)
+        except Exception:
+            logger.exception("Failed to cancel protective stop %s while force-exiting %s", record.protective_order_id, record.symbol)
+        multiplier = 1 if record.side == "BUY" else -1
+        pnl = multiplier * (price - record.entry_price) * record.quantity
+        self.repository.save_trade(
+            TradeRecord(
+                symbol=record.symbol,
+                entry_time=record.entry_time,
+                exit_time=timestamp,
+                entry_price=record.entry_price,
+                exit_price=price,
+                quantity=record.quantity,
+                pnl=pnl,
+                side=record.side,
+                position_type="INTRADAY",
+                strategy_name=record.strategy_name,
+                exit_reason=reason,
+            )
+        )
+        self.repository.delete_position(record.symbol)
+        self.positions.pop(record.symbol, None)
+        self.repository.save_activity(
+            ActivityRecord(
+                event_kind="force_exit",
+                symbol=record.symbol,
+                timestamp=timestamp,
+                mode="LIVE",
+                price=price,
+                order_id=record.protective_order_id,
+                side=exit_side.value,
+                quantity=record.quantity,
+                entry_price=record.entry_price,
+                stop_loss=record.stop_loss,
+                pnl=pnl,
+                reason=reason,
+            )
+        )
+        logger.info("force_exit %s side=%s price=%.2f pnl=%.2f", record.symbol, exit_side.value, price, pnl)
+        self.notifier.send(f"{reason}: {record.symbol} closed at {price:.2f}, pnl={pnl:.2f}")
+        self._log_decision(record, event_type="exit", decision="FORCE_CLOSE", rationale=reason, outputs={"exit_price": price, "pnl": pnl})
+        self.repository.link_decision_outcome(self._correlation_id(record), {"exit_price": price, "pnl": pnl, "exit_reason": reason})
 
     def _reconcile_intraday_positions(self, positions: list[AgentPosition], timestamp: datetime) -> None:
         """Detect an intraday position that closed at the broker -- a protective SL-M fill, a
@@ -388,10 +527,9 @@ class TrailingStopAgent:
         if broker_quantity != 0:
             self._reconcile_entry_price(position, broker_position)
             return
-        exit_price = self._broker_exit_fill_price(record)
+        exit_price, reason = self._broker_exit_fill(record)
         multiplier = 1 if record.side == "BUY" else -1
         pnl = multiplier * (exit_price - record.entry_price) * record.quantity
-        reason = "broker-side position closed; detected by the standalone trailing-stop agent"
         self.repository.save_trade(
             TradeRecord(
                 symbol=record.symbol,
@@ -428,6 +566,15 @@ class TrailingStopAgent:
         )
         logger.info("broker_exit_detected %s side=%s price=%.2f pnl=%.2f", record.symbol, exit_side, exit_price, pnl)
         self.notifier.send(f"broker_exit_detected {record.symbol} side={exit_side} price={exit_price:.2f} pnl={pnl:.2f} reason={reason}")
+        self._log_decision(
+            record,
+            event_type="exit",
+            decision="EXIT",
+            rationale=reason,
+            inputs={"exit_side": exit_side},
+            outputs={"exit_price": exit_price, "pnl": pnl},
+        )
+        self.repository.link_decision_outcome(self._correlation_id(record), {"exit_price": exit_price, "pnl": pnl, "exit_reason": reason})
 
     def _reconcile_entry_price(self, position: AgentPosition, broker_position: dict) -> None:
         """Correct a persisted position's entry price to match Zerodha's own average price.
@@ -539,7 +686,8 @@ class TrailingStopAgent:
                 if self._protective_stop_needs_rearm(record.protective_order_id):
                     self._rearm_protective_stop(position)
                 continue
-            exit_price = self._broker_exit_fill_price(record)
+            exit_price, exit_reason = self._broker_exit_fill(record)
+            pnl = (exit_price - record.entry_price) * record.quantity
             self.repository.save_trade(
                 TradeRecord(
                     symbol=record.symbol,
@@ -548,15 +696,23 @@ class TrailingStopAgent:
                     entry_price=record.entry_price,
                     exit_price=exit_price,
                     quantity=record.quantity,
-                    pnl=(exit_price - record.entry_price) * record.quantity,
+                    pnl=pnl,
                     side=record.side,
                     position_type="SWING",
                     strategy_name=record.strategy_name,
-                    exit_reason="broker-side position closed (protective stop or manual exit)",
+                    exit_reason=exit_reason,
                 )
             )
             self.repository.delete_position(record.symbol)
             self.positions.pop(record.symbol, None)
+            self._log_decision(
+                record,
+                event_type="exit",
+                decision="EXIT",
+                rationale=exit_reason,
+                outputs={"exit_price": exit_price, "pnl": pnl},
+            )
+            self.repository.link_decision_outcome(self._correlation_id(record), {"exit_price": exit_price, "pnl": pnl, "exit_reason": exit_reason})
 
     def _broker_held_tradingsymbols(self) -> set[str] | None:
         """Tradingsymbols Zerodha's kite.holdings() still shows as genuinely owned.
@@ -585,7 +741,19 @@ class TrailingStopAgent:
                 held.add(str(entry.get("tradingsymbol", "")).strip().upper())
         return held
 
-    def _broker_exit_fill_price(self, record: PositionRecord) -> float:
+    def _broker_exit_fill(self, record: PositionRecord) -> tuple[float, str]:
+        """Find the real fill price for a position discovered closed at the broker, and a
+        plain-language reason for the P&L page -- checked in order of confidence:
+
+        1. The tracked protective SL-M itself shows a completed fill -> a genuine stop-loss hit.
+        2. A different completed order for the same tradingsymbol today (the confirmed cause of
+           a real incident: the position was closed manually at Zerodha, not via the tracked
+           SL-M, so its order_history never shows a fill) -> found by scanning today's order
+           book for the exit side, excluding the tracked order id.
+        3. Neither is found -> fall back to the last recorded stop price, but say so plainly
+           rather than silently presenting a stale price as the real exit (that silence is
+           exactly what previously made the P&L page show a wrong, unsynced number).
+        """
         order_id = record.protective_order_id
         if order_id and self.broker_client is not None and hasattr(self.broker_client, "order_history"):
             try:
@@ -599,8 +767,31 @@ class TrailingStopAgent:
                 except (TypeError, ValueError):
                     average_price = 0
                 if status in {"COMPLETE", "COMPLETED", "FILLED"} and average_price > 0:
-                    return average_price
-        return record.stop_loss
+                    return average_price, "Closed due to stop-loss hit (SL-M filled at the broker)"
+        if self.broker_client is not None and hasattr(self.broker_client, "orders"):
+            tradingsymbol = self._tradingsymbol(record.symbol)
+            exit_side = "SELL" if record.side == "BUY" else "BUY"
+            try:
+                todays_orders = self.broker_client.orders() or []
+            except Exception:
+                todays_orders = []
+            candidates = [
+                order
+                for order in todays_orders
+                if str(order.get("tradingsymbol", "")).strip().upper() == tradingsymbol
+                and str(order.get("order_id")) != str(order_id)
+                and str(order.get("transaction_type", "")).upper() == exit_side
+                and str(order.get("status", "")).upper() in {"COMPLETE", "COMPLETED", "FILLED"}
+            ]
+            if candidates:
+                latest = max(candidates, key=lambda order: str(order.get("order_timestamp", "")))
+                try:
+                    average_price = float(latest.get("average_price", 0) or 0)
+                except (TypeError, ValueError):
+                    average_price = 0
+                if average_price > 0:
+                    return average_price, "Closed at broker (a different order than the tracked SL-M -- likely a manual square-off)"
+        return record.stop_loss, "Closed at broker; exact fill price unavailable, using the last recorded stop as an estimate"
 
     def _protective_stop_needs_rearm(self, order_id: str | None) -> bool:
         """True if the protective stop needs a fresh order placed today.
@@ -678,16 +869,18 @@ class TrailingStopAgent:
         reference_price = float(frame.iloc[-1]["close"])
         atr_multiplier = record.atr_multiplier or 2.0
         if record.strategy_name == "SWING_TREND_BREAKOUT":
-            candidate = compute_trend_breakout_stop(frame, tick_size)
+            result = compute_trend_breakout_stop(frame, tick_size)
         else:
-            candidate = compute_ema_swing_stop(frame, self.atr_period, atr_multiplier, reference_price, tick_size)
-        if candidate is None:
+            result = compute_ema_swing_stop(frame, self.atr_period, atr_multiplier, reference_price, tick_size)
+        if result is None:
             return
-        self._maybe_apply(position, candidate, reference_price)
+        candidate, calc_detail = result
+        calculation = f"trailing stop moved from ₹{record.stop_loss:.2f} to ₹{candidate:.2f} - Calc: {calc_detail}"
+        self._maybe_apply(position, candidate, reference_price, calculation)
 
     # -- shared apply/persist/notify path --------------------------------------
 
-    def _maybe_apply(self, position: AgentPosition, candidate_stop: float, reference_price: float) -> None:
+    def _maybe_apply(self, position: AgentPosition, candidate_stop: float, reference_price: float, calculation: str) -> None:
         if candidate_stop is None or candidate_stop <= 0:
             return
         with position.lock:
@@ -698,14 +891,16 @@ class TrailingStopAgent:
             else:
                 if candidate_stop >= record.stop_loss or candidate_stop <= reference_price:
                     return
-            self._apply_candidate_stop(position, candidate_stop, reference_price)
+            self._apply_candidate_stop(position, candidate_stop, reference_price, calculation)
 
-    def _apply_candidate_stop(self, position: AgentPosition, candidate_stop: float, reference_price: float) -> None:
+    def _apply_candidate_stop(self, position: AgentPosition, candidate_stop: float, reference_price: float, calculation: str) -> None:
         record = position.record
         exit_side = Side.SELL if record.side == "BUY" else Side.BUY
         product = "CNC" if record.position_type == "SWING" else "MIS"
         request = OrderRequest(record.symbol, exit_side, record.quantity, reference_price, candidate_stop, product, self._exchange(record.symbol))
         error_message = self._modify_with_retry(record.protective_order_id or "", request)
+        if error_message and self._is_modification_limit_error(error_message):
+            error_message = self._replace_protective_stop(position, request)
         if error_message:
             # Previously swallowed entirely (only logged to a file + a Telegram notifier
             # message no one necessarily has configured) -- so the dashboard's own "Trailing-stop
@@ -717,7 +912,15 @@ class TrailingStopAgent:
                 self._swing_broker_error = friendly
             else:
                 self._intraday_broker_error = friendly
+            self._log_decision(
+                record,
+                event_type="stop_trailed",
+                decision="TRAIL_STOP_FAILED",
+                rationale=f"{calculation} -- but the broker rejected the update: {error_message}",
+                inputs={"reference_price": reference_price, "attempted_stop": candidate_stop},
+            )
             return
+        record = position.record  # _replace_protective_stop may have swapped in a fresh order id
         self.repository.update_stop_price(record.symbol, candidate_stop)
         previous_stop = record.stop_loss
         position.record = replace(record, stop_loss=candidate_stop)
@@ -734,10 +937,19 @@ class TrailingStopAgent:
                 quantity=record.quantity,
                 entry_price=record.entry_price,
                 stop_loss=candidate_stop,
-                reason=f"trailing stop moved from {previous_stop:.2f} to {candidate_stop:.2f}",
+                reason=calculation,
+                previous_stop=previous_stop,
             )
         )
         self.notifier.send(f"Trailing stop moved: {record.symbol} -> {candidate_stop:.2f}")
+        self._log_decision(
+            record,
+            event_type="stop_trailed",
+            decision="TRAIL_STOP",
+            rationale=calculation,
+            inputs={"reference_price": reference_price, "previous_stop": previous_stop},
+            outputs={"new_stop": candidate_stop},
+        )
 
     def _modify_with_retry(self, order_id: str, request: OrderRequest) -> str:
         """Returns an empty string on success, otherwise a human-readable failure reason."""
@@ -753,8 +965,54 @@ class TrailingStopAgent:
             except Exception as error:
                 last_error = error
                 logger.warning("modify_protective_stop failed for %s (attempt %s/%s): %s", request.symbol, attempt + 1, attempts, error)
+                if self._is_modification_limit_error(error):
+                    # Every further attempt on this same order_id fails identically -- the cap
+                    # is per-order, not transient -- so retrying here only burns the backoff
+                    # window before _apply_candidate_stop falls back to replacing the order.
+                    break
                 if attempt < attempts - 1:
                     sleep(min(self.modify_retry_backoff_seconds * (2**attempt), 5))
-        logger.error("modify_protective_stop permanently failed for %s: %s", request.symbol, last_error)
-        self.notifier.send(f"critical_unprotected: could not trail stop for {request.symbol}: {last_error}")
+        if not self._is_modification_limit_error(last_error):
+            logger.error("modify_protective_stop permanently failed for %s: %s", request.symbol, last_error)
+            self.notifier.send(f"critical_unprotected: could not trail stop for {request.symbol}: {last_error}")
         return str(last_error) or "unknown error"
+
+    @staticmethod
+    def _is_modification_limit_error(error: Exception | str | None) -> bool:
+        return MODIFICATION_LIMIT_ERROR_TEXT in str(error).lower()
+
+    def _replace_protective_stop(self, position: AgentPosition, request: OrderRequest) -> str:
+        """Cancel the current protective SL-M and place a fresh one in its place.
+
+        Called only once Zerodha's per-order modification cap (25) has been hit -- there's no
+        API to reset that count on the existing order, but a brand-new order id starts back at
+        zero. Cancels first (rather than placing the replacement first) so the stale-priced
+        order can never sit resting alongside the new one and fill at the wrong level.
+        """
+        record = position.record
+        old_order_id = record.protective_order_id
+        try:
+            if old_order_id:
+                self.orders.cancel(old_order_id)
+        except Exception:
+            logger.exception("Failed to cancel modification-capped protective stop %s for %s", old_order_id, record.symbol)
+        try:
+            new_order_id = self.orders.place_protective_stop(request)
+        except Exception as error:
+            logger.error("Failed to place a replacement protective stop for %s after hitting the modification cap: %s", record.symbol, error)
+            self.notifier.send(f"critical_unprotected: could not replace the modification-capped stop for {record.symbol}: {error}")
+            return str(error) or "unknown error"
+        updated = replace(record, protective_order_id=new_order_id)
+        self.repository.save_position(updated)
+        position.record = updated
+        logger.info("Replaced modification-capped protective stop for %s with fresh order %s", record.symbol, new_order_id)
+        self.notifier.send(f"{record.symbol}: replaced its protective stop with a fresh order after hitting Zerodha's 25-modification cap")
+        self._log_decision(
+            updated,
+            event_type="protective_stop_replaced",
+            decision="REPLACE_ORDER",
+            rationale=f"Order {old_order_id} hit Zerodha's 25-modification cap; cancelled it and placed fresh order {new_order_id} at the same trigger price to keep trailing.",
+            inputs={"old_order_id": old_order_id, "trigger_price": request.stop_loss},
+            outputs={"new_order_id": new_order_id},
+        )
+        return ""

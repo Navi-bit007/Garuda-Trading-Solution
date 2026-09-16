@@ -72,6 +72,7 @@ from app.execution.trading_pipeline import TradingPipeline
 from app.strategy.atr_momentum import AtrMomentumStrategy
 from app.strategy.ema_200_close import Ema200CloseStrategy
 from app.strategy.ema_9_200_swing import Ema9200SwingStrategy
+from app.strategy.ema_9_200_progressive import Ema9200ProgressiveStrategy
 from app.strategy.swing_trend_breakout import SwingTrendBreakoutStrategy
 from app.strategy.ema_trend import EmaTrendStrategy
 from app.strategy.high_conviction_long import HighConvictionLongStrategy
@@ -91,8 +92,10 @@ from app.strategy.preset_builder import (
 from app.strategy.signal import Signal
 from app.strategy.vwap_momentum import VwapMomentumStrategy
 from app.strategy.vwap_ema_breakout import MarketRegimeContext, TimeframeConfirmation, VwapEmaBreakoutStrategy
+from app.market.backtest_data import KiteHistoricalDataLoader
 from backtest.engine import BacktestEngine
 from backtest.metrics import calculate_metrics
+from backtest.runner import run_strategy_backtest
 
 
 EDITABLE_SETTINGS = (
@@ -208,6 +211,19 @@ PRE_SPIKE_LIVE_LABEL = "Pre-Spike Momentum"
 PREVIOUS_DAY_HIGH_LABEL = "Previous day high breakout"
 EMA_200_CLOSE_LIVE_LABEL = "EMA 200 close-above"
 HIGH_CONVICTION_LIVE_LABEL = "High-conviction long"
+BACKTEST_PROGRESSIVE_LABEL = "EMA 9/200 progressive"
+BACKTEST_SWING_TREND_LABEL = "Trend breakout (next-session confirmation)"
+BACKTEST_STRATEGY_LABELS = [
+    BACKTEST_PROGRESSIVE_LABEL,
+    PRE_SPIKE_LIVE_LABEL,
+    PREVIOUS_DAY_HIGH_LABEL,
+    EMA_200_CLOSE_LIVE_LABEL,
+    HIGH_CONVICTION_LIVE_LABEL,
+    CURRENT_STRATEGY_LABEL,
+    EMA_ONLY_STRATEGY_LABEL,
+    "EMA 9/200 swing",
+    BACKTEST_SWING_TREND_LABEL,
+]
 DAILY_SCAN_STRATEGIES = {
     "EMA 9/200 swing": Ema9200SwingStrategy,
     "EMA 200 close-above": Ema200CloseStrategy,
@@ -223,6 +239,7 @@ WORKSPACE_PAGES = [
     "P&L statement",
     "Watchlists",
     "Scanner & signals",
+    "Backtesting",
     "Swing auto trading",
     "Intratrading",
     "Risk & settings",
@@ -234,6 +251,7 @@ SIDEBAR_PAGE_ICONS = {
     "P&L statement": "receipt_long",
     "Watchlists": "list_alt",
     "Scanner & signals": "radar",
+    "Backtesting": "history",
     "Swing auto trading": "trending_up",
     "Intratrading": "bolt",
     "Risk & settings": "settings",
@@ -298,6 +316,28 @@ def build_dashboard_strategy(repository: Repository, selected_label: str, pre_sp
     if preset.strategy_type == EMA_ONLY_STRATEGY_TYPE:
         return build_ema_preset_strategy(preset.name, preset.parameters)
     return build_preset_strategy(preset.name, preset.parameters)
+
+
+def build_backtest_strategy(selected_label: str, interval: str):
+    if selected_label == BACKTEST_PROGRESSIVE_LABEL:
+        return Ema9200ProgressiveStrategy(timeframe=interval)
+    if selected_label == PRE_SPIKE_LIVE_LABEL:
+        return PreSpikeMomentumStrategy(timeframe=interval)
+    if selected_label == PREVIOUS_DAY_HIGH_LABEL:
+        return PreviousDayHighBreakoutStrategy()
+    if selected_label == EMA_200_CLOSE_LIVE_LABEL:
+        return Ema200CloseStrategy()
+    if selected_label == HIGH_CONVICTION_LIVE_LABEL:
+        return HighConvictionLongStrategy()
+    if selected_label == CURRENT_STRATEGY_LABEL:
+        return current_strategy()
+    if selected_label == EMA_ONLY_STRATEGY_LABEL:
+        return EmaTrendStrategy(**EMA_ONLY_DEFAULT_PARAMETERS)
+    if selected_label == "EMA 9/200 swing":
+        return Ema9200SwingStrategy()
+    if selected_label == BACKTEST_SWING_TREND_LABEL:
+        return SwingTrendBreakoutStrategy()
+    raise ValueError(f"unsupported backtest strategy: {selected_label}")
 
 
 def build_live_signal_strategy(selected_label: str, timeframe: str, pre_spike_config: PreSpikeMomentumConfig | None = None):
@@ -3348,6 +3388,189 @@ def render_swing_auto_trading(st, settings) -> None:
     render_swing_content()
 
 
+def render_backtesting(st, settings) -> None:
+    st.title("Backtesting")
+    st.caption("Replay Kite historical candles against the same research strategies used by Scanner & signals, Intratrading, and Swing auto trading.")
+    st.warning("Backtest results are historical simulations, not guarantees of future performance. This page never submits orders or changes live positions.", icon=":material/science:")
+
+    access_token = runtime_access_token(st, settings)
+    if not broker_credentials_configured(settings) or not access_token:
+        st.info("Authenticate with Kite before running a backtest.", icon=":material/key:")
+        return
+
+    repository = get_dashboard_repository(st)
+    selected_symbols = selected_watchlist_symbols(repository, dashboard_user_id(settings))
+    if not selected_symbols:
+        st.info("Select at least one watchlist on the Watchlists page before running a backtest.", icon=":material/list_alt:")
+        return
+
+    scope = st.radio("Run scope", ["One symbol", "Selected watchlists"], horizontal=True, key="backtest_scope")
+    if scope == "One symbol":
+        symbol = st.selectbox("Symbol", list(selected_symbols), key="backtest_symbol")
+        run_symbols = {symbol: selected_symbols[symbol]}
+    else:
+        run_symbols = selected_symbols
+        st.caption(f"{len(run_symbols)} unique instruments from the selected watchlists")
+
+    strategy_label = st.selectbox("Strategy", BACKTEST_STRATEGY_LABELS, key="backtest_strategy")
+    daily_default = strategy_label in {"EMA 9/200 swing", BACKTEST_SWING_TREND_LABEL}
+    timeframe = st.selectbox(
+        "Timeframe",
+        ["Daily", "5-minute"],
+        index=0 if daily_default else 1,
+        key="backtest_timeframe",
+    )
+    interval = "day" if timeframe == "Daily" else "5minute"
+
+    date_column, capital_column, sizing_column = st.columns(3)
+    with date_column:
+        default_start = date.today() - timedelta(days=90 if interval == "5minute" else 730)
+        selected_dates = st.date_input(
+            "Historical date range",
+            value=(default_start, date.today()),
+            key="backtest_dates",
+        )
+    with capital_column:
+        initial_capital = st.number_input("Initial capital", min_value=1.0, value=100_000.0, step=10_000.0, key="backtest_initial_capital")
+    with sizing_column:
+        sizing_mode = st.selectbox("Sizing", ["Fixed quantity", "Capital per position"], key="backtest_sizing_mode")
+    quantity_column, position_column, fee_column, slippage_column = st.columns(4)
+    with quantity_column:
+        fixed_quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key="backtest_quantity")
+    with position_column:
+        capital_per_position = st.number_input("Capital per position", min_value=1.0, value=10_000.0, step=1_000.0, key="backtest_capital_position")
+    with fee_column:
+        fee_rate = st.number_input("Fee rate", min_value=0.0, value=0.0003, step=0.0001, format="%.4f", key="backtest_fee_rate")
+    with slippage_column:
+        slippage_rate = st.number_input("Slippage rate", min_value=0.0, value=0.0005, step=0.0001, format="%.4f", key="backtest_slippage_rate")
+
+    if not isinstance(selected_dates, (tuple, list)) or len(selected_dates) != 2:
+        st.info("Select both a start and end date.")
+        return
+    start_date, end_date = selected_dates
+    if start_date > end_date:
+        st.error("The historical start date must be on or before the end date.")
+        return
+
+    try:
+        strategy = build_backtest_strategy(strategy_label, interval)
+    except ValueError as error:
+        st.error(str(error))
+        return
+
+    st.caption(f"Kite interval: {interval} · warm-up: {getattr(strategy, 'warmup_period', 'stateful')} completed candles · one position per symbol")
+    if strategy_label == BACKTEST_PROGRESSIVE_LABEL:
+        st.info("Progressive replay enters only on STRONG alignment. LIGHT events are lifecycle context; EMA9 <= EMA200 invalidates an open cycle.", icon=":material/timeline:")
+
+    if st.button("Run backtest", type="primary", icon=":material/play_arrow:", width="stretch"):
+        try:
+            client = connect_kite(settings, access_token)
+            market_data = MarketData(client.client)
+            loader = KiteHistoricalDataLoader(market_data)
+            st.session_state.backtest_loader = loader
+            start_timestamp = datetime.combine(start_date, datetime_time.min)
+            end_timestamp = datetime.combine(end_date, datetime_time.max)
+            progress = st.progress(0.0, text=f"Fetching 0/{len(run_symbols)} symbols")
+            all_trades = []
+            errors: list[str] = []
+            symbol_metrics: dict[str, dict] = {}
+            for completed, (run_symbol, instrument_token) in enumerate(run_symbols.items(), start=1):
+                try:
+                    candles = loader.load(int(instrument_token), start_timestamp, end_timestamp, interval)
+                    if candles.empty:
+                        raise ValueError("Kite returned no historical candles for the selected range")
+                    if sizing_mode == "Fixed quantity":
+                        run_quantity = int(fixed_quantity)
+                    else:
+                        run_quantity = max(1, int(float(capital_per_position) // float(candles["close"].iloc[0])))
+                    symbol_trades = run_strategy_backtest(
+                        run_symbol,
+                        candles,
+                        strategy,
+                        quantity=run_quantity,
+                        fee_rate=float(fee_rate),
+                        slippage_rate=float(slippage_rate),
+                    )
+                    all_trades.extend(symbol_trades)
+                    symbol_metrics[run_symbol] = calculate_metrics(symbol_trades)
+                except Exception as error:
+                    errors.append(f"{run_symbol}: {error}")
+                progress.progress(completed / len(run_symbols), text=f"Processed {completed}/{len(run_symbols)} symbols")
+            progress.empty()
+            all_trades.sort(key=lambda trade: (pd.Timestamp(trade.exit_time), trade.symbol))
+            st.session_state.backtest_result = {
+                "trades": all_trades,
+                "metrics": calculate_metrics(all_trades),
+                "symbol_metrics": symbol_metrics,
+                "errors": errors,
+                "parameters": {
+                    "strategy": strategy_label,
+                    "interval": interval,
+                    "start": start_date.isoformat(),
+                    "end": end_date.isoformat(),
+                    "initial_capital": float(initial_capital),
+                    "fee_rate": float(fee_rate),
+                    "slippage_rate": float(slippage_rate),
+                },
+            }
+        except (OSError, RuntimeError, ValueError) as error:
+            st.error(f"Backtest could not start: {error}")
+
+    result = st.session_state.get("backtest_result")
+    if not result:
+        st.caption("Run a Kite-backed historical replay to see results here.")
+        return
+    metrics = result["metrics"]
+    metric_columns = st.columns(5)
+    metric_columns[0].metric("Trades", int(metrics["trades"]))
+    metric_columns[1].metric("Net P&L", f"₹{metrics['net_pnl']:,.2f}")
+    metric_columns[2].metric("Win rate", f"{metrics['win_rate']:.1%}")
+    metric_columns[3].metric("Profit factor", "∞" if metrics["profit_factor"] == float("inf") else f"{metrics['profit_factor']:.2f}")
+    metric_columns[4].metric("Max drawdown", f"₹{metrics['max_drawdown']:,.2f}")
+    st.caption(" · ".join(f"{key}: {value}" for key, value in result["parameters"].items()))
+
+    if result["errors"]:
+        st.warning("Some symbols could not be backtested: " + " · ".join(result["errors"][:10]))
+    if result["symbol_metrics"]:
+        symbol_table = pd.DataFrame.from_dict(result["symbol_metrics"], orient="index").reset_index(names="Symbol")
+        st.subheader("Per-symbol results")
+        st.dataframe(symbol_table, width="stretch", hide_index=True)
+
+    trades = result["trades"]
+    if not trades:
+        st.info("No trades were generated for the selected strategy and historical range.")
+        return
+    trade_table = pd.DataFrame(
+        [
+            {
+                "Symbol": trade.symbol,
+                "Entry time": trade.entry_time,
+                "Exit time": trade.exit_time,
+                "Side": trade.side.value,
+                "Quantity": trade.quantity,
+                "Entry": trade.entry_price,
+                "Exit": trade.exit_price,
+                "P&L": trade.pnl,
+                "Exit reason": trade.exit_reason,
+                "Target 1 hit": trade.target_1_hit,
+            }
+            for trade in trades
+        ]
+    )
+    equity = trade_table["P&L"].cumsum() + float(result["parameters"]["initial_capital"])
+    st.subheader("Equity curve")
+    st.line_chart(pd.DataFrame({"Equity": equity.to_numpy()}))
+    st.subheader("Trades")
+    st.dataframe(trade_table, width="stretch", hide_index=True)
+    st.download_button(
+        "Download trades",
+        data=trade_table.to_csv(index=False).encode("utf-8"),
+        file_name="kite-backtest-trades.csv",
+        mime="text/csv",
+        icon=":material/download:",
+    )
+
+
 def render_historical_day_scan_section(st, settings) -> None:
     st.caption("Choose a watchlist, strategy, and completed date to evaluate every stock using only daily candles available through that date.")
     repository = get_dashboard_repository(st)
@@ -4718,6 +4941,8 @@ def main() -> None:
             render_watchlists(st, settings)
         elif page == "Scanner & signals":
             render_signal_feed(st, settings)
+        elif page == "Backtesting":
+            render_backtesting(st, settings)
         elif page == "Swing auto trading":
             render_swing_auto_trading(st, settings)
         elif page == "Intratrading":

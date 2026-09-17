@@ -46,7 +46,7 @@ from app.database.models import ActivityRecord, DynamicWatchlistRecord, Notifica
 from app.database.repository import Repository
 from app.execution.position_manager import Position, PositionManager
 from app.execution.reconciliation import reconcile
-from app.execution.agent_launcher import agent_heartbeat_is_fresh, launch_trailing_stop_agent, maybe_autostart_trailing_agent, stop_trailing_stop_agent
+from app.execution.agent_launcher import agent_heartbeat_is_fresh, launch_trailing_stop_agent, maybe_autostart_trailing_agent, stop_trailing_stop_agent, trailing_agent_env_from_settings
 from app.execution.swing_auto_trader import SwingAutoTrader, SwingOrderResult, SwingScanResult
 from app.market.candles import validate_ohlcv
 from app.market.indicators import atr as compute_atr
@@ -109,6 +109,7 @@ EDITABLE_SETTINGS = (
     "entry_end",
     "force_exit",
     "trailing_atr_multiplier",
+    "min_stop_improvement_pct",
     "swing_capital_limit",
     "swing_quantity_limit",
     "swing_trailing_atr_multiplier",
@@ -637,6 +638,51 @@ def runtime_access_token(st, settings) -> str:
         st.session_state.kite_access_token = persisted_token.strip()
         return persisted_token.strip()
     return settings.kite_access_token.get_secret_value().strip()
+
+
+KITE_TOKEN_VALIDATION_CACHE_SECONDS = 60
+
+
+def verified_kite_access_token(st, settings) -> str:
+    """Like runtime_access_token, but actively confirms the token still works at Zerodha before
+    trusting it, instead of only checking that a token string is stored.
+
+    Kite invalidates every access token once a trading day, with no refresh grant -- a token
+    persisted from yesterday is worthless today, but `runtime_access_token` alone can't tell the
+    difference, so the app used to keep declaring "Kite authenticated" the next morning right up
+    until some other page's broker call failed. Cached per token for
+    KITE_TOKEN_VALIDATION_CACHE_SECONDS so this doesn't cost an API call on every rerun.
+
+    Only Kite's own `TokenException` (a real "this token is dead" answer from the broker) is
+    treated as invalid; any other error (a network blip, Kite being briefly unreachable) leaves
+    the cached result untouched and the token is trusted as-is -- otherwise a transient failure
+    here would force everyone into a false "please sign in again" on every hiccup.
+    """
+    token = runtime_access_token(st, settings)
+    if not token or not broker_credentials_configured(settings):
+        return token
+    cache_key = f"kite_token_verified::{token}"
+    cached = st.session_state.get(cache_key)
+    now = datetime.now()
+    if cached is not None and (now - cached["checked_at"]).total_seconds() < KITE_TOKEN_VALIDATION_CACHE_SECONDS:
+        return token if cached["valid"] else ""
+    try:
+        from kiteconnect.exceptions import TokenException
+    except ImportError:
+        return token
+    try:
+        connect_kite(settings, token).client.profile()
+    except TokenException:
+        st.session_state[cache_key] = {"checked_at": now, "valid": False}
+        repository = get_dashboard_repository(st)
+        st.session_state.pop("kite_access_token", None)
+        repository.clear_kite_access_token(dashboard_user_id(settings))
+        st.session_state.kite_session_expired_notice = True
+        return ""
+    except Exception:
+        return token
+    st.session_state[cache_key] = {"checked_at": now, "valid": True}
+    return token
 
 
 def log_out_of_kite(st, repository=None, user_id: str = "") -> None:
@@ -1447,7 +1493,13 @@ def render_live_monitor(st, settings) -> None:
                 access_token = runtime_access_token(st, settings)
                 start_disabled = not broker_credentials_configured(settings) or not access_token
                 if st.button("Start agent now", icon=":material/play_arrow:", disabled=start_disabled, width="stretch"):
-                    launch_trailing_stop_agent(settings.kite_api_key, settings.kite_api_secret.get_secret_value(), access_token, repository)
+                    launch_trailing_stop_agent(
+                        settings.kite_api_key,
+                        settings.kite_api_secret.get_secret_value(),
+                        access_token,
+                        repository,
+                        extra_env=trailing_agent_env_from_settings(settings),
+                    )
                     st.rerun()
 
         records = [record for record in repository.load_positions() if record.trading_mode == "LIVE"]
@@ -1456,16 +1508,22 @@ def render_live_monitor(st, settings) -> None:
             return
 
         activity = load_activity()[2]
+        # "stop_trailed" is an ATR/EMA-driven move; "stop_rearmed" is a same-price re-placement
+        # after Zerodha's overnight day-order expiry -- both are broker-side changes to the
+        # resting SL-M and belong in the same history, or a freshly re-armed order (a new
+        # order id at the broker, confirmed by "Broker status") would show no explanation at all.
+        stop_update_kinds = ["stop_trailed", "stop_rearmed"]
         stop_trail_events = pd.DataFrame(columns=["timestamp", "symbol", "reason", "stop_loss", "previous_stop"])
         if not activity.empty:
             stop_trail_events = activity.loc[
-                activity["event_kind"] == "stop_trailed", ["timestamp", "symbol", "reason", "stop_loss", "previous_stop"]
+                activity["event_kind"].isin(stop_update_kinds), ["timestamp", "symbol", "reason", "stop_loss", "previous_stop"]
             ].copy()
             stop_trail_events["timestamp"] = pd.to_datetime(stop_trail_events["timestamp"], errors="coerce")
         stop_trail_counts = stop_trail_events["symbol"].value_counts().to_dict() if not stop_trail_events.empty else {}
         # st.dataframe has no per-cell hover tooltip -- column_config "help" is one static string
         # for the whole column -- so instead of a hover, show the latest move's from/to prices
-        # directly as a column: the most recent "stop_trailed" activity row per symbol.
+        # directly as a column: the most recent stop-price-moving activity row per symbol (a
+        # re-arm never changes the price, so it's naturally skipped below via previous_stop).
         latest_stop_move: dict[str, str] = {}
         if not stop_trail_events.empty:
             for _, event_row in stop_trail_events.sort_values("timestamp").iterrows():
@@ -1571,7 +1629,7 @@ def render_live_monitor(st, settings) -> None:
             "P&L %": st.column_config.NumberColumn(format="%.2f%%", help="P&L as a percentage of entry price x quantity: (Last - Entry) / Entry x 100, signed for the trade's side."),
             "Target 1": st.column_config.NumberColumn(format="₹%.2f", help="The price that triggers the target-1 action (move stop to breakeven, or close the position, depending on strategy). Blank means the strategy didn't set one."),
             "Stop updates": st.column_config.NumberColumn(
-                help="How many times the trailing-stop agent has moved this position's SL-M since entry. Select the row to filter 'Recent stop-loss updates' below to just this symbol."
+                help="How many times the trailing-stop agent has moved or re-armed this position's SL-M since entry. Select the row to filter 'Recent stop-loss updates' below to just this symbol."
             ),
             "Last stop move": st.column_config.TextColumn(help="The most recent trailing-stop move for this position (old price → new price)."),
             "Entered": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
@@ -1626,7 +1684,12 @@ def render_live_monitor(st, settings) -> None:
                 selected_updates = recent_updates
                 updates_title = f"Recent stop-loss updates ({len(recent_updates)})"
             with st.expander(updates_title, expanded=bool(selected_stop_symbol)):
-                st.caption("Every SL-M move the trailing-stop agent has made, most recent first. From and To are the broker trigger prices; Calculation details is the exact trailing-stop math that produced the new stop.")
+                st.caption(
+                    "Every SL-M change the trailing-stop agent has made at the broker, most recent first -- including a "
+                    "same-price re-arm after Zerodha's overnight day-order expiry, not just an actual trailing move. From "
+                    "and To are the broker trigger prices (equal for a re-arm, since the level itself didn't change); "
+                    "Calculation details is the exact trailing-stop math for a move, or the re-arm's reason otherwise."
+                )
                 detail_rows = selected_updates.copy()
                 # Rows logged before the calculation-detail upgrade have no previous_stop and
                 # phrase "reason" as "trailing stop moved from X to Y" instead of a formula --
@@ -1715,7 +1778,6 @@ def render_pnl_statement(st, settings) -> None:
                     "P&L %": _pnl_pct(pnl, record.entry_price, record.quantity),
                     "SL Current Price": record.stop_loss,
                     "Used Strategy Name": record.strategy_name or "-",
-                    "Exit reason": "-",
                     "Entered": record.entry_time,
                     "Exited": None,
                     "Activity time": record.entry_time,
@@ -1735,7 +1797,6 @@ def render_pnl_statement(st, settings) -> None:
                     "P&L %": _pnl_pct(trade.pnl, trade.entry_price, trade.quantity),
                     "SL Current Price": None,
                     "Used Strategy Name": trade.strategy_name or "-",
-                    "Exit reason": trade.exit_reason or "-",
                     "Entered": trade.entry_time,
                     "Exited": trade.exit_time,
                     "Activity time": trade.exit_time,
@@ -1913,12 +1974,18 @@ def render_kite_authentication(st, settings) -> None:
     st.title("Kite authentication")
     if notice := st.session_state.pop("kite_auth_notice", ""):
         st.success(notice, icon=":material/check_circle:")
+    if st.session_state.pop("kite_session_expired_notice", False):
+        st.warning(
+            "Your Kite session expired -- Zerodha invalidates access tokens daily with no refresh, "
+            "so a fresh sign-in is required. Please log in again below.",
+            icon=":material/schedule:",
+        )
 
     if not broker_credentials_configured(settings):
         st.info("Add KITE_API_KEY and KITE_API_SECRET to .env before starting Kite login.", icon=":material/key:")
         return
 
-    runtime_token = runtime_access_token(st, settings)
+    runtime_token = verified_kite_access_token(st, settings)
     repository = get_dashboard_repository(st)
     user_id = dashboard_user_id(settings)
     auto_start_enabled = render_trailing_agent_auto_start_toggle(st, repository, user_id)
@@ -1947,7 +2014,13 @@ def render_kite_authentication(st, settings) -> None:
                     st.rerun()
             else:
                 if st.button("Start agent now", icon=":material/play_arrow:", width="stretch"):
-                    launch_trailing_stop_agent(settings.kite_api_key, settings.kite_api_secret.get_secret_value(), runtime_token, repository)
+                    launch_trailing_stop_agent(
+                        settings.kite_api_key,
+                        settings.kite_api_secret.get_secret_value(),
+                        runtime_token,
+                        repository,
+                        extra_env=trailing_agent_env_from_settings(settings),
+                    )
                     st.rerun()
         if st.button("Log out", icon=":material/logout:"):
             log_out_of_kite(st, repository, user_id)
@@ -1987,7 +2060,13 @@ def render_kite_authentication(st, settings) -> None:
                 st.session_state.pop("kite_request_token_attempted", None)
                 st.session_state.pop("kite_logged_out", None)
                 if auto_start_enabled:
-                    maybe_autostart_trailing_agent(repository, settings.kite_api_key, settings.kite_api_secret.get_secret_value(), access_token.value)
+                    maybe_autostart_trailing_agent(
+                        repository,
+                        settings.kite_api_key,
+                        settings.kite_api_secret.get_secret_value(),
+                        access_token.value,
+                        extra_env=trailing_agent_env_from_settings(settings),
+                    )
                 st.rerun()
 
     with st.container(border=True):
@@ -2020,7 +2099,13 @@ def render_kite_authentication(st, settings) -> None:
             repository.save_kite_access_token(user_id, access_token_input.strip())
             st.session_state.pop("kite_logged_out", None)
             if auto_start_enabled:
-                maybe_autostart_trailing_agent(repository, settings.kite_api_key, settings.kite_api_secret.get_secret_value(), access_token_input.strip())
+                maybe_autostart_trailing_agent(
+                    repository,
+                    settings.kite_api_key,
+                    settings.kite_api_secret.get_secret_value(),
+                    access_token_input.strip(),
+                    extra_env=trailing_agent_env_from_settings(settings),
+                )
         manual_request_token = st.text_input(
             "Kite request token",
             type="password",
@@ -4229,7 +4314,7 @@ def render_risk_settings(st, settings) -> None:
     with st.form("risk_settings_form"):
         st.subheader("Global")
         st.caption("Shared account-level settings that apply to both Intratrading and Swing auto trading.")
-        mode_column, capital_column, deployment_column = st.columns(3)
+        mode_column, capital_column, deployment_column, min_move_column = st.columns(4)
         trading_mode = mode_column.selectbox(
             "Trading mode",
             list(TradingMode),
@@ -4250,6 +4335,20 @@ def render_risk_settings(st, settings) -> None:
             value=float(settings.max_capital_deployment * 100),
             step=1.0,
             format="%.1f",
+        )
+        min_stop_improvement_pct = min_move_column.number_input(
+            "Minimum SL-M move to update (%)",
+            min_value=0.0,
+            max_value=5.0,
+            value=float(settings.min_stop_improvement_pct),
+            step=0.05,
+            format="%.2f",
+            help=(
+                "The trailing-stop agent skips sending a broker-side SL-M update unless the new stop improves on "
+                "the current one by at least this percentage of the last traded price. Zerodha caps modifications "
+                "at 25 per order; this cuts down on paisa-level noise updates that burn through that cap for no "
+                "real protection benefit. 0 disables the filter (every improvement is sent, as before)."
+            ),
         )
 
         st.subheader("Intratrading")
@@ -4358,6 +4457,7 @@ def render_risk_settings(st, settings) -> None:
         "entry_end": entry_end,
         "force_exit": force_exit,
         "trailing_atr_multiplier": float(trailing_atr_multiplier),
+        "min_stop_improvement_pct": float(min_stop_improvement_pct),
         "swing_capital_limit": float(swing_capital_limit),
         "swing_quantity_limit": int(swing_quantity_limit),
         "swing_trailing_atr_multiplier": float(swing_trailing_atr_multiplier),
@@ -5062,7 +5162,7 @@ def main() -> None:
     settings = get_frontend_settings(st, base_settings)
     orders, trades, activity = load_activity()
 
-    authenticated = broker_credentials_configured(settings) and bool(runtime_access_token(st, settings))
+    authenticated = broker_credentials_configured(settings) and bool(verified_kite_access_token(st, settings))
     pages = WORKSPACE_PAGES if authenticated else ["Kite authentication"]
     st.session_state.setdefault("active_page", "Kite authentication")
     if st.session_state.active_page not in pages:

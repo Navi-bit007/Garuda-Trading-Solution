@@ -177,6 +177,99 @@ def test_dashboard_repository_rebuilds_stale_session_instance(monkeypatch, tmp_p
     database.close()
 
 
+def _broker_settings(user_id: str = "alice"):
+    return SimpleNamespace(
+        user_id=user_id,
+        kite_api_key="test-key",
+        kite_api_secret=SimpleNamespace(get_secret_value=lambda: "test-secret"),
+        kite_access_token=SimpleNamespace(get_secret_value=lambda: ""),
+    )
+
+
+def test_verified_token_clears_a_dead_session_on_a_real_token_exception(monkeypatch, tmp_path):
+    """Kite invalidates every access token once a trading day with no refresh grant -- a token
+    persisted from yesterday reads as present but is dead. Confirmed via Kite's own
+    TokenException (raised for a 403/expired-session response, not a generic error), the stale
+    token must be dropped from both session state and the database, with a notice queued for
+    the login page -- otherwise the app keeps claiming "authenticated" long after Zerodha has
+    actually revoked the session."""
+    from kiteconnect.exceptions import TokenException
+
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    repository.save_kite_access_token("alice", "stale-token")
+    session_state = _SessionState(dashboard_repository=repository)
+    streamlit = SimpleNamespace(session_state=session_state)
+    settings = _broker_settings()
+
+    class FailingProfile:
+        def profile(self):
+            raise TokenException("session expired")
+
+    monkeypatch.setattr(dashboard_app, "connect_kite", lambda settings, token: SimpleNamespace(client=FailingProfile()))
+
+    token = dashboard_app.verified_kite_access_token(streamlit, settings)
+
+    assert token == ""
+    assert not session_state.get("kite_access_token")
+    assert repository.load_kite_access_token("alice") == ""
+    assert session_state.get("kite_session_expired_notice") is True
+    database.close()
+
+
+def test_verified_token_is_trusted_and_cached_once_confirmed_valid(monkeypatch, tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    repository.save_kite_access_token("alice", "fresh-token")
+    session_state = _SessionState(dashboard_repository=repository)
+    streamlit = SimpleNamespace(session_state=session_state)
+    settings = _broker_settings()
+
+    call_count = {"n": 0}
+
+    class WorkingProfile:
+        def profile(self):
+            call_count["n"] += 1
+            return {"user_id": "AB1234"}
+
+    monkeypatch.setattr(dashboard_app, "connect_kite", lambda settings, token: SimpleNamespace(client=WorkingProfile()))
+
+    first = dashboard_app.verified_kite_access_token(streamlit, settings)
+    second = dashboard_app.verified_kite_access_token(streamlit, settings)
+
+    assert first == "fresh-token"
+    assert second == "fresh-token"
+    assert call_count["n"] == 1  # cached: the second call didn't re-verify against the broker
+    database.close()
+
+
+def test_verified_token_survives_a_network_error_without_forcing_a_false_logout(monkeypatch, tmp_path):
+    """Only Kite's own TokenException means the session is actually dead -- a network blip (or
+    Kite being briefly unreachable) while checking must never be treated the same way, or a
+    transient failure here would force everyone into a false "please sign in again"."""
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    repository.save_kite_access_token("alice", "fresh-token")
+    session_state = _SessionState(dashboard_repository=repository)
+    streamlit = SimpleNamespace(session_state=session_state)
+    settings = _broker_settings()
+
+    class UnreachableProfile:
+        def profile(self):
+            raise ConnectionError("network blip")
+
+    monkeypatch.setattr(dashboard_app, "connect_kite", lambda settings, token: SimpleNamespace(client=UnreachableProfile()))
+
+    token = dashboard_app.verified_kite_access_token(streamlit, settings)
+
+    assert token == "fresh-token"
+    assert repository.load_kite_access_token("alice") == "fresh-token"
+    database.close()
+
+
 def test_dashboard_settings_save_supports_hot_reloaded_repository(tmp_path):
     database = Database(str(tmp_path / "trading.sqlite3"))
     stale_repository = SimpleNamespace(database=database)

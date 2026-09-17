@@ -555,3 +555,59 @@ Traceback (most recent call last):
   File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\adapters.py", line 711, in send
     raise ConnectionError(err, request=request)
 requests.exceptions.ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+2026-09-17 09:29:41,039 INFO app.execution.trading_pipeline Entry order 260917190188052 for NSE:CARRARO confirmed by broker: status=COMPLETE average_price=514.03026316 protective_stop=260917190188059
+2026-09-17 09:29:41,040 INFO app.execution.trading_pipeline Entry price for NSE:CARRARO adjusted from signal price 512.9 to broker fill price 514.03026316
+2026-09-17 09:29:44,315 INFO app.execution.trading_pipeline Entry order 260917190188431 for NSE:CASTROLIND confirmed by broker: status=COMPLETE average_price=189.89 protective_stop=260917190188437
+2026-09-17 09:29:44,316 INFO app.execution.trading_pipeline Entry price for NSE:CASTROLIND adjusted from signal price 189.76 to broker fill price 189.89
+2026-09-17 11:55:13,821 INFO app.execution.trading_pipeline Entry order 260917190800065 for NSE:APARINDS confirmed by broker: status=COMPLETE average_price=17376.0 protective_stop=260917190800075
+2026-09-17 11:55:13,827 INFO app.execution.trading_pipeline Entry price for NSE:APARINDS adjusted from signal price 17374.0 to broker fill price 17376.0
+2026-09-17 11:55:59,082 INFO app.execution.trading_pipeline Entry order 260917190802116 for NSE:CEATLTD confirmed by broker: status=COMPLETE average_price=3358.3 protective_stop=260917190802119
+2026-09-17 11:55:59,084 INFO app.execution.trading_pipeline Entry price for NSE:CEATLTD adjusted from signal price 3358.0 to broker fill price 3358.3
+2026-09-17 11:57:07,845 ERROR app.execution.trading_pipeline Entry order 260917190805652 for NSE:GMBREW was accepted by the broker but then went to status=REJECTED; cancelling protective stop 260917190805663 and not opening a position
+2026-09-17 11:57:07,887 ERROR app.execution.trading_pipeline Failed to cancel protective stop 260917190805663 after entry order 260917190805652 was REJECTED for NSE:GMBREW
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\app\execution\trading_pipeline.py", line 433, in _submit_entry
+    self.orders.cancel(protective_order_id or "")
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\app\broker\order_api.py", line 95, in cancel
+    self.client.cancel_order(variety="regular", order_id=order_id)
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 444, in cancel_order
+    return self._delete("order.cancel",
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 928, in _delete
+    return self._request(route, "DELETE", url_args=url_args, params=params, is_json=is_json)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 992, in _request
+    raise exp(data["message"], code=r.status_code)
+kiteconnect.exceptions.InputException: Order cannot be cancelled as it is being processed. Try later.
+2026-09-17 11:57:38,705 ERROR app.execution.trading_pipeline Entry order 260917190807374 for NSE:HYUNDAI was accepted by the broker but then went to status=REJECTED; cancelling protective stop 260917190807381 and not opening a position
+2026-09-17 11:57:38,735 ERROR app.execution.trading_pipeline Failed to cancel protective stop 260917190807381 after entry order 260917190807374 was REJECTED for NSE:HYUNDAI
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\app\execution\trading_pipeline.py", line 433, in _submit_entry
+    self.orders.cancel(protective_order_id or "")
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\app\broker\order_api.py", line 95, in cancel
+    self.client.cancel_order(variety="regular", order_id=order_id)
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 444, in cancel_order
+    return self._delete("order.cancel",
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 928, in _delete
+    return self._request(route, "DELETE", url_args=url_args, params=params, is_json=is_json)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 992, in _request
+    raise exp(data["message"], code=r.status_code)
+kiteconnect.exceptions.InputException: Order cannot be cancelled as it is being processed. Try later.
+2026-09-17 11:58:05,832 ERROR app.execution.trading_pipeline Entry order 260917190809620 for NSE:JKCEMENT was accepted by the broker but then went to status=REJECTED; cancelling protective stop 260917190809622 and not opening a position
+2026-09-17 11:58:05,864 ERROR app.execution.trading_pipeline Failed to cancel protective stop 260917190809622 after entry order 260917190809620 was REJECTED for NSE:JKCEMENT
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\app\execution\trading_pipeline.py", line 433, in _submit_entry
+    self.orders.cancel(protective_order_id or "")
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\app\broker\order_api.py", line 95, in cancel
+    self.client.cancel_order(variety="regular", order_id=order_id)
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 444, in cancel_order
+    return self._delete("order.cancel",
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 928, in _delete
+    return self._request(route, "DELETE", url_args=url_args, params=params, is_json=is_json)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 992, in _request
+    raise exp(data["message"], code=r.status_code)
+kiteconnect.exceptions.InputException: Order cannot be cancelled as it is being processed. Try later.

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from datetime import time as time_of_day
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,24 @@ HEARTBEAT_STALE_SECONDS = 90.0
 STARTUP_GRACE_SECONDS = 1.5
 LOG_TAIL_LINES = 25
 TRAILING_STOP_AGENT_ENGINE_NAME = "trailing_stop_agent"
+
+
+def trailing_agent_env_from_settings(settings) -> dict[str, str]:
+    """Environment overrides mirroring the trailing-stop agent's own settings knobs (force exit
+    time, ATR multipliers, minimum stop-improvement threshold), so a freshly (re)launched agent
+    picks up whatever a user currently has configured -- including anything only ever persisted
+    to the per-user `dashboard_settings` DB row, which the standalone agent's own `get_settings()`
+    call never reads (that only sees `.env`/process environment). Falls back to the same
+    defaults `TrailingStopAgent.__init__` itself uses if an attribute is missing, so passing an
+    incomplete settings-like object never raises.
+    """
+    return {
+        "FORCE_EXIT": getattr(settings, "force_exit", time_of_day(15, 15)).isoformat(),
+        "AGENT_SHUTDOWN_TIME": getattr(settings, "agent_shutdown_time", time_of_day(15, 40)).isoformat(),
+        "TRAILING_ATR_MULTIPLIER": str(getattr(settings, "trailing_atr_multiplier", 1.5)),
+        "SWING_TRAILING_ATR_MULTIPLIER": str(getattr(settings, "swing_trailing_atr_multiplier", 2.0)),
+        "MIN_STOP_IMPROVEMENT_PCT": str(getattr(settings, "min_stop_improvement_pct", 0.25)),
+    }
 
 
 def agent_heartbeat_is_fresh(repository, now: datetime | None = None) -> bool:
@@ -54,7 +73,7 @@ def _record_startup_failure_if_any(repository, process: subprocess.Popen) -> Non
 
 
 def launch_trailing_stop_agent(
-    api_key: str, api_secret: str, access_token: str, repository=None
+    api_key: str, api_secret: str, access_token: str, repository=None, extra_env: dict[str, str] | None = None
 ) -> subprocess.Popen:
     """Start scripts/run_trailing_stop_agent.py as a fully detached background process.
 
@@ -67,6 +86,14 @@ def launch_trailing_stop_agent(
     The repo root is put on PYTHONPATH -- running a script directly (rather than via `-m`) only
     ever puts the script's own folder on sys.path, so without this the child process cannot
     `import app` regardless of its working directory.
+
+    `extra_env` carries the dashboard's current effective risk settings (force exit time,
+    trailing ATR multiplier, minimum stop-improvement threshold, ...) as environment variable
+    overrides -- confirmed live: the standalone agent otherwise only ever reads `.env`/process
+    environment via `get_settings()`, with no idea that a user changed something in Risk &
+    Settings, since those changes are only ever persisted to the per-user `dashboard_settings`
+    DB row, which this subprocess never reads. Without this, restarting the agent after changing
+    a risk setting silently keeps using the old `.env` value.
 
     If `repository` is given, a short startup check catches a crash in the first
     STARTUP_GRACE_SECONDS (e.g. the import failure above, or bad credentials) and records it as
@@ -81,6 +108,7 @@ def launch_trailing_stop_agent(
         "KITE_ACCESS_TOKEN": access_token,
         "TRADING_MODE": "LIVE",
         "PYTHONPATH": os.pathsep.join(filter(None, [str(REPO_ROOT), os.environ.get("PYTHONPATH", "")])),
+        **(extra_env or {}),
     }
     popen_kwargs: dict[str, Any] = dict(
         cwd=str(REPO_ROOT),
@@ -101,7 +129,9 @@ def launch_trailing_stop_agent(
     return process
 
 
-def maybe_autostart_trailing_agent(repository, api_key: str, api_secret: str, access_token: str) -> subprocess.Popen | None:
+def maybe_autostart_trailing_agent(
+    repository, api_key: str, api_secret: str, access_token: str, extra_env: dict[str, str] | None = None
+) -> subprocess.Popen | None:
     """Launch the agent unless a recent heartbeat shows one is already running.
 
     Safe to call on every login/token-refresh -- the heartbeat check makes it idempotent, so it
@@ -109,7 +139,7 @@ def maybe_autostart_trailing_agent(repository, api_key: str, api_secret: str, ac
     """
     if agent_heartbeat_is_fresh(repository):
         return None
-    return launch_trailing_stop_agent(api_key, api_secret, access_token, repository)
+    return launch_trailing_stop_agent(api_key, api_secret, access_token, repository, extra_env=extra_env)
 
 
 def stop_trailing_stop_agent(repository) -> bool:

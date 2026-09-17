@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -137,6 +138,48 @@ def test_intraday_trailing_stop_ratchets_and_persists(tmp_path):
     assert saved.stop_loss > 90.0
     assert saved.stop_loss < 110.0
     assert agent.orders.paper_protective_orders["PAPER-STOP-000001"].stop_loss == saved.stop_loss
+    database.close()
+
+
+def test_min_stop_improvement_pct_suppresses_tiny_moves_but_lets_real_ones_through(tmp_path):
+    """A paisa-level ATR wobble is still technically "an improvement", but sending it to the
+    broker burns one of Zerodha's 25 modifications on this order for no real protection benefit
+    -- it must be silently skipped unless it clears the configured minimum step (a percentage of
+    the reference price, from Risk & settings), while a move that does clear it still applies
+    exactly as before."""
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    entry_time = datetime(2026, 1, 1, 9, 20)
+    repository.save_position(
+        PositionRecord(
+            symbol="NSE:AAA",
+            side="BUY",
+            quantity=10,
+            entry_price=100.0,
+            stop_loss=90.00,
+            entry_time=entry_time,
+            protective_order_id="PAPER-STOP-000001",
+            instrument_token=111,
+            position_type="INTRADAY",
+            atr_multiplier=1.5,
+            trading_mode="LIVE",
+        )
+    )
+    settings = SimpleNamespace(min_stop_improvement_pct=0.25)
+    agent = build_agent(repository, client, settings=settings)
+    agent.orders.paper_protective_orders["PAPER-STOP-000001"] = OrderRequest("NSE:AAA", Side.SELL, 10, 100.0, 90.00, "MIS", "NSE")
+    agent.load_positions()
+    position = agent.positions["NSE:AAA"]
+
+    # reference_price 110 -> 0.25% threshold = Rs0.275; a Rs0.10 improvement must be rejected.
+    agent._maybe_apply(position, 90.10, 110.0, "tiny move")
+    [saved] = repository.load_positions()
+    assert saved.stop_loss == 90.00
+
+    # A move that clears the threshold still applies exactly as before.
+    agent._maybe_apply(position, 90.40, 110.0, "real move")
+    [saved] = repository.load_positions()
+    assert saved.stop_loss == 90.40
     database.close()
 
 
@@ -809,6 +852,20 @@ def test_expired_overnight_stop_is_rearmed(tmp_path):
     assert saved.protective_order_id != "PAPER-STOP-000001"
     assert saved.protective_order_id in agent.orders.paper_protective_orders
     assert agent.orders.paper_protective_orders[saved.protective_order_id].stop_loss == 90.0
+
+    # A re-arm used to be invisible outside a Telegram notification -- confirmed live: a user
+    # saw a fresh SL-M order at the broker with nothing in the app explaining it. It must show
+    # up in the activity ledger (for the Live monitor's "Recent stop-loss updates" panel) and
+    # the decision log, even though the stop price itself didn't change.
+    [activity_row] = database.connection.execute(
+        "SELECT event_kind, symbol, stop_loss, previous_stop FROM activity WHERE event_kind = 'stop_rearmed'"
+    ).fetchall()
+    assert tuple(activity_row)[:3] == ("stop_rearmed", "NSE:AAA", 90.0)
+    assert activity_row["previous_stop"] is None
+
+    [decision] = repository.load_decisions(symbol="NSE:AAA", event_type="stop_rearmed")
+    assert decision.decision == "REARM_STOP"
+    assert "day order" in decision.rationale
     database.close()
 
 

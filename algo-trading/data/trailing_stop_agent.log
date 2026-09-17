@@ -22674,3 +22674,28 @@ Traceback (most recent call last):
 requests.exceptions.ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
 2026-09-16 15:40:10,640 INFO Past today's shutdown time (15:40:00); trailing stop agent is exiting for the day
 2026-09-16 15:40:14,876 INFO Trailing stop agent shut down for the day; exiting process
+2026-09-17 09:07:09,245 INFO Trailing stop agent started
+2026-09-17 09:07:10,156 ERROR Failed to re-arm protective stop for NSE:JUBLPHARMA: SL-M orders are not allowed during pre-open session, place a limit order. Regular trading starts at 9:15 AM.
+2026-09-17 09:12:11,036 INFO Re-armed protective stop for NSE:JUBLPHARMA at 961.80 (order 260917190042528)
+2026-09-17 09:17:11,735 INFO Re-armed protective stop for NSE:JUBLPHARMA at 961.80 (order 260917190075862)
+2026-09-17 09:22:15,588 ERROR Broker holdings lookup failed during swing reconciliation
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\app\execution\trailing_stop_agent.py", line 730, in _broker_held_tradingsymbols
+    holdings = self.broker_client.holdings()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 504, in holdings
+    return self._get("portfolio.holdings")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 916, in _get
+    return self._request(route, "GET", url_args=url_args, params=params, is_json=is_json)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 992, in _request
+    raise exp(data["message"], code=r.status_code)
+kiteconnect.exceptions.NetworkException: Too many requests
+2026-09-17 09:25:43,439 INFO Trailing stop agent started
+2026-09-17 09:36:04,103 INFO NSE:CASTROLIND reached target 1 (190.29); stop now floors at breakeven
+2026-09-17 10:17:35,944 INFO Trailing stop agent started
+2026-09-17 10:19:07,545 INFO NSE:CARRARO reached target 1 (516.23); stop now floors at breakeven
+2026-09-17 10:24:10,282 INFO broker_exit_detected NSE:CARRARO side=SELL price=513.69 pnl=-12.95
+2026-09-17 10:30:51,061 INFO Trailing stop agent started
+2026-09-17 10:50:12,906 INFO broker_exit_detected NSE:CASTROLIND side=SELL price=190.36 pnl=49.02

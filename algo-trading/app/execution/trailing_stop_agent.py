@@ -109,6 +109,12 @@ class TrailingStopAgent:
         # (see Settings.agent_shutdown_after_force_exit), so every open intraday position gets a
         # market exit here well before the agent itself stops watching for the day.
         self.force_exit_time = getattr(settings, "force_exit", time_of_day(15, 15))
+        # Without a floor, any improvement at all -- even a paisa -- sends a broker-side SL-M
+        # modify, which is what burns through Zerodha's 25-modifications-per-order cap on noise
+        # rather than real moves. Expressed as a percentage of the reference price (matching how
+        # "Stop distance %" is already shown on the dashboard), not a fixed rupee amount, so it
+        # scales sensibly across a Rs.50 stock and a Rs.5,000 one.
+        self.min_stop_improvement_pct = float(getattr(settings, "min_stop_improvement_pct", 0.25))
         self.shut_down_for_the_day = False
 
     @property
@@ -851,6 +857,37 @@ class TrailingStopAgent:
         position.record = updated
         logger.info("Re-armed protective stop for %s at %.2f (order %s)", record.symbol, record.stop_loss, new_order_id)
         self.notifier.send(f"Re-armed protective stop for {record.symbol} at {record.stop_loss:.2f} (previous SL-M had expired)")
+        reason = (
+            f"Overnight SL-M expired as a day order (previous order {record.protective_order_id or 'unknown'}); "
+            f"re-armed a fresh protective stop {new_order_id} at the same trigger price -- the stop level itself did not change."
+        )
+        # Previously this whole re-arm was invisible outside a Telegram notification: nothing in
+        # `activity` or the decision log recorded that a *new* SL-M order now exists at the
+        # broker, even though the Live monitor page's own "Broker status" already shows it as
+        # the resting order -- exactly the gap that made a freshly re-armed stop look
+        # unexplained there.
+        self.repository.save_activity(
+            ActivityRecord(
+                event_kind="stop_rearmed",
+                symbol=record.symbol,
+                timestamp=datetime.now(),
+                mode="LIVE",
+                price=record.stop_loss,
+                order_id=new_order_id,
+                side=exit_side.value,
+                quantity=record.quantity,
+                entry_price=record.entry_price,
+                stop_loss=record.stop_loss,
+                reason=reason,
+            )
+        )
+        self._log_decision(
+            updated,
+            event_type="stop_rearmed",
+            decision="REARM_STOP",
+            rationale=reason,
+            outputs={"new_order_id": new_order_id, "stop_loss": record.stop_loss},
+        )
 
     def _process_swing_position(self, position: AgentPosition, timestamp: datetime) -> None:
         record = position.record
@@ -891,6 +928,14 @@ class TrailingStopAgent:
             else:
                 if candidate_stop >= record.stop_loss or candidate_stop <= reference_price:
                     return
+            # A genuine improvement that's too small to matter (a paisa-level ATR wobble) still
+            # burns one of Zerodha's 25 modifications on this order for no real protection
+            # benefit -- skip sending it to the broker at all unless it clears the configured
+            # minimum step (Risk & settings). Nothing is persisted or logged for a skip: this is
+            # deliberately silent, not a failure, so it doesn't add decision-log noise either.
+            min_step = reference_price * (self.min_stop_improvement_pct / 100.0)
+            if abs(candidate_stop - record.stop_loss) < min_step:
+                return
             self._apply_candidate_stop(position, candidate_stop, reference_price, calculation)
 
     def _apply_candidate_stop(self, position: AgentPosition, candidate_stop: float, reference_price: float, calculation: str) -> None:

@@ -10,6 +10,7 @@ from app.execution.agent_launcher import (
     launch_trailing_stop_agent,
     maybe_autostart_trailing_agent,
     stop_trailing_stop_agent,
+    trailing_agent_env_from_settings,
 )
 
 
@@ -44,7 +45,7 @@ def test_autostart_skips_launch_when_heartbeat_is_fresh(tmp_path, monkeypatch):
     launched = []
     monkeypatch.setattr(
         "app.execution.agent_launcher.launch_trailing_stop_agent",
-        lambda *args: launched.append(args),
+        lambda *args, **kwargs: launched.append((args, kwargs)),
     )
 
     result = maybe_autostart_trailing_agent(repository, "key", "secret", "token")
@@ -59,13 +60,32 @@ def test_autostart_launches_when_heartbeat_is_stale_or_missing(tmp_path, monkeyp
     launched = []
     monkeypatch.setattr(
         "app.execution.agent_launcher.launch_trailing_stop_agent",
-        lambda api_key, api_secret, access_token, repository: launched.append((api_key, api_secret, access_token, repository)) or "process",
+        lambda api_key, api_secret, access_token, repository, **kwargs: launched.append((api_key, api_secret, access_token, repository, kwargs)) or "process",
     )
 
     result = maybe_autostart_trailing_agent(repository, "key", "secret", "token")
 
     assert result == "process"
-    assert launched == [("key", "secret", "token", repository)]
+    assert launched == [("key", "secret", "token", repository, {"extra_env": None})]
+    database.close()
+
+
+def test_autostart_passes_extra_env_through_to_launch(tmp_path, monkeypatch):
+    """Risk settings changes (e.g. the minimum stop-improvement threshold) are only ever
+    persisted to the per-user dashboard_settings DB row -- the standalone agent's own
+    get_settings() call never reads that table, only .env/process environment. Without
+    threading extra_env through here too, auto-starting the agent on login would silently keep
+    using stale .env-level defaults instead of whatever the user configured."""
+    database, repository = build_repository(tmp_path)
+    captured = {}
+    monkeypatch.setattr(
+        "app.execution.agent_launcher.launch_trailing_stop_agent",
+        lambda api_key, api_secret, access_token, repository, **kwargs: captured.update(kwargs) or "process",
+    )
+
+    maybe_autostart_trailing_agent(repository, "key", "secret", "token", extra_env={"MIN_STOP_IMPROVEMENT_PCT": "0.1"})
+
+    assert captured == {"extra_env": {"MIN_STOP_IMPROVEMENT_PCT": "0.1"}}
     database.close()
 
 
@@ -95,6 +115,66 @@ def test_launch_puts_repo_root_on_pythonpath(tmp_path, monkeypatch):
     assert str(REPO_ROOT) in pythonpath_entries
     assert captured["env"]["KITE_ACCESS_TOKEN"] == "token"
     assert captured["env"]["TRADING_MODE"] == "LIVE"
+
+
+def test_launch_forwards_extra_env_into_the_child_process(tmp_path, monkeypatch):
+    """A risk setting (e.g. the minimum stop-improvement threshold) changed in the dashboard is
+    only ever persisted to the per-user dashboard_settings DB row -- the standalone agent's own
+    get_settings() call reads only .env/process environment and has no idea that row exists.
+    extra_env is how a freshly (re)launched agent is told what's actually configured, instead of
+    silently falling back to a stale .env-level default."""
+    monkeypatch.setattr("app.execution.agent_launcher.AGENT_LOG_PATH", tmp_path / "agent.log")
+    monkeypatch.setattr("app.execution.agent_launcher.STARTUP_GRACE_SECONDS", 0)
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeProcess(returncode=None)
+
+    monkeypatch.setattr("app.execution.agent_launcher.subprocess.Popen", fake_popen)
+
+    launch_trailing_stop_agent("key", "secret", "token", extra_env={"MIN_STOP_IMPROVEMENT_PCT": "0.1", "FORCE_EXIT": "15:20:00"})
+
+    assert captured["env"]["MIN_STOP_IMPROVEMENT_PCT"] == "0.1"
+    assert captured["env"]["FORCE_EXIT"] == "15:20:00"
+    # Credentials/PYTHONPATH must still be set as before -- extra_env only adds to the child's
+    # environment, it never replaces the rest of it.
+    assert captured["env"]["KITE_ACCESS_TOKEN"] == "token"
+
+
+def test_trailing_agent_env_from_settings_mirrors_the_effective_settings():
+    from datetime import time
+    from types import SimpleNamespace
+
+    settings = SimpleNamespace(
+        force_exit=time(15, 20),
+        agent_shutdown_time=time(15, 45),
+        trailing_atr_multiplier=1.75,
+        swing_trailing_atr_multiplier=2.5,
+        min_stop_improvement_pct=0.1,
+    )
+
+    env = trailing_agent_env_from_settings(settings)
+
+    assert env == {
+        "FORCE_EXIT": "15:20:00",
+        "AGENT_SHUTDOWN_TIME": "15:45:00",
+        "TRAILING_ATR_MULTIPLIER": "1.75",
+        "SWING_TRAILING_ATR_MULTIPLIER": "2.5",
+        "MIN_STOP_IMPROVEMENT_PCT": "0.1",
+    }
+
+
+def test_trailing_agent_env_from_settings_falls_back_on_missing_attributes():
+    env = trailing_agent_env_from_settings(object())
+
+    assert env == {
+        "FORCE_EXIT": "15:15:00",
+        "AGENT_SHUTDOWN_TIME": "15:40:00",
+        "TRAILING_ATR_MULTIPLIER": "1.5",
+        "SWING_TRAILING_ATR_MULTIPLIER": "2.0",
+        "MIN_STOP_IMPROVEMENT_PCT": "0.25",
+    }
 
 
 def test_launch_records_error_heartbeat_on_immediate_crash(tmp_path, monkeypatch):

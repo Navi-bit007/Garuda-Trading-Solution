@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     force_exit: time = time(15, 15)
     agent_shutdown_time: time = time(15, 40)
     trailing_atr_multiplier: float = Field(default=1.5, gt=0)
+    min_stop_improvement_pct: float = Field(default=0.25, ge=0)
     enable_telegram: bool = False
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""

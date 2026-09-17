@@ -39,11 +39,13 @@ from app.config.constants import Side, SignalAction, TradingMode
 from app.broker.authentication import AccessToken, AuthenticationError, exchange_request_token
 from app.broker.kite_client import KiteClient
 from app.broker.market_data import MarketData
+from app.broker.order_api import OrderAPI
 from app.broker.positions_api import PositionsAPI
 from app.config.settings import get_settings
 from app.database.database import Database
-from app.database.models import ActivityRecord, DynamicWatchlistRecord, NotificationRecord, SignalRecord, WatchlistRecord
+from app.database.models import ActivityRecord, DynamicWatchlistRecord, NotificationRecord, PositionRecord, SignalRecord, WatchlistRecord
 from app.database.repository import Repository
+from app.execution.exit_actions import close_position_at_market
 from app.execution.position_manager import Position, PositionManager
 from app.execution.reconciliation import reconcile
 from app.execution.agent_launcher import agent_heartbeat_is_fresh, launch_trailing_stop_agent, maybe_autostart_trailing_agent, stop_trailing_stop_agent, trailing_agent_env_from_settings
@@ -1455,6 +1457,81 @@ def render_position_monitor(st, settings, access_token: str) -> None:
         st.caption(" · ".join(f"{event.kind}: {event.symbol}" for event in recent_events))
 
 
+def render_manual_exit_action(st, settings, repository: Repository, record: PositionRecord, access_token: str, quotes: dict) -> None:
+    """Let the user force-close the selected Live monitor row on demand: market-exit it and
+    cancel its resting SL-M, mirroring the standalone agent's own force-exit mechanics
+    (app.execution.exit_actions.close_position_at_market) but triggered by a click instead of
+    the configured force-exit time. Works for both INTRADAY and SWING rows, since -- unlike the
+    Intraday desk's own "Exit" button, which only ever sees symbols in that dashboard session's
+    in-memory pipeline -- this acts directly on whatever PositionRecord Live monitor is already
+    displaying, straight from the shared `positions` table the agent itself reads.
+    """
+    if not broker_credentials_configured(settings) or not access_token:
+        st.info("Connect to Zerodha (Kite authentication page) to send a live exit order.", icon=":material/link_off:")
+        return
+
+    key = record.symbol if ":" in record.symbol else f"NSE:{record.symbol}"
+    live_quote = quotes.get(key) or {}
+    last_price = float(live_quote.get("last_price", 0) or 0) or record.entry_price
+
+    with st.container(border=True):
+        st.markdown(f"**Exit {record.symbol} at market**")
+        st.caption(
+            f"{record.side} {record.quantity} · entry ₹{record.entry_price:,.2f} · stop ₹{record.stop_loss:,.2f} · "
+            f"last ₹{last_price:,.2f} · {record.position_type}"
+        )
+        with st.form(f"manual_exit_form_{record.symbol}"):
+            confirmed = st.checkbox(
+                f"I understand this will send a live MARKET exit order for {record.symbol} and cancel its resting protective stop.",
+                key=f"manual_exit_confirm_{record.symbol}",
+            )
+            submitted = st.form_submit_button(f"Exit {record.symbol} now", type="primary", icon=":material/close:")
+
+        if not submitted:
+            return
+        if not confirmed:
+            st.warning("Confirm the checkbox above to send the exit order.")
+            return
+
+        # Re-check the position immediately before acting -- it may have been closed by the
+        # standalone agent (a stop hit, or its own force-exit) in the few seconds between this
+        # row being rendered and the button being clicked. Using the freshest record also
+        # targets the current protective_order_id if the agent re-armed or replaced it since.
+        fresh_record = next((row for row in repository.load_positions() if row.symbol == record.symbol), None)
+        if fresh_record is None:
+            st.info(f"{record.symbol} is no longer open -- it may have just been closed by the trailing-stop agent or at the broker.")
+            st.rerun()
+            return
+
+        try:
+            client = connect_kite(settings, access_token)
+        except Exception as error:
+            st.error(f"Could not connect to Zerodha to send the exit order: {error}")
+            return
+        orders = OrderAPI(TradingMode.LIVE, client.client)
+        outcome = close_position_at_market(
+            repository,
+            orders,
+            fresh_record,
+            price=last_price,
+            timestamp=datetime.now(),
+            reason="Manual exit (Live monitor)",
+            event_kind="manual_exit",
+            decision="MANUAL_EXIT",
+        )
+        if not outcome.success:
+            st.error(f"Exit order failed for {record.symbol}: {outcome.error}")
+            return
+        if outcome.cancel_error:
+            st.warning(
+                f"{record.symbol} closed at ₹{outcome.exit_price:,.2f} (pnl ₹{outcome.pnl:,.2f}), but cancelling its "
+                f"resting stop failed: {outcome.cancel_error}. Check for a stale SL-M order at the broker."
+            )
+        else:
+            st.success(f"{record.symbol} closed at ₹{outcome.exit_price:,.2f} (pnl ₹{outcome.pnl:,.2f}).")
+        st.rerun()
+
+
 def render_live_monitor(st, settings) -> None:
     @st.fragment(run_every=10)
     def render_live_monitor_content() -> None:
@@ -1711,6 +1788,11 @@ def render_live_monitor(st, settings) -> None:
                         "Calculation details": st.column_config.TextColumn(width="large"),
                     },
                 )
+
+        if selected_stop_symbol:
+            selected_record = next((row for row in records if row.symbol == selected_stop_symbol), None)
+            if selected_record is not None:
+                render_manual_exit_action(st, settings, repository, selected_record, access_token, quotes)
 
         if broker_open_tradingsymbols is not None:
             tracked_tradingsymbols = {tradingsymbol(record.symbol) for record in records}

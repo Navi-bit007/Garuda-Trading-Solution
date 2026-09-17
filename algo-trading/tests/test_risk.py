@@ -5,9 +5,23 @@ from app.risk.risk_manager import RiskManager
 
 def test_daily_trade_count_stops_new_trades():
     limits = DailyLimits(100_000, 2)
-    limits.record_trade(-1_500)
-    limits.record_trade(500)
+    limits.record_entry()
+    limits.record_entry()
     assert not limits.can_trade()
+
+
+def test_a_closed_trade_does_not_free_up_daily_limit_headroom():
+    """A position closing must never appear to give back today's quota -- record_trade() (called
+    when a trade closes, to fold in its P&L) must not touch the entry count that can_trade()
+    checks, or a 6th entry could slip through on a day where some earlier trades already closed."""
+    limits = DailyLimits(100_000, 1)
+    limits.record_entry()
+    assert not limits.can_trade()
+
+    limits.record_trade(500.0)
+
+    assert not limits.can_trade()
+    assert limits.realized_pnl == 500.0
 
 
 def test_exposure_allows_more_notional_value_with_leverage():
@@ -47,8 +61,8 @@ def test_risk_manager_approve_entry_respects_leverage():
 
 def test_risk_manager_approve_entry_reports_daily_trade_limit_with_exact_counts():
     limits = DailyLimits(100_000, 2)
-    limits.record_trade(500)
-    limits.record_trade(-200)
+    limits.record_entry()
+    limits.record_entry()
     manager = RiskManager(100_000, 3, limits, Exposure(100_000, 0.80))
 
     approved, reason = manager.approve_entry(0, 0, 1_000, quantity=1)

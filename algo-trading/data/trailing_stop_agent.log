@@ -22699,3 +22699,6 @@ kiteconnect.exceptions.NetworkException: Too many requests
 2026-09-17 10:24:10,282 INFO broker_exit_detected NSE:CARRARO side=SELL price=513.69 pnl=-12.95
 2026-09-17 10:30:51,061 INFO Trailing stop agent started
 2026-09-17 10:50:12,906 INFO broker_exit_detected NSE:CASTROLIND side=SELL price=190.36 pnl=49.02
+2026-09-17 13:39:57,584 INFO Trailing stop agent started
+2026-09-17 13:39:58,106 INFO broker_exit_detected NSE:CEATLTD side=SELL price=3375.20 pnl=84.50
+2026-09-17 13:51:04,762 INFO NSE:APARINDS reached target 1 (17560.73); stop now floors at breakeven

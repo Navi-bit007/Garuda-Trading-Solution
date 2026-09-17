@@ -81,6 +81,13 @@ class TradingPipeline:
     ENTRY_FILL_POLL_SECONDS = 0.5
     ENTRY_FILLED_STATUSES = {"COMPLETE", "COMPLETED", "FILLED"}
     ENTRY_REJECTED_STATUSES = {"REJECTED", "CANCELLED"}
+    # Confirmed live: cancelling the protective stop right after its sibling entry order is
+    # rejected regularly fails with kiteconnect.exceptions.InputException("Order cannot be
+    # cancelled as it is being processed. Try later.") -- Zerodha's own RMS/exchange pipeline
+    # hasn't settled the just-submitted order into a stable, cancellable state yet. Without a
+    # retry here, that stop is left resting at the broker with no position behind it at all.
+    PROTECTIVE_STOP_CANCEL_RETRY_ATTEMPTS = 3
+    PROTECTIVE_STOP_CANCEL_RETRY_BACKOFF_SECONDS = 1.0
 
     def __init__(self, settings: Any, token_to_symbol: dict[int, str], strategy: Strategy, broker_client: Any = None, activity_repository: Any = None):
         if settings.trading_mode == TradingMode.LIVE and broker_client is None:
@@ -429,10 +436,7 @@ class TradingPipeline:
                 "cancelling protective stop %s and not opening a position",
                 order_id, symbol, entry_status, protective_order_id,
             )
-            try:
-                self.orders.cancel(protective_order_id or "")
-            except Exception:
-                logger.exception("Failed to cancel protective stop %s after entry order %s was %s for %s", protective_order_id, order_id, entry_status, symbol)
+            self._cancel_protective_stop_with_retry(protective_order_id, order_id, entry_status, symbol)
             return self._event(
                 "entry_rejected",
                 symbol,
@@ -466,6 +470,7 @@ class TradingPipeline:
         position_side = Side.BUY if signal.action == SignalAction.BUY else Side.SELL
         position = Position(symbol, position_side, quantity, actual_entry_price, signal.stop_loss, signal.timestamp, signal.target_1, signal.target_2)
         self.positions.add(position)
+        self.limits.record_entry()
         self.managed_positions[symbol] = ManagedPosition(
             position,
             TrailingStop(actual_entry_price, signal.stop_loss, self.settings.trailing_atr_multiplier, position_side.value),
@@ -482,6 +487,32 @@ class TradingPipeline:
         if strategy_stop_multiplier > 0:
             self.last_atr[symbol] = abs(actual_entry_price - signal.stop_loss) / strategy_stop_multiplier
         return self._event("entry_submitted", symbol, signal.timestamp, actual_entry_price, order_id, signal.reason, signal.action.value, quantity, actual_entry_price, signal.stop_loss)
+
+    def _cancel_protective_stop_with_retry(self, protective_order_id: str | None, order_id: str, entry_status: str, symbol: str) -> None:
+        """Cancel the protective stop placed alongside an entry order that was ultimately
+        rejected -- with no position behind it, that stop must not be left resting at the
+        broker. Confirmed live: the very first cancel attempt regularly fails with
+        kiteconnect.exceptions.InputException("Order cannot be cancelled as it is being
+        processed. Try later.") since Zerodha's own RMS/exchange pipeline hasn't settled the
+        just-submitted order into a stable state yet -- a short retry clears this almost every
+        time, whereas giving up on the first attempt (the previous behavior) orphaned the stop.
+        """
+        if not protective_order_id:
+            return
+        last_error: Exception | None = None
+        for attempt in range(1, self.PROTECTIVE_STOP_CANCEL_RETRY_ATTEMPTS + 1):
+            try:
+                self.orders.cancel(protective_order_id)
+                return
+            except Exception as error:
+                last_error = error
+                if attempt < self.PROTECTIVE_STOP_CANCEL_RETRY_ATTEMPTS:
+                    sleep(self.PROTECTIVE_STOP_CANCEL_RETRY_BACKOFF_SECONDS)
+        logger.error(
+            "Failed to cancel protective stop %s after entry order %s was %s for %s (tried %d time(s)): %s -- "
+            "this stop may still be resting at the broker with no position behind it; check and cancel it manually.",
+            protective_order_id, order_id, entry_status, symbol, self.PROTECTIVE_STOP_CANCEL_RETRY_ATTEMPTS, last_error,
+        )
 
     def resolve_intraday_leverage(self, symbol: str, price: float) -> float:
         """Ask the broker for the real MIS margin it requires for `symbol` right now and derive

@@ -950,12 +950,24 @@ class Repository:
         return row is not None
 
     def load_daily_trade_stats(self, day: str) -> tuple[int, float]:
+        """Returns (entries taken today, realized P&L from trades closed today).
+
+        These come from two different event kinds -- an entry's own activity row has no P&L yet
+        (it isn't known until the position closes), and a position opened today may still be
+        open, so it wouldn't show up if this only looked at exits. Counting entries (not closes)
+        here matches DailyLimits.can_trade(): a position closing must never appear to free up
+        headroom for a new one within the same day.
+        """
         with self.database.lock:
-            row = self.database.connection.execute(
-                "SELECT COUNT(*) AS trades, COALESCE(SUM(pnl), 0) AS pnl FROM activity WHERE event_kind IN ('exit_submitted', 'broker_exit_detected') AND substr(timestamp, 1, 10) = ?",
+            entries_row = self.database.connection.execute(
+                "SELECT COUNT(*) AS entries FROM activity WHERE event_kind = 'entry_submitted' AND substr(timestamp, 1, 10) = ?",
                 (day,),
             ).fetchone()
-        return int(row["trades"]), float(row["pnl"])
+            pnl_row = self.database.connection.execute(
+                "SELECT COALESCE(SUM(pnl), 0) AS pnl FROM activity WHERE event_kind IN ('exit_submitted', 'broker_exit_detected') AND substr(timestamp, 1, 10) = ?",
+                (day,),
+            ).fetchone()
+        return int(entries_row["entries"]), float(pnl_row["pnl"])
 
     def save_strategy_preset(self, preset: StrategyPresetRecord) -> None:
         with self.database.lock:

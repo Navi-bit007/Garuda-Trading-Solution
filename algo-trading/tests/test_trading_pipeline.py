@@ -96,6 +96,24 @@ class RejectedAfterAcceptClient:
         return [{"status": "REJECTED", "filled_quantity": 0, "average_price": 0}]
 
 
+class FlakyRejectedAfterAcceptClient(RejectedAfterAcceptClient):
+    """Like RejectedAfterAcceptClient, but cancel_order() fails the first `fail_times` calls with
+    the exact kiteconnect error Zerodha returns while an order is still settling, confirmed live:
+    "Order cannot be cancelled as it is being processed. Try later." -- exercising the retry
+    added to _cancel_protective_stop_with_retry."""
+
+    def __init__(self, fail_times: int):
+        super().__init__()
+        self.fail_times = fail_times
+        self.cancel_attempts = 0
+
+    def cancel_order(self, **kwargs):
+        self.cancel_attempts += 1
+        if self.cancel_attempts <= self.fail_times:
+            raise Exception("Order cannot be cancelled as it is being processed. Try later.")
+        return super().cancel_order(**kwargs)
+
+
 class SlippedFillClient:
     """Simulates a MARKET order filling away from the last-tick price the signal was priced
     at -- the scenario behind the monitoring page showing an entry price that didn't match
@@ -219,6 +237,33 @@ def test_live_pipeline_requires_authenticated_broker_client():
         TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy())
 
 
+def test_daily_trade_limit_blocks_a_new_entry_even_after_an_earlier_one_closed():
+    """A trade closing must not free up today's quota -- otherwise "max trades per day" only
+    caps how many round-trips can be open/closed in sequence, not how many entries are actually
+    taken, letting a 6th (or later) position slip through on a day where earlier ones already
+    closed. max_trades_per_day=1 here: AAA's entry uses up the day's only slot; AAA is then
+    force-exited (closed); a fresh BBB signal must still be rejected on the daily limit."""
+    pipeline = TradingPipeline(build_settings(max_trades_per_day=1), {1: "AAA", 2: "BBB"}, BuyStrategy())
+    entry_events = pipeline.on_ticks([
+        {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 20), "last_price": 100, "volume_traded": 100},
+        {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 21), "last_price": 100, "volume_traded": 150},
+    ])
+    assert [event.kind for event in entry_events] == ["entry_submitted"]
+
+    close_events = pipeline.on_ticks([
+        {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 15, 15), "last_price": 101, "volume_traded": 180},
+    ])
+    assert [event.kind for event in close_events] == ["exit_submitted"]
+    assert not pipeline.managed_positions
+
+    rejected_events = pipeline.on_ticks([
+        {"instrument_token": 2, "timestamp": datetime(2026, 1, 1, 9, 20), "last_price": 200, "volume_traded": 100},
+        {"instrument_token": 2, "timestamp": datetime(2026, 1, 1, 9, 21), "last_price": 200, "volume_traded": 150},
+    ])
+    assert [event.kind for event in rejected_events] == ["entry_rejected"]
+    assert rejected_events[0].reason == "daily trade limit reached (1/1 trades today)"
+
+
 def test_pipeline_moves_broker_sold_position_to_recently_closed_with_realized_pnl():
     client = BrokerExitClient()
     pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client)
@@ -252,6 +297,44 @@ def test_entry_rejected_when_broker_accepts_then_rejects_the_order(tmp_path):
     assert client.cancelled_order_ids == ["ORDER-2"]
     rows = database.connection.execute("SELECT event_kind FROM activity ORDER BY id").fetchall()
     assert [row[0] for row in rows] == ["entry_rejected"]
+    database.close()
+
+
+def test_protective_stop_cancel_retries_after_a_transient_rejection(tmp_path):
+    """Zerodha regularly refuses to cancel the just-placed protective stop the instant its
+    sibling entry order is rejected -- "Order cannot be cancelled as it is being processed. Try
+    later." -- since its own RMS/exchange pipeline hasn't settled the order yet. The cancel must
+    be retried rather than giving up and leaving that stop resting at the broker unprotected."""
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = FlakyRejectedAfterAcceptClient(fail_times=2)
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+    pipeline.PROTECTIVE_STOP_CANCEL_RETRY_BACKOFF_SECONDS = 0.001
+
+    event = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+
+    assert event.kind == "entry_rejected"
+    assert client.cancel_attempts == 3
+    assert client.cancelled_order_ids == ["ORDER-2"]
+    database.close()
+
+
+def test_protective_stop_cancel_gives_up_cleanly_after_retries_exhausted(tmp_path):
+    """Even if every retry attempt fails, the failure must stay contained (logged, not raised) --
+    the entry is still correctly reported as rejected and no position is opened."""
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = FlakyRejectedAfterAcceptClient(fail_times=99)
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+    pipeline.PROTECTIVE_STOP_CANCEL_RETRY_BACKOFF_SECONDS = 0.001
+
+    event = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+
+    assert event.kind == "entry_rejected"
+    assert not pipeline.managed_positions
+    assert client.cancel_attempts == pipeline.PROTECTIVE_STOP_CANCEL_RETRY_ATTEMPTS
     database.close()
 
 

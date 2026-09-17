@@ -14,6 +14,7 @@ from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import Side
 from app.database.models import ActivityRecord, AgentHeartbeat, DecisionLogRecord, PositionRecord, TradeRecord
 from app.database.repository import Repository
+from app.execution.exit_actions import close_position_at_market, correlation_id_for, exchange_of, tradingsymbol_of
 from app.execution.swing_trailing import compute_ema_swing_stop, compute_trend_breakout_stop
 from app.execution.trailing_stop import TrailingStop
 from app.market.candles import validate_ohlcv
@@ -282,11 +283,11 @@ class TrailingStopAgent:
 
     @staticmethod
     def _tradingsymbol(symbol: str) -> str:
-        return symbol.split(":", 1)[1].strip().upper() if ":" in symbol else symbol.strip().upper()
+        return tradingsymbol_of(symbol)
 
     @staticmethod
     def _exchange(symbol: str) -> str:
-        return symbol.split(":", 1)[0].strip().upper() if ":" in symbol else "NSE"
+        return exchange_of(symbol)
 
     @staticmethod
     def _candles_frame(rows: list[dict]) -> pd.DataFrame:
@@ -305,7 +306,7 @@ class TrailingStopAgent:
         changes once a position is open, so symbol+entry_time is the closest thing this app has
         to a trade id.
         """
-        return f"{record.symbol}:{record.entry_time.isoformat()}"
+        return correlation_id_for(record)
 
     def _log_decision(
         self,
@@ -439,59 +440,32 @@ class TrailingStopAgent:
         instead of the client doing so first.
         """
         record = position.record
-        exit_side = Side.SELL if record.side == "BUY" else Side.BUY
         reason = "Force close; Auto Square off"
-        try:
-            self.orders.place(OrderRequest(record.symbol, exit_side, record.quantity, price, product="MIS", exchange=self._exchange(record.symbol)))
-        except Exception as error:
-            logger.error("Force-exit market order failed for %s: %s", record.symbol, error)
-            self.notifier.send(f"critical_unprotected: force-exit order failed for {record.symbol}: {error}")
-            self._intraday_broker_error = f"force-exit order failed for {record.symbol}: {error}"
+        outcome = close_position_at_market(
+            self.repository,
+            self.orders,
+            record,
+            price,
+            timestamp,
+            reason=reason,
+            event_kind="force_exit",
+            decision="FORCE_CLOSE",
+            notifier=self.notifier,
+        )
+        if not outcome.success:
+            logger.error("Force-exit market order failed for %s: %s", record.symbol, outcome.error)
+            self._intraday_broker_error = f"force-exit order failed for {record.symbol}: {outcome.error}"
             return
-        try:
-            if record.protective_order_id:
-                self.orders.cancel(record.protective_order_id)
-        except Exception:
-            logger.exception("Failed to cancel protective stop %s while force-exiting %s", record.protective_order_id, record.symbol)
-        multiplier = 1 if record.side == "BUY" else -1
-        pnl = multiplier * (price - record.entry_price) * record.quantity
-        self.repository.save_trade(
-            TradeRecord(
-                symbol=record.symbol,
-                entry_time=record.entry_time,
-                exit_time=timestamp,
-                entry_price=record.entry_price,
-                exit_price=price,
-                quantity=record.quantity,
-                pnl=pnl,
-                side=record.side,
-                position_type="INTRADAY",
-                strategy_name=record.strategy_name,
-                exit_reason=reason,
+        if outcome.cancel_error:
+            logger.error(
+                "Failed to cancel protective stop %s while force-exiting %s: %s",
+                record.protective_order_id,
+                record.symbol,
+                outcome.cancel_error,
             )
-        )
-        self.repository.delete_position(record.symbol)
         self.positions.pop(record.symbol, None)
-        self.repository.save_activity(
-            ActivityRecord(
-                event_kind="force_exit",
-                symbol=record.symbol,
-                timestamp=timestamp,
-                mode="LIVE",
-                price=price,
-                order_id=record.protective_order_id,
-                side=exit_side.value,
-                quantity=record.quantity,
-                entry_price=record.entry_price,
-                stop_loss=record.stop_loss,
-                pnl=pnl,
-                reason=reason,
-            )
-        )
-        logger.info("force_exit %s side=%s price=%.2f pnl=%.2f", record.symbol, exit_side.value, price, pnl)
-        self.notifier.send(f"{reason}: {record.symbol} closed at {price:.2f}, pnl={pnl:.2f}")
-        self._log_decision(record, event_type="exit", decision="FORCE_CLOSE", rationale=reason, outputs={"exit_price": price, "pnl": pnl})
-        self.repository.link_decision_outcome(self._correlation_id(record), {"exit_price": price, "pnl": pnl, "exit_reason": reason})
+        exit_side = Side.SELL if record.side == "BUY" else Side.BUY
+        logger.info("force_exit %s side=%s price=%.2f pnl=%.2f", record.symbol, exit_side.value, price, outcome.pnl)
 
     def _reconcile_intraday_positions(self, positions: list[AgentPosition], timestamp: datetime) -> None:
         """Detect an intraday position that closed at the broker -- a protective SL-M fill, a

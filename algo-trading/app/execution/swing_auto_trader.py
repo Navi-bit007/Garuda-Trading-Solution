@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, ROUND_FLOOR
 from math import floor
 from time import monotonic, sleep
@@ -10,8 +11,8 @@ import pandas as pd
 
 from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import NSE_TICK_SIZE, Side, TradingMode
-from app.market.candles import validate_ohlcv
-from app.market.indicators import atr, ema
+from app.database.models import PositionRecord, TradeRecord
+from app.database.repository import Repository
 from app.strategy.base import NoSignal
 from app.strategy.ema_9_200_swing import Ema9200SwingEvaluation, Ema9200SwingStrategy
 from app.strategy.signal import Signal
@@ -38,6 +39,21 @@ class SwingScanResult:
     insufficient_history: tuple[str, ...] = ()
     pending_candidates: tuple[SwingCandidate, ...] = ()
     strategy_name: str = "EMA 9/200 swing"
+    no_signal: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class SwingSymbolEvaluation:
+    """The outcome of evaluating a single symbol -- lets a caller (e.g. a parallel scan that
+    submits an order the moment a qualifying candidate is found, rather than waiting for the
+    whole universe to finish) act on one symbol without needing the full SwingScanResult."""
+
+    symbol: str
+    candidate: SwingCandidate | None = None
+    pending_candidate: SwingCandidate | None = None
+    no_signal_reasons: tuple[str, ...] = ()
+    insufficient_history: bool = False
+    error: str | None = None
 
 
 @dataclass
@@ -84,6 +100,7 @@ class SwingAutoTrader:
         mode: TradingMode = TradingMode.LIVE,
         trailing_atr_multiplier: float = 2.0,
         strategy_name: str = "EMA 9/200 swing",
+        repository: Repository | None = None,
     ):
         if trailing_atr_multiplier <= 0:
             raise ValueError("trailing ATR multiplier must be positive")
@@ -93,6 +110,7 @@ class SwingAutoTrader:
         self.strategy_name = ""
         self.strategy = Ema9200SwingStrategy()
         self.orders = OrderAPI(mode, client)
+        self.repository = repository
         self.tick_sizes: dict[int, float] = {}
         self.active_positions: dict[str, SwingPosition] = {}
         self.submitted_signal_keys: set[str] = set()
@@ -114,42 +132,73 @@ class SwingAutoTrader:
             return
         raise ValueError(f"unsupported swing strategy: {strategy_name}")
 
+    def evaluate_symbol(self, symbol: str, instrument_token: int, candle_loader: Callable[[int], pd.DataFrame]) -> SwingSymbolEvaluation:
+        """Evaluate one symbol in isolation -- the per-symbol body of scan()'s loop, pulled out
+        so a caller can run it the moment that symbol's candles are ready (e.g. from a
+        ThreadPoolExecutor future) instead of only after every other symbol has also been
+        fetched and scored. Mutates self.pending_breakouts for SWING_TREND_BREAKOUT exactly as
+        scan() did -- callers must call this from a single thread (candle *fetching* can be
+        parallelized, but this evaluation step is stateful and not thread-safe).
+        """
+        try:
+            candles = candle_loader(instrument_token)
+            if isinstance(self.strategy, SwingTrendBreakoutStrategy):
+                candidate = None
+                no_signal_reasons: list[str] = []
+                pending = self.pending_breakouts.pop(symbol, None)
+                if pending is not None:
+                    confirmed_signal = self.strategy.confirm_entry(pending, candles)
+                    if confirmed_signal is not None:
+                        candidate = SwingCandidate(symbol, int(instrument_token), pending, confirmed_signal)
+                    else:
+                        no_signal_reasons.append("breakout did not confirm on the next completed candle")
+                evaluation = self.strategy.evaluate(symbol, candles)
+                pending_candidate = None
+                if evaluation.qualified:
+                    self.pending_breakouts[symbol] = evaluation
+                    pending_candidate = SwingCandidate(symbol, int(instrument_token), evaluation)
+                else:
+                    no_signal_reasons.append("; ".join(evaluation.rejection_reasons) or "conditions not met")
+                return SwingSymbolEvaluation(symbol, candidate=candidate, pending_candidate=pending_candidate, no_signal_reasons=tuple(no_signal_reasons))
+            evaluation = self.strategy.evaluate(symbol, candles, instrument_token)
+        except NoSignal as no_signal_error:
+            return SwingSymbolEvaluation(symbol, no_signal_reasons=(str(no_signal_error) or "no qualifying signal",))
+        except ValueError as error:
+            if "not enough completed daily candles" in str(error):
+                return SwingSymbolEvaluation(symbol, insufficient_history=True)
+            return SwingSymbolEvaluation(symbol, error=str(error))
+        except Exception as error:
+            return SwingSymbolEvaluation(symbol, error=str(error))
+        return SwingSymbolEvaluation(symbol, candidate=SwingCandidate(symbol, int(instrument_token), evaluation))
+
     def scan(
         self,
         selected_symbols: dict[str, int],
         candle_loader: Callable[[int], pd.DataFrame],
+        on_progress: Callable[[int, int, str], None] | None = None,
     ) -> SwingScanResult:
         candidates: list[SwingCandidate] = []
         pending_candidates: list[SwingCandidate] = []
         errors: list[str] = []
         insufficient_history: list[str] = []
-        for symbol, instrument_token in selected_symbols.items():
-            try:
-                candles = candle_loader(instrument_token)
-                if isinstance(self.strategy, SwingTrendBreakoutStrategy):
-                    pending = self.pending_breakouts.pop(symbol, None)
-                    if pending is not None:
-                        confirmed_signal = self.strategy.confirm_entry(pending, candles)
-                        if confirmed_signal is not None:
-                            candidates.append(SwingCandidate(symbol, int(instrument_token), pending, confirmed_signal))
-                    evaluation = self.strategy.evaluate(symbol, candles)
-                    if evaluation.qualified:
-                        self.pending_breakouts[symbol] = evaluation
-                        pending_candidates.append(SwingCandidate(symbol, int(instrument_token), evaluation))
-                    continue
-                evaluation = self.strategy.evaluate(symbol, candles, instrument_token)
-            except NoSignal:
+        no_signal: list[tuple[str, str]] = []
+        total = len(selected_symbols)
+        for index, (symbol, instrument_token) in enumerate(selected_symbols.items(), start=1):
+            if on_progress is not None:
+                on_progress(index, total, symbol)
+            result = self.evaluate_symbol(symbol, instrument_token, candle_loader)
+            if result.error is not None:
+                errors.append(f"{symbol}: {result.error}")
                 continue
-            except ValueError as error:
-                if "not enough completed daily candles" in str(error):
-                    insufficient_history.append(symbol)
-                    continue
-                errors.append(f"{symbol}: {error}")
+            if result.insufficient_history:
+                insufficient_history.append(symbol)
                 continue
-            except Exception as error:
-                errors.append(f"{symbol}: {error}")
-                continue
-            candidates.append(SwingCandidate(symbol, int(instrument_token), evaluation))
+            if result.candidate is not None:
+                candidates.append(result.candidate)
+            if result.pending_candidate is not None:
+                pending_candidates.append(result.pending_candidate)
+            for reason in result.no_signal_reasons:
+                no_signal.append((symbol, reason))
         candidates.sort(key=lambda item: item.signal.timestamp, reverse=True)
         return SwingScanResult(
             tuple(candidates),
@@ -158,6 +207,7 @@ class SwingAutoTrader:
             tuple(insufficient_history),
             tuple(pending_candidates),
             self.strategy_name,
+            tuple(no_signal),
         )
 
     def submit_candidate(self, candidate: SwingCandidate, amount_limit: float, quantity_limit: int) -> SwingOrderResult:
@@ -177,7 +227,11 @@ class SwingAutoTrader:
             return SwingOrderResult(candidate.symbol, "skipped", "signal was already submitted")
         quantity = min(quantity_limit, floor(amount_limit / signal.price))
         if quantity < 1:
-            return SwingOrderResult(candidate.symbol, "rejected", "amount limit is smaller than one share")
+            return SwingOrderResult(
+                candidate.symbol,
+                "rejected",
+                f"amount limit ₹{amount_limit:,.2f} is smaller than one share at ₹{signal.price:,.2f} (quantity limit {quantity_limit})",
+            )
         if self.mode != TradingMode.LIVE:
             return SwingOrderResult(candidate.symbol, "rejected", "swing orders require LIVE trading mode", quantity)
 
@@ -193,7 +247,7 @@ class SwingAutoTrader:
             )
         stop_loss = self._round_down_to_tick(signal.stop_loss, tick_size)
         try:
-            order_id = self._place_market_order(exchange, tradingsymbol, quantity)
+            order_id = self._place_market_order(exchange, tradingsymbol, quantity, signal.price)
         except Exception as error:
             return SwingOrderResult(candidate.symbol, "rejected", f"broker order rejected: {error}", quantity)
 
@@ -228,7 +282,7 @@ class SwingAutoTrader:
             )
         except Exception as error:
             try:
-                exit_order_id = self._place_market_exit(pending_entry.candidate.symbol, filled_quantity)
+                exit_order_id = self._place_market_exit(pending_entry.candidate.symbol, filled_quantity, pending_entry.candidate.signal.price)
             except Exception as exit_error:
                 self.pending_entries.pop(signal_key, None)
                 self._register_position(
@@ -300,98 +354,6 @@ class SwingAutoTrader:
                 return max(0, int(position.get("quantity", 0) or 0))
         return 0
 
-    def manage_position(self, symbol: str, candles: pd.DataFrame, current_price: float | None = None) -> SwingOrderResult | None:
-        """Manage a trend-breakout position from completed daily candles."""
-        position = self.active_positions.get(symbol)
-        if position is None or position.strategy_name != "SWING_TREND_BREAKOUT":
-            return None
-        frame = validate_ohlcv(candles)
-        if frame.empty:
-            return None
-        latest = frame.iloc[-1]
-        latest_timestamp = latest["timestamp"]
-        close = float(latest["close"])
-        market_price = float(current_price) if current_price is not None else close
-
-        if market_price <= position.stop_loss:
-            return SwingOrderResult(symbol, "stop_triggered", "configured stop was reached; broker-side SL-M remains the exit boundary", position.quantity, protective_order_id=position.protective_order_id)
-
-        if position.target_1 is not None and not position.partial_profit_booked and market_price >= position.target_1:
-            partial_quantity = min(position.quantity, max(1, floor(position.quantity * 0.4)))
-            order_id = self._place_market_exit(symbol, partial_quantity)
-            position.quantity -= partial_quantity
-            position.partial_profit_booked = True
-            if position.quantity > 0 and position.protective_order_id is not None:
-                self._modify_protective_stop(symbol, position.protective_order_id, position.quantity, position.stop_loss, market_price)
-            return SwingOrderResult(symbol, "partial_profit_booked", f"booked 40% at 2R; remaining quantity {position.quantity}", partial_quantity, order_id, position.protective_order_id)
-
-        if latest_timestamp > position.entry_timestamp and close < float(ema(frame["close"], 20).iloc[-1]):
-            order_id = self._place_market_exit(symbol, position.quantity)
-            quantity = position.quantity
-            del self.active_positions[symbol]
-            try:
-                self._cancel_protective_stop(position.protective_order_id)
-            except Exception as error:
-                return SwingOrderResult(
-                    symbol,
-                    "critical_unprotected",
-                    f"market exit submitted but protective stop cancellation failed: {error}",
-                    quantity,
-                    order_id,
-                    position.protective_order_id,
-                )
-            return SwingOrderResult(symbol, "exited", "completed daily close below EMA20", quantity, order_id, position.protective_order_id)
-
-        ema20_value = float(ema(frame["close"], 20).iloc[-1])
-        candidate_stop = self._round_down_to_tick(
-            ema20_value,
-            self._position_tick_size(position),
-        )
-        if position.protective_order_id is not None and position.quantity > 0 and position.last_trailing_candle < latest_timestamp and position.stop_loss < candidate_stop < market_price:
-            self._modify_protective_stop(symbol, position.protective_order_id, position.quantity, candidate_stop, market_price)
-            position.stop_loss = candidate_stop
-            position.last_trailing_candle = latest_timestamp
-            return SwingOrderResult(symbol, "stop_trailed", f"EMA20 trailing stop moved to {candidate_stop:.2f}", position.quantity, protective_order_id=position.protective_order_id)
-        position.last_trailing_candle = max(position.last_trailing_candle, latest_timestamp)
-        return None
-
-    def trail_position(self, symbol: str, candles: pd.DataFrame, current_price: float | None = None) -> float | None:
-        position = self.active_positions.get(symbol)
-        if position is None or position.protective_order_id is None:
-            return None
-        frame = validate_ohlcv(candles)
-        if len(frame) < self.strategy.atr_period:
-            return None
-        latest = frame.iloc[-1]
-        latest_timestamp = latest["timestamp"]
-        if latest_timestamp <= position.last_trailing_candle:
-            return None
-        atr_value = float(atr(frame, self.strategy.atr_period).iloc[-1])
-        if not pd.notna(atr_value) or atr_value <= 0:
-            position.last_trailing_candle = latest_timestamp
-            return None
-        reference_price = float(latest["close"])
-        if current_price is not None:
-            reference_price = min(reference_price, float(current_price))
-        candidate_stop = reference_price - self.trailing_atr_multiplier * atr_value
-        candidate_stop = self._round_down_to_tick(
-            candidate_stop,
-            self._position_tick_size(position),
-        )
-        if candidate_stop <= position.stop_loss or candidate_stop >= reference_price:
-            position.last_trailing_candle = latest_timestamp
-            return None
-        self._modify_protective_stop(
-            symbol,
-            position.protective_order_id,
-            position.quantity,
-            candidate_stop,
-            reference_price,
-        )
-        position.stop_loss = candidate_stop
-        position.last_trailing_candle = latest_timestamp
-        return candidate_stop
-
     def sync_broker_positions(self) -> None:
         if self.mode != TradingMode.LIVE:
             return
@@ -404,7 +366,28 @@ class SwingAutoTrader:
         self.broker_open_symbols = open_symbols
         for symbol in list(self.active_positions):
             if self._tradingsymbol(symbol) not in open_symbols:
+                position = self.active_positions[symbol]
+                exit_price = self._broker_exit_fill_price(position)
                 del self.active_positions[symbol]
+                self._delete_position(symbol)
+                self._record_trade_history(position, position.quantity, exit_price, "broker-side position closed (protective stop or manual exit)")
+
+    def _broker_exit_fill_price(self, position: SwingPosition) -> float:
+        order_id = position.protective_order_id
+        if order_id and hasattr(self.client, "order_history"):
+            try:
+                history = self.client.order_history(order_id) or []
+            except Exception:
+                history = []
+            for record in reversed(history):
+                status = str(record.get("status", "")).upper()
+                try:
+                    average_price = float(record.get("average_price", 0) or 0)
+                except (TypeError, ValueError):
+                    average_price = 0
+                if status in {"COMPLETE", "COMPLETED", "FILLED"} and average_price > 0:
+                    return average_price
+        return position.stop_loss
 
     @staticmethod
     def _tradingsymbol(symbol: str) -> str:
@@ -414,17 +397,8 @@ class SwingAutoTrader:
     def _exchange(symbol: str) -> str:
         return symbol.split(":", 1)[0] if ":" in symbol else "NSE"
 
-    def _place_market_order(self, exchange: str, tradingsymbol: str, quantity: int) -> str:
-        return self.client.place_order(
-            variety="regular",
-            exchange=exchange,
-            tradingsymbol=tradingsymbol,
-            transaction_type=Side.BUY.value,
-            quantity=quantity,
-            product="CNC",
-            order_type="MARKET",
-            market_protection=-1,
-        )
+    def _place_market_order(self, exchange: str, tradingsymbol: str, quantity: int, price: float) -> str:
+        return self.orders.place(OrderRequest(f"{exchange}:{tradingsymbol}", Side.BUY, quantity, price, product="CNC", exchange=exchange))
 
     def _place_protective_stop(
         self,
@@ -446,17 +420,8 @@ class SwingAutoTrader:
             )
         )
 
-    def _place_market_exit(self, symbol: str, quantity: int) -> str:
-        return self.client.place_order(
-            variety="regular",
-            exchange=self._exchange(symbol),
-            tradingsymbol=self._tradingsymbol(symbol),
-            transaction_type=Side.SELL.value,
-            quantity=quantity,
-            product="CNC",
-            order_type="MARKET",
-            market_protection=-1,
-        )
+    def _place_market_exit(self, symbol: str, quantity: int, price: float) -> str:
+        return self.orders.place(OrderRequest(symbol, Side.SELL, quantity, price, product="CNC", exchange=self._exchange(symbol)))
 
     def _register_position(
         self,
@@ -482,6 +447,52 @@ class SwingAutoTrader:
             target_1=signal.target_1,
             strategy_name=self.strategy_name,
         )
+        self._save_position(self.active_positions[candidate.symbol])
+
+    def _save_position(self, position: SwingPosition) -> None:
+        if self.repository is None:
+            return
+        self.repository.save_position(
+            PositionRecord(
+                symbol=position.symbol,
+                side=Side.BUY.value,
+                quantity=position.quantity,
+                entry_price=position.entry_price,
+                stop_loss=position.stop_loss,
+                entry_time=position.entry_timestamp,
+                target_1=position.target_1,
+                protective_order_id=position.protective_order_id,
+                instrument_token=position.instrument_token,
+                position_type="SWING",
+                atr_multiplier=self.trailing_atr_multiplier,
+                strategy_name=position.strategy_name,
+                trading_mode=self.mode.value,
+            )
+        )
+
+    def _delete_position(self, symbol: str) -> None:
+        if self.repository is None:
+            return
+        self.repository.delete_position(symbol)
+
+    def _record_trade_history(self, position: SwingPosition, quantity: int, exit_price: float, exit_reason: str) -> None:
+        if self.repository is None:
+            return
+        self.repository.save_trade(
+            TradeRecord(
+                symbol=position.symbol,
+                entry_time=position.entry_timestamp,
+                exit_time=datetime.now(),
+                entry_price=position.entry_price,
+                exit_price=exit_price,
+                quantity=quantity,
+                pnl=(exit_price - position.entry_price) * quantity,
+                side=Side.BUY.value,
+                position_type="SWING",
+                strategy_name=position.strategy_name,
+                exit_reason=exit_reason,
+            )
+        )
 
     @staticmethod
     def _round_down_to_tick(price: float, tick_size: float) -> float:
@@ -492,31 +503,3 @@ class SwingAutoTrader:
         rounded = (price_decimal / tick_decimal).to_integral_value(rounding=ROUND_FLOOR) * tick_decimal
         return float(rounded)
 
-    def _modify_protective_stop(
-        self,
-        symbol: str,
-        order_id: str,
-        quantity: int,
-        trigger_price: float,
-        reference_price: float,
-    ) -> None:
-        self.orders.modify_protective_stop(
-            order_id,
-            OrderRequest(
-                symbol,
-                Side.SELL,
-                quantity,
-                reference_price,
-                trigger_price,
-                "CNC",
-                self._exchange(symbol),
-            ),
-        )
-
-    def _position_tick_size(self, position: SwingPosition) -> float:
-        return self.orders.tick_size(position.symbol, self._exchange(position.symbol))
-
-    def _cancel_protective_stop(self, order_id: str | None) -> None:
-        if order_id is None:
-            return
-        self.client.cancel_order(variety="regular", order_id=order_id)

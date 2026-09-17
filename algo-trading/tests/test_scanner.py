@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pandas as pd
@@ -104,6 +105,29 @@ def test_strategy_signal_scanner_returns_independent_buy_and_sell_limits():
     assert result.scanned == 3
 
 
+def test_evaluate_symbol_matches_sequential_scan_results_under_concurrent_use():
+    """The dashboard now fetches candles for many symbols in a ThreadPoolExecutor and calls
+    evaluate_symbol() for each as its fetch completes, so it can submit an order the moment a
+    signal is found instead of waiting for the whole universe. This proves evaluate_symbol
+    produces the same per-symbol outcome under real concurrency as scan() does sequentially --
+    each thread's captured candles/confirmation must never leak across symbols."""
+    frames = {"AAA": breakout_frame("bullish", 1499), "BBB": breakout_frame("bullish", 3000), "CCC": breakout_frame("bearish", 2000)}
+    scanner = StrategySignalScanner(buy_limit=5, sell_limit=5)
+    strategy = VwapEmaBreakoutStrategy()
+    regime = neutral_regime()
+
+    def evaluate(symbol: str):
+        candles = frames[symbol]
+        confirmation = confirmations("bearish" if symbol == "CCC" else "bullish")
+        return scanner.evaluate_symbol(symbol, None, strategy, lambda s, c=candles: c, regime, lambda s, cf=confirmation: cf)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {symbol: executor.submit(evaluate, symbol) for symbol in frames}
+        outcomes = {symbol: future.result().outcome for symbol, future in futures.items()}
+
+    assert outcomes == {"AAA": "buy", "BBB": "buy", "CCC": "sell"}
+
+
 def test_strategy_signal_scanner_reuses_supplied_regime_and_keeps_symbol_errors_local():
     calls = []
 
@@ -158,6 +182,76 @@ def test_strategy_signal_scanner_keeps_invalid_kite_token_local():
 
     assert result.buy["symbol"].tolist() == ["AAA"]
     assert result.errors == ("BBB: invalid token",)
+
+
+def test_strategy_signal_scanner_reports_progress_per_symbol_in_order():
+    progress_calls: list[tuple[int, int, str]] = []
+
+    StrategySignalScanner(buy_limit=5, sell_limit=5).scan(
+        candidates().iloc[:2],
+        VwapEmaBreakoutStrategy(),
+        lambda symbol: breakout_frame("bullish"),
+        neutral_regime(),
+        lambda symbol: confirmations("bullish"),
+        on_progress=lambda index, total, symbol: progress_calls.append((index, total, symbol)),
+    )
+
+    assert progress_calls == [(1, 2, "AAA"), (2, 2, "BBB")]
+
+
+def test_strategy_signal_scanner_records_insufficient_history_separately_from_errors():
+    def load_candles(symbol: str) -> pd.DataFrame:
+        return breakout_frame("bullish").iloc[:10]
+
+    result = StrategySignalScanner(buy_limit=5, sell_limit=5).scan(
+        candidates().iloc[:1],
+        VwapEmaBreakoutStrategy(),
+        load_candles,
+        neutral_regime(),
+        lambda symbol: confirmations("bullish"),
+    )
+
+    assert result.errors == ()
+    assert result.insufficient_history == ("AAA",)
+    assert result.no_signal == ()
+
+
+class LowScoreStrategy:
+    name = "LOW_SCORE"
+
+    def generate_signal(self, symbol, candles):
+        from app.config.constants import SignalAction
+        from app.strategy.signal import Signal
+
+        latest = candles.iloc[-1]
+        return Signal(symbol, SignalAction.BUY, latest["timestamp"].to_pydatetime(), float(latest["close"]), float(latest["close"] - 5), "test", score=10)
+
+
+def test_strategy_signal_scanner_records_no_signal_reason_for_low_score():
+    result = StrategySignalScanner(buy_limit=5, sell_limit=5, minimum_score=80).scan(
+        candidates().iloc[:1],
+        LowScoreStrategy(),
+        lambda symbol: breakout_frame("bullish"),
+    )
+
+    assert result.buy.empty
+    assert len(result.no_signal) == 1
+    symbol, reason = result.no_signal[0]
+    assert symbol == "AAA"
+    assert "below threshold" in reason
+
+
+def test_strategy_signal_scanner_result_defaults_are_empty_tuples():
+    result = StrategySignalScanner(buy_limit=5, sell_limit=5).scan(
+        candidates().iloc[:1],
+        VwapEmaBreakoutStrategy(),
+        lambda symbol: breakout_frame("bullish"),
+        neutral_regime(),
+        lambda symbol: confirmations("bullish"),
+    )
+
+    assert isinstance(result.insufficient_history, tuple)
+    assert isinstance(result.no_signal, tuple)
 
 
 def test_strategy_signal_scanner_preserves_previous_day_high_metadata():

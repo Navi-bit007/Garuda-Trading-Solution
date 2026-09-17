@@ -6,7 +6,7 @@ from app.database.database import Database
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.database.models import ActivityRecord, DynamicWatchlistRecord, NotificationRecord, OrderRecord, PositionRecord, PreSpikeEventRecord, ProgressiveEmaCycleRecord, SignalEngineStatus, SignalRecord, StrategyPresetRecord, TradeRecord, WatchlistRecord
+from app.database.models import ActivityRecord, AgentHeartbeat, DecisionLogRecord, DynamicWatchlistRecord, NotificationRecord, OrderRecord, PositionRecord, PreSpikeEventRecord, ProgressiveEmaCycleRecord, SignalEngineStatus, SignalRecord, StrategyPresetRecord, TradeRecord, WatchlistRecord
 
 EXPORT_TIMEZONE = ZoneInfo("Asia/Kolkata")
 EXPORT_TIMESTAMP_KEYS = {
@@ -57,13 +57,46 @@ class Repository:
 
     def save_trade(self, trade: TradeRecord) -> None:
         with self.database.lock:
-            self.database.connection.execute("INSERT INTO trades (symbol, entry_time, exit_time, entry_price, exit_price, quantity, pnl) VALUES (?, ?, ?, ?, ?, ?, ?)", (trade.symbol, trade.entry_time.isoformat(), trade.exit_time.isoformat(), trade.entry_price, trade.exit_price, trade.quantity, trade.pnl))
+            self.database.connection.execute(
+                """
+                INSERT INTO trades (
+                    symbol, entry_time, exit_time, entry_price, exit_price, quantity, pnl,
+                    side, position_type, strategy_name, exit_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade.symbol, trade.entry_time.isoformat(), trade.exit_time.isoformat(),
+                    trade.entry_price, trade.exit_price, trade.quantity, trade.pnl,
+                    trade.side, trade.position_type, trade.strategy_name, trade.exit_reason,
+                ),
+            )
             self.database.connection.commit()
+
+    def load_trades(self) -> list[TradeRecord]:
+        with self.database.lock:
+            rows = self.database.connection.execute("SELECT * FROM trades ORDER BY exit_time DESC").fetchall()
+        return [
+            TradeRecord(
+                symbol=row["symbol"],
+                entry_time=datetime.fromisoformat(row["entry_time"]),
+                exit_time=datetime.fromisoformat(row["exit_time"]),
+                entry_price=float(row["entry_price"]),
+                exit_price=float(row["exit_price"]),
+                quantity=int(row["quantity"]),
+                pnl=float(row["pnl"]),
+                side=row["side"] if row["side"] is not None else "BUY",
+                position_type=row["position_type"] if row["position_type"] is not None else "INTRADAY",
+                strategy_name=row["strategy_name"] if row["strategy_name"] is not None else "",
+                exit_reason=row["exit_reason"] if row["exit_reason"] is not None else "",
+            )
+            for row in rows
+        ]
 
     def save_activity(self, activity: ActivityRecord) -> None:
         with self.database.lock:
             self.database.connection.execute(
-                "INSERT INTO activity (event_kind, symbol, timestamp, mode, price, order_id, side, quantity, entry_price, stop_loss, pnl, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO activity (event_kind, symbol, timestamp, mode, price, order_id, side, quantity, entry_price, stop_loss, pnl, reason, previous_stop) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     activity.event_kind,
                     activity.symbol,
@@ -77,9 +110,108 @@ class Repository:
                     activity.stop_loss,
                     activity.pnl,
                     activity.reason,
+                    activity.previous_stop,
                 ),
             )
             self.database.connection.commit()
+
+    def save_decision(self, decision: DecisionLogRecord) -> int:
+        """Append one row to the unified decision log and return its id.
+
+        The returned id is only useful as a `source_id` for something logged in the same
+        request; it is never used to look the row back up for mutation -- outcomes are joined
+        on `correlation_id` instead (see `link_decision_outcome`), since a single trade's
+        entry/trail/exit rows are written far apart in time by different callers that don't
+        share a row id.
+        """
+        with self.database.lock:
+            cursor = self.database.connection.execute(
+                """
+                INSERT INTO decision_log
+                (timestamp, symbol, event_type, strategy_name, mode, decision, rationale, inputs, outputs, confidence, correlation_id, outcome, source_table, source_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.timestamp.isoformat(),
+                    decision.symbol,
+                    decision.event_type,
+                    decision.strategy_name,
+                    decision.mode,
+                    decision.decision,
+                    decision.rationale,
+                    json.dumps(decision.inputs, sort_keys=True, default=str),
+                    json.dumps(decision.outputs, sort_keys=True, default=str),
+                    decision.confidence,
+                    decision.correlation_id,
+                    json.dumps(decision.outcome, sort_keys=True, default=str) if decision.outcome is not None else None,
+                    decision.source_table,
+                    decision.source_id,
+                ),
+            )
+            self.database.connection.commit()
+            return int(cursor.lastrowid)
+
+    def link_decision_outcome(self, correlation_id: str, outcome: dict[str, object]) -> int:
+        """Backfill `outcome` onto every decision-log row sharing `correlation_id` that doesn't
+        already have one -- called once a trade's real result is known (a fill, a close), so
+        earlier decisions (the signal that proposed it, every stop trail along the way) end up
+        labelled with what actually happened. Returns the number of rows updated."""
+        if not correlation_id:
+            return 0
+        with self.database.lock:
+            cursor = self.database.connection.execute(
+                "UPDATE decision_log SET outcome = ? WHERE correlation_id = ? AND outcome IS NULL",
+                (json.dumps(outcome, sort_keys=True, default=str), correlation_id),
+            )
+            self.database.connection.commit()
+            return cursor.rowcount
+
+    def load_decisions(
+        self,
+        symbol: str | None = None,
+        event_type: str | None = None,
+        correlation_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 200,
+    ) -> list[DecisionLogRecord]:
+        query = "SELECT * FROM decision_log WHERE 1=1"
+        parameters: list[object] = []
+        if symbol is not None:
+            query += " AND symbol = ?"
+            parameters.append(symbol)
+        if event_type is not None:
+            query += " AND event_type = ?"
+            parameters.append(event_type)
+        if correlation_id is not None:
+            query += " AND correlation_id = ?"
+            parameters.append(correlation_id)
+        if since is not None:
+            query += " AND timestamp >= ?"
+            parameters.append(since.isoformat())
+        query += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+        parameters.append(limit)
+        with self.database.lock:
+            rows = self.database.connection.execute(query, parameters).fetchall()
+        return [self._decision_from_row(row) for row in rows]
+
+    @staticmethod
+    def _decision_from_row(row) -> DecisionLogRecord:
+        return DecisionLogRecord(
+            timestamp=datetime.fromisoformat(row["timestamp"]),
+            symbol=row["symbol"],
+            event_type=row["event_type"],
+            strategy_name=row["strategy_name"] or "",
+            mode=row["mode"] or "LIVE",
+            decision=row["decision"] or "",
+            rationale=row["rationale"] or "",
+            inputs=json.loads(row["inputs"] or "{}"),
+            outputs=json.loads(row["outputs"] or "{}"),
+            confidence=float(row["confidence"]) if row["confidence"] is not None else None,
+            correlation_id=row["correlation_id"] or "",
+            outcome=json.loads(row["outcome"]) if row["outcome"] is not None else None,
+            source_table=row["source_table"] or "",
+            source_id=row["source_id"] or "",
+        )
 
     def save_notification(self, notification: NotificationRecord) -> bool:
         signal_id = f"{notification.instrument_token or notification.symbol}:{notification.side}:{notification.signal_timestamp.isoformat()}"
@@ -664,19 +796,119 @@ class Repository:
         heartbeat_at = datetime.fromisoformat(row["heartbeat_at"]) if row["heartbeat_at"] else datetime.fromisoformat(row["last_run_at"])
         return SignalEngineStatus(row["user_id"], datetime.fromisoformat(row["last_run_at"]), row["last_error"], heartbeat_at)
 
+    def save_agent_heartbeat(self, status: AgentHeartbeat) -> None:
+        heartbeat_at = status.heartbeat_at or status.last_run_at
+        with self.database.lock:
+            self.database.connection.execute(
+                """
+                INSERT INTO agent_heartbeat (engine_name, last_run_at, last_error, heartbeat_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(engine_name) DO UPDATE SET
+                    last_run_at=excluded.last_run_at,
+                    last_error=excluded.last_error,
+                    heartbeat_at=excluded.heartbeat_at
+                """,
+                (status.engine_name, status.last_run_at.isoformat(), status.last_error, heartbeat_at.isoformat()),
+            )
+            self.database.connection.commit()
+
+    def load_agent_heartbeat(self, engine_name: str) -> AgentHeartbeat | None:
+        with self.database.lock:
+            row = self.database.connection.execute(
+                "SELECT engine_name, last_run_at, last_error, heartbeat_at FROM agent_heartbeat WHERE engine_name = ?",
+                (engine_name,),
+            ).fetchone()
+        if row is None:
+            return None
+        heartbeat_at = datetime.fromisoformat(row["heartbeat_at"]) if row["heartbeat_at"] else datetime.fromisoformat(row["last_run_at"])
+        return AgentHeartbeat(row["engine_name"], datetime.fromisoformat(row["last_run_at"]), row["last_error"], heartbeat_at)
+
+    def save_agent_pid(self, engine_name: str, pid: int) -> None:
+        """Record the OS process id of a just-launched agent so it can be stopped from the UI
+        later without the operator having to hunt it down in Task Manager. Upserts a placeholder
+        heartbeat row if none exists yet -- the agent's own first real heartbeat (within
+        STARTUP_GRACE_SECONDS) overwrites the placeholder timestamps immediately."""
+        now = datetime.now().isoformat()
+        with self.database.lock:
+            self.database.connection.execute(
+                """
+                INSERT INTO agent_heartbeat (engine_name, last_run_at, last_error, heartbeat_at, pid)
+                VALUES (?, ?, '', ?, ?)
+                ON CONFLICT(engine_name) DO UPDATE SET pid=excluded.pid
+                """,
+                (engine_name, now, now, pid),
+            )
+            self.database.connection.commit()
+
+    def get_agent_pid(self, engine_name: str) -> int | None:
+        with self.database.lock:
+            row = self.database.connection.execute(
+                "SELECT pid FROM agent_heartbeat WHERE engine_name = ?",
+                (engine_name,),
+            ).fetchone()
+        return int(row["pid"]) if row and row["pid"] is not None else None
+
+    def clear_agent_heartbeat(self, engine_name: str) -> None:
+        """Drop the heartbeat row after deliberately stopping an agent, so the dashboard reflects
+        "not running" immediately instead of waiting up to HEARTBEAT_STALE_SECONDS for the last
+        heartbeat to age out."""
+        with self.database.lock:
+            self.database.connection.execute("DELETE FROM agent_heartbeat WHERE engine_name = ?", (engine_name,))
+            self.database.connection.commit()
+
+    def set_auto_start_trailing_agent(self, user_id: str, enabled: bool) -> None:
+        with self.database.lock:
+            self.database.connection.execute(
+                """
+                INSERT INTO agent_preferences (user_id, auto_start_trailing_agent)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET auto_start_trailing_agent=excluded.auto_start_trailing_agent
+                """,
+                (user_id, int(enabled)),
+            )
+            self.database.connection.commit()
+
+    def get_auto_start_trailing_agent(self, user_id: str) -> bool:
+        with self.database.lock:
+            row = self.database.connection.execute(
+                "SELECT auto_start_trailing_agent FROM agent_preferences WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return bool(row["auto_start_trailing_agent"]) if row is not None else False
+
     def save_position(self, position: PositionRecord) -> None:
         with self.database.lock:
             self.database.connection.execute(
                 """
-            INSERT INTO positions (symbol, side, quantity, entry_price, stop_loss, entry_time, target_1, target_2, protective_order_id, target_1_hit)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO positions (
+                symbol, side, quantity, entry_price, stop_loss, entry_time, target_1, target_2,
+                protective_order_id, target_1_hit, instrument_token, position_type, atr_multiplier, strategy_name,
+                trading_mode
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 side=excluded.side, quantity=excluded.quantity, entry_price=excluded.entry_price,
                 stop_loss=excluded.stop_loss, entry_time=excluded.entry_time, target_1=excluded.target_1,
                 target_2=excluded.target_2, protective_order_id=excluded.protective_order_id,
-                target_1_hit=excluded.target_1_hit
+                target_1_hit=excluded.target_1_hit, instrument_token=excluded.instrument_token,
+                position_type=excluded.position_type, atr_multiplier=excluded.atr_multiplier,
+                strategy_name=excluded.strategy_name, trading_mode=excluded.trading_mode
                 """,
-                (position.symbol, position.side, position.quantity, position.entry_price, position.stop_loss, position.entry_time.isoformat(), position.target_1, position.target_2, position.protective_order_id, int(position.target_1_hit)),
+                (
+                    position.symbol, position.side, position.quantity, position.entry_price, position.stop_loss,
+                    position.entry_time.isoformat(), position.target_1, position.target_2,
+                    position.protective_order_id, int(position.target_1_hit), position.instrument_token,
+                    position.position_type, position.atr_multiplier, position.strategy_name,
+                    position.trading_mode,
+                ),
+            )
+            self.database.connection.commit()
+
+    def update_stop_price(self, symbol: str, stop_loss: float) -> None:
+        with self.database.lock:
+            self.database.connection.execute(
+                "UPDATE positions SET stop_loss = ? WHERE symbol = ?",
+                (stop_loss, symbol),
             )
             self.database.connection.commit()
 
@@ -700,6 +932,11 @@ class Repository:
                 target_2=float(row["target_2"]) if row["target_2"] is not None else None,
                 protective_order_id=row["protective_order_id"],
                 target_1_hit=bool(row["target_1_hit"]),
+                instrument_token=int(row["instrument_token"]) if row["instrument_token"] is not None else None,
+                position_type=row["position_type"] if row["position_type"] is not None else "INTRADAY",
+                atr_multiplier=float(row["atr_multiplier"]) if row["atr_multiplier"] is not None else None,
+                strategy_name=row["strategy_name"] if row["strategy_name"] is not None else "",
+                trading_mode=row["trading_mode"] if row["trading_mode"] is not None else "LIVE",
             )
             for row in rows
         ]
@@ -713,12 +950,24 @@ class Repository:
         return row is not None
 
     def load_daily_trade_stats(self, day: str) -> tuple[int, float]:
+        """Returns (entries taken today, realized P&L from trades closed today).
+
+        These come from two different event kinds -- an entry's own activity row has no P&L yet
+        (it isn't known until the position closes), and a position opened today may still be
+        open, so it wouldn't show up if this only looked at exits. Counting entries (not closes)
+        here matches DailyLimits.can_trade(): a position closing must never appear to free up
+        headroom for a new one within the same day.
+        """
         with self.database.lock:
-            row = self.database.connection.execute(
-                "SELECT COUNT(*) AS trades, COALESCE(SUM(pnl), 0) AS pnl FROM activity WHERE event_kind IN ('exit_submitted', 'broker_exit_detected') AND substr(timestamp, 1, 10) = ?",
+            entries_row = self.database.connection.execute(
+                "SELECT COUNT(*) AS entries FROM activity WHERE event_kind = 'entry_submitted' AND substr(timestamp, 1, 10) = ?",
                 (day,),
             ).fetchone()
-        return int(row["trades"]), float(row["pnl"])
+            pnl_row = self.database.connection.execute(
+                "SELECT COALESCE(SUM(pnl), 0) AS pnl FROM activity WHERE event_kind IN ('exit_submitted', 'broker_exit_detected') AND substr(timestamp, 1, 10) = ?",
+                (day,),
+            ).fetchone()
+        return int(entries_row["entries"]), float(pnl_row["pnl"])
 
     def save_strategy_preset(self, preset: StrategyPresetRecord) -> None:
         with self.database.lock:
@@ -766,6 +1015,38 @@ class Repository:
                 """,
                 (user_id, json.dumps(settings, sort_keys=True), datetime.now().isoformat()),
             )
+            self.database.connection.commit()
+
+    def save_kite_access_token(self, user_id: str, access_token: str) -> None:
+        """Persist the day's Kite access token so a new browser tab/session (which starts with
+        empty st.session_state -- Streamlit does not share session state across tabs, even
+        duplicated ones) can pick it up without re-running the Kite login flow. Cleared on
+        logout via clear_kite_access_token; a token from a previous trading day is naturally
+        stale (Zerodha invalidates it) rather than actively expired here."""
+        with self.database.lock:
+            self.database.connection.execute(
+                """
+                INSERT INTO kite_session (user_id, access_token, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    access_token=excluded.access_token,
+                    updated_at=excluded.updated_at
+                """,
+                (user_id, access_token, datetime.now().isoformat()),
+            )
+            self.database.connection.commit()
+
+    def load_kite_access_token(self, user_id: str) -> str:
+        with self.database.lock:
+            row = self.database.connection.execute(
+                "SELECT access_token FROM kite_session WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+
+    def clear_kite_access_token(self, user_id: str) -> None:
+        with self.database.lock:
+            self.database.connection.execute("DELETE FROM kite_session WHERE user_id = ?", (user_id,))
             self.database.connection.commit()
 
     def load_dashboard_settings(self, user_id: str) -> dict:

@@ -94,6 +94,35 @@ class OrderAPI:
             raise RuntimeError("live order cancellation requires a connected Kite client")
         self.client.cancel_order(variety="regular", order_id=order_id)
 
+    def required_intraday_margin(self, symbol: str) -> float | None:
+        """Ask the broker for the real per-share MIS margin it requires for `symbol` right now,
+        via Kite's order-margin calculator -- the same endpoint the order ticket UI uses to show
+        e.g. "Required Rs94.13 (5x)". This reflects the actual, current leverage Zerodha is
+        granting for this specific stock (SEBI peak-margin category, volatility, liquidity),
+        rather than a single number assumed for every stock. Returns None if the client can't
+        answer (PAPER mode, no client, or the endpoint call fails) so callers can fall back.
+        """
+        if self.client is None or not hasattr(self.client, "order_margins"):
+            return None
+        exchange, tradingsymbol = self._split_symbol(symbol, "NSE")
+        response = self.client.order_margins(
+            [
+                {
+                    "exchange": exchange,
+                    "tradingsymbol": tradingsymbol,
+                    "transaction_type": "BUY",
+                    "variety": "regular",
+                    "product": "MIS",
+                    "order_type": "MARKET",
+                    "quantity": 1,
+                    "price": 0,
+                    "trigger_price": 0,
+                }
+            ]
+        )
+        margin_per_share = float(response[0]["total"])
+        return margin_per_share if margin_per_share > 0 else None
+
     def register_tick_size(self, symbol: str, tick_size: float) -> None:
         exchange, tradingsymbol = self._split_symbol(symbol, "NSE")
         if tick_size <= 0:
@@ -185,11 +214,14 @@ class OrderAPI:
         )
 
     def _modify_live_protective_stop(self, order_id: str, request: OrderRequest) -> None:
+        # Kite Connect's modify_order() has no `product` parameter at all -- product type isn't
+        # something you change on an existing order, only on a fresh place_order() -- so passing
+        # it here always raised a TypeError and silently killed every trailing-stop update at
+        # the broker (retried 3x, then given up on, every single cycle, for every live position).
         self.client.modify_order(
             variety="regular",
             order_id=order_id,
             quantity=request.quantity,
-            product=request.product,
             order_type="SL-M",
             trigger_price=request.stop_loss,
             market_protection=-1,

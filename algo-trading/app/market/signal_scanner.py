@@ -27,6 +27,20 @@ class SignalScanResult:
     sell: pd.DataFrame
     errors: tuple[str, ...]
     scanned: int
+    insufficient_history: tuple[str, ...] = ()
+    no_signal: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class SymbolEvaluation:
+    """The outcome of evaluating a single symbol -- lets a caller (e.g. a parallel scan that
+    submits an order the moment a qualifying signal is found, rather than waiting for the whole
+    universe to finish) act on one symbol without needing the full SignalScanResult."""
+
+    symbol: str
+    outcome: str  # "buy" | "sell" | "no_signal" | "insufficient_history" | "error"
+    row: dict | None = None
+    detail: str = ""
 
 
 class StrategySignalScanner:
@@ -39,6 +53,50 @@ class StrategySignalScanner:
         self.sell_limit = sell_limit
         self.minimum_score = minimum_score
 
+    def evaluate_symbol(
+        self,
+        symbol: str,
+        token: int | None,
+        strategy: Strategy,
+        candle_loader: Callable[[str], pd.DataFrame],
+        market_regime: MarketRegimeContext | None = None,
+        confirmation_loader: Callable[[str], TimeframeConfirmation] | None = None,
+    ) -> SymbolEvaluation:
+        """Evaluate one symbol in isolation -- the per-symbol body of scan()'s loop, pulled out
+        so a caller can run it the moment that symbol's candles are ready (e.g. from a
+        ThreadPoolExecutor future) instead of only after every other symbol has also been
+        fetched and scored."""
+        try:
+            candles = candle_loader(symbol)
+            confirmation = confirmation_loader(symbol) if confirmation_loader else None
+            if isinstance(strategy, type) or not hasattr(strategy, "evaluate"):
+                signal = strategy.generate_signal(symbol, candles)
+                row = self._signal_row(signal, strategy, token)
+            else:
+                evaluation = strategy.evaluate(
+                    symbol,
+                    candles,
+                    market_regime=market_regime,
+                    confirmation=confirmation,
+                )
+                signal = evaluation.signal
+                row = self._evaluation_row(evaluation, strategy, token)
+            if signal.score < self.minimum_score:
+                return SymbolEvaluation(symbol, "no_signal", detail=f"score {signal.score} below threshold {self.minimum_score}")
+        except NoSignal as no_signal_error:
+            return SymbolEvaluation(symbol, "no_signal", detail=str(no_signal_error) or "no qualifying signal")
+        except ValueError as error:
+            if str(error).startswith("not enough"):
+                return SymbolEvaluation(symbol, "insufficient_history")
+            return SymbolEvaluation(symbol, "error", detail=str(error))
+        except Exception as error:
+            return SymbolEvaluation(symbol, "error", detail=str(error))
+        if signal.action == SignalAction.BUY:
+            return SymbolEvaluation(symbol, "buy", row=row)
+        if signal.action == SignalAction.SELL:
+            return SymbolEvaluation(symbol, "sell", row=row)
+        return SymbolEvaluation(symbol, "no_signal", detail="signal action is neither BUY nor SELL")
+
     def scan(
         self,
         selected_stocks: Iterable[str] | pd.DataFrame,
@@ -46,43 +104,36 @@ class StrategySignalScanner:
         candle_loader: Callable[[str], pd.DataFrame],
         market_regime: MarketRegimeContext | None = None,
         confirmation_loader: Callable[[str], TimeframeConfirmation] | None = None,
+        on_progress: Callable[[int, int, str], None] | None = None,
     ) -> SignalScanResult:
         candidates = self._normalise_selected_stocks(selected_stocks)
         buys: list[dict] = []
         sells: list[dict] = []
         errors: list[str] = []
-        for symbol, token in candidates:
-            try:
-                candles = candle_loader(symbol)
-                confirmation = confirmation_loader(symbol) if confirmation_loader else None
-                if isinstance(strategy, type) or not hasattr(strategy, "evaluate"):
-                    signal = strategy.generate_signal(symbol, candles)
-                    row = self._signal_row(signal, strategy, token)
-                else:
-                    evaluation = strategy.evaluate(
-                        symbol,
-                        candles,
-                        market_regime=market_regime,
-                        confirmation=confirmation,
-                    )
-                    signal = evaluation.signal
-                    row = self._evaluation_row(evaluation, strategy, token)
-                if signal.score < self.minimum_score:
-                    continue
-            except NoSignal:
-                continue
-            except Exception as error:
-                errors.append(f"{symbol}: {error}")
-                continue
-            if signal.action == SignalAction.BUY:
-                buys.append(row)
-            elif signal.action == SignalAction.SELL:
-                sells.append(row)
+        insufficient_history: list[str] = []
+        no_signal: list[tuple[str, str]] = []
+        total = len(candidates)
+        for index, (symbol, token) in enumerate(candidates, start=1):
+            if on_progress is not None:
+                on_progress(index, total, symbol)
+            result = self.evaluate_symbol(symbol, token, strategy, candle_loader, market_regime, confirmation_loader)
+            if result.outcome == "buy":
+                buys.append(result.row)
+            elif result.outcome == "sell":
+                sells.append(result.row)
+            elif result.outcome == "insufficient_history":
+                insufficient_history.append(symbol)
+            elif result.outcome == "error":
+                errors.append(f"{symbol}: {result.detail}")
+            else:
+                no_signal.append((symbol, result.detail))
         return SignalScanResult(
             buy=self._rank(buys, self.buy_limit),
             sell=self._rank(sells, self.sell_limit),
             errors=tuple(errors),
             scanned=len(candidates),
+            insufficient_history=tuple(insufficient_history),
+            no_signal=tuple(no_signal),
         )
 
     @staticmethod

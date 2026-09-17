@@ -4,14 +4,16 @@ from collections.abc import Mapping
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
+import logging
 import math
+from time import monotonic, sleep
 from typing import Any, Iterable
 
 import pandas as pd
 
 from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import Side, SignalAction, TradingMode
-from app.database.models import ActivityRecord, PositionRecord
+from app.database.models import ActivityRecord, PositionRecord, TradeRecord
 from app.execution.order_manager import OrderManager
 from app.execution.position_manager import Position, PositionManager
 from app.execution.trailing_stop import TrailingStop
@@ -25,6 +27,8 @@ from app.risk.risk_manager import RiskManager
 from app.strategy.base import NoSignal
 from app.strategy.base import Strategy
 from app.strategy.signal import Signal
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,23 @@ class ClosedPosition:
 class TradingPipeline:
     """Deterministic tick-to-order pipeline with PAPER as the default boundary."""
 
+    # Kite's place_order() only confirms an order was accepted into the broker's OMS queue --
+    # the real RMS/exchange accept-or-reject decision happens moments later, asynchronously.
+    # These bound how long _submit_entry() polls order_history() for that terminal outcome
+    # before trusting the accepted order id enough to log entry_submitted and open a position.
+    # Mirrors SwingAutoTrader.ENTRY_FILL_TIMEOUT_SECONDS/ENTRY_FILL_POLL_SECONDS.
+    ENTRY_FILL_TIMEOUT_SECONDS = 10.0
+    ENTRY_FILL_POLL_SECONDS = 0.5
+    ENTRY_FILLED_STATUSES = {"COMPLETE", "COMPLETED", "FILLED"}
+    ENTRY_REJECTED_STATUSES = {"REJECTED", "CANCELLED"}
+    # Confirmed live: cancelling the protective stop right after its sibling entry order is
+    # rejected regularly fails with kiteconnect.exceptions.InputException("Order cannot be
+    # cancelled as it is being processed. Try later.") -- Zerodha's own RMS/exchange pipeline
+    # hasn't settled the just-submitted order into a stable, cancellable state yet. Without a
+    # retry here, that stop is left resting at the broker with no position behind it at all.
+    PROTECTIVE_STOP_CANCEL_RETRY_ATTEMPTS = 3
+    PROTECTIVE_STOP_CANCEL_RETRY_BACKOFF_SECONDS = 1.0
+
     def __init__(self, settings: Any, token_to_symbol: dict[int, str], strategy: Strategy, broker_client: Any = None, activity_repository: Any = None):
         if settings.trading_mode == TradingMode.LIVE and broker_client is None:
             raise ValueError("LIVE pipeline requires an authenticated broker client")
@@ -89,13 +110,13 @@ class TradingPipeline:
         self.history: dict[str, list[dict]] = defaultdict(list)
         self.last_prices: dict[str, float] = {}
         self.last_atr: dict[str, float] = {}
-        self.limits = DailyLimits(settings.initial_capital, settings.max_daily_loss, settings.max_trades_per_day)
+        self.limits = DailyLimits(settings.initial_capital, settings.max_trades_per_day)
         self.risk = RiskManager(
             settings.initial_capital,
-            settings.risk_per_trade,
             settings.max_open_positions,
             self.limits,
             Exposure(settings.initial_capital, settings.max_capital_deployment),
+            default_leverage=float(getattr(settings, "intraday_leverage_multiplier", 1.0)),
         )
         self.halted = False
         self._restore_daily_limits()
@@ -199,9 +220,9 @@ class TradingPipeline:
         stop_is_invalid = stop_loss >= price if action == SignalAction.BUY else stop_loss <= price
         if price <= 0 or stop_loss <= 0 or stop_is_invalid:
             stop_direction = "below" if action == SignalAction.BUY else "above"
-            return self._event("entry_rejected", symbol, signal_timestamp, price, reason=f"stop loss must be positive and {stop_direction} entry price", side=action.value, entry_price=price, stop_loss=stop_loss)
+            return self._event("entry_rejected", symbol, signal_timestamp, price, reason=f"stop loss ({stop_loss}) must be positive and {stop_direction} entry price ({price})", side=action.value, entry_price=price, stop_loss=stop_loss)
         if quantity is not None and quantity <= 0:
-            return self._event("entry_rejected", symbol, signal_timestamp, price, reason="quantity must be positive", side=action.value, entry_price=price, stop_loss=stop_loss)
+            return self._event("entry_rejected", symbol, signal_timestamp, price, reason=f"quantity must be positive (requested {quantity})", side=action.value, entry_price=price, stop_loss=stop_loss)
         return self._submit_entry(
             Signal(symbol, action, signal_timestamp, price, stop_loss, "manual entry", target_1=target_1, target_2=target_2),
             quantity,
@@ -233,15 +254,19 @@ class TradingPipeline:
     def sync_broker_positions(self) -> list[PipelineEvent]:
         if self.settings.trading_mode != TradingMode.LIVE or self.orders.client is None:
             return []
-        broker_positions = self.orders.client.positions().get("net", [])
-        broker_quantities = {
-            str(position.get("tradingsymbol", "")).strip().upper(): int(position.get("quantity", 0) or 0)
-            for position in broker_positions
-        }
+        try:
+            broker_positions = self.orders.client.positions().get("net", [])
+        except Exception:
+            logger.exception("Broker position lookup failed while reconciling %s managed intraday position(s); reconciliation skipped this cycle", len(self.managed_positions))
+            raise
+        broker_by_tradingsymbol = {str(position.get("tradingsymbol", "")).strip().upper(): position for position in broker_positions}
         events: list[PipelineEvent] = []
         for symbol, managed in list(self.managed_positions.items()):
             tradingsymbol = symbol.split(":", 1)[-1].strip().upper()
-            if broker_quantities.get(tradingsymbol, 0) != 0:
+            broker_position = broker_by_tradingsymbol.get(tradingsymbol)
+            broker_quantity = int(broker_position.get("quantity", 0) or 0) if broker_position else 0
+            if broker_quantity != 0:
+                self._reconcile_entry_price(symbol, managed, broker_position)
                 continue
             exit_price, exit_order_id, fill_reason = self._broker_exit_fill(managed)
             reason = f"broker-side position closed; {fill_reason}"
@@ -263,6 +288,7 @@ class TradingPipeline:
                 reason,
             )
             self.recent_closed_positions = [closed, *self.recent_closed_positions[:19]]
+            self._record_trade_history(managed, closed, reason)
             events.append(
                 self._event(
                     "broker_exit_detected",
@@ -278,6 +304,44 @@ class TradingPipeline:
                 )
             )
         return events
+
+    def _reconcile_entry_price(self, symbol: str, managed: ManagedPosition, broker_position: dict) -> None:
+        """Correct a still-open position's entry price to match Zerodha's own average price.
+
+        A MARKET entry order can fill a little away from the last-tick price the signal was
+        priced at, and a position opened before entry_submitted started using the broker's
+        confirmed fill price (see _submit_entry) keeps whatever price it was first saved with
+        forever -- nothing else ever revisits it. Runs on every monitoring-page refresh so the
+        dashboard's Entry column, and the persisted PositionRecord, stay aligned with what the
+        broker itself reports for the trade.
+        """
+        try:
+            broker_entry_price = float(broker_position.get("average_price", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if broker_entry_price <= 0 or abs(broker_entry_price - managed.position.entry_price) < 0.01:
+            return
+        logger.info("Correcting entry price for %s from %.2f to broker average price %.2f", symbol, managed.position.entry_price, broker_entry_price)
+        managed.position.entry_price = broker_entry_price
+        managed.trailing_stop.entry_price = broker_entry_price
+        if self.activity_repository is not None and hasattr(self.activity_repository, "save_position"):
+            self.activity_repository.save_position(
+                PositionRecord(
+                    symbol,
+                    managed.position.side.value,
+                    managed.position.quantity,
+                    broker_entry_price,
+                    managed.position.stop_loss,
+                    managed.position.entry_time,
+                    managed.position.target_1,
+                    managed.position.target_2,
+                    managed.protective_order_id,
+                    managed.target_1_hit,
+                    atr_multiplier=self.settings.trailing_atr_multiplier,
+                    strategy_name=getattr(self.strategy, "name", ""),
+                    trading_mode=self.settings.trading_mode.value,
+                )
+            )
 
     def submit_manual_exit(self, symbol: str, price: float, timestamp: datetime | None = None) -> PipelineEvent:
         """Close one open position through the configured broker boundary."""
@@ -315,43 +379,101 @@ class TradingPipeline:
         if self.activity_repository is not None and hasattr(self.activity_repository, "has_submitted_signal") and self.activity_repository.has_submitted_signal(symbol, signal.action.value, signal.timestamp):
             return self._event("entry_skipped", symbol, signal.timestamp, signal.price, reason="signal already submitted for this candle", side=signal.action.value)
         if enforce_entry_window and (signal.timestamp.time() < self.settings.entry_start or signal.timestamp.time() > self.settings.entry_end):
-            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason="outside configured entry window", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss)
+            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"signal time {signal.timestamp.time()} is outside the configured entry window {self.settings.entry_start}-{self.settings.entry_end}", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss)
         if signal.price <= 0:
-            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason="entry price must be positive", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss)
+            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"entry price must be positive (received {signal.price})", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss)
         if signal.stop_loss is None:
             return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason="BUY signal has no stop loss", side=signal.action.value, entry_price=signal.price)
         if signal.stop_loss <= 0:
-            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason="stop loss must be positive", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss)
+            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"stop loss must be positive (received {signal.stop_loss})", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss)
         stop_is_invalid = signal.stop_loss >= signal.price if signal.action == SignalAction.BUY else signal.stop_loss <= signal.price
         if stop_is_invalid:
             stop_direction = "below" if signal.action == SignalAction.BUY else "above"
-            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"{signal.action.value} stop loss must be {stop_direction} entry price", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss)
+            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"{signal.action.value} stop loss ({signal.stop_loss}) must be {stop_direction} entry price ({signal.price})", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss)
         if requested_quantity is not None and requested_quantity <= 0:
-            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason="quantity must be positive", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss, quantity=requested_quantity)
-        maximum_quantity = self.risk.quantity(signal.price, signal.stop_loss)
+            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"quantity must be positive (requested {requested_quantity})", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss, quantity=requested_quantity)
+        leverage = self.resolve_intraday_leverage(symbol, signal.price)
+        maximum_quantity = self.risk.quantity(signal.price, leverage)
         quantity = maximum_quantity if requested_quantity is None else requested_quantity
         if quantity > maximum_quantity:
-            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"quantity exceeds risk limit of {maximum_quantity}", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss, quantity=quantity)
+            leverage_note = f" × {leverage:.1f}x leverage" if leverage != 1.0 else ""
+            deployment_cap = self.settings.initial_capital * self.settings.max_capital_deployment * leverage
+            return self._event(
+                "entry_rejected",
+                symbol,
+                signal.timestamp,
+                signal.price,
+                reason=(
+                    f"requested quantity {quantity} exceeds the capital deployment limit of {maximum_quantity} shares "
+                    f"(₹{self.settings.initial_capital:,.0f} capital × {self.settings.max_capital_deployment:.0%} deployment{leverage_note} "
+                    f"= ₹{deployment_cap:,.0f} ÷ ₹{signal.price:,.2f} price)"
+                ),
+                side=signal.action.value,
+                entry_price=signal.price,
+                stop_loss=signal.stop_loss,
+                quantity=quantity,
+            )
         current_exposure = sum(position.position.entry_price * position.position.quantity for position in self.managed_positions.values())
-        if not self.risk.approve_entry(len(self.managed_positions), current_exposure, signal.price, signal.stop_loss, quantity):
-            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason="risk limits rejected entry", side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss, quantity=quantity)
+        approved, rejection_reason = self.risk.approve_entry(len(self.managed_positions), current_exposure, signal.price, quantity, leverage)
+        if not approved:
+            return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=rejection_reason, side=signal.action.value, entry_price=signal.price, stop_loss=signal.stop_loss, quantity=quantity)
         try:
             order_id = self.order_manager.submit_signal(signal, quantity)
             protective_order_id = self.order_manager.submit_protective_stop(signal, quantity)
         except Exception as error:
+            logger.exception("Broker order placement failed for %s %s x%s @ %s", signal.action.value, symbol, quantity, signal.price)
             if "order_id" in locals():
                 try:
                     exit_side = Side.SELL if signal.action == SignalAction.BUY else Side.BUY
                     self.orders.place(OrderRequest(symbol, exit_side, quantity, signal.price))
                 except Exception:
-                    pass
+                    logger.exception("Compensating exit after a failed protective-stop placement also failed for %s (entry order %s may be unprotected)", symbol, order_id)
             return self._event("entry_rejected", symbol, signal.timestamp, signal.price, reason=f"broker order rejected: {error}", side=signal.action.value, quantity=quantity, entry_price=signal.price, stop_loss=signal.stop_loss)
+        entry_status, average_fill_price = self._confirm_live_entry_fill(order_id, symbol)
+        if entry_status in self.ENTRY_REJECTED_STATUSES:
+            logger.error(
+                "Entry order %s for %s was accepted by the broker but then went to status=%s; "
+                "cancelling protective stop %s and not opening a position",
+                order_id, symbol, entry_status, protective_order_id,
+            )
+            self._cancel_protective_stop_with_retry(protective_order_id, order_id, entry_status, symbol)
+            return self._event(
+                "entry_rejected",
+                symbol,
+                signal.timestamp,
+                signal.price,
+                order_id,
+                reason=f"broker accepted the order but then marked it {entry_status.lower()} before it filled",
+                side=signal.action.value,
+                quantity=quantity,
+                entry_price=signal.price,
+                stop_loss=signal.stop_loss,
+            )
+        if entry_status == "UNKNOWN":
+            logger.warning(
+                "Entry order %s for %s never reached a confirmed terminal status within %.0fs; "
+                "opening the position anyway, but verify order %s against the broker directly",
+                order_id, symbol, self.ENTRY_FILL_TIMEOUT_SECONDS, order_id,
+            )
+        else:
+            logger.info(
+                "Entry order %s for %s confirmed by broker: status=%s average_price=%s protective_stop=%s",
+                order_id, symbol, entry_status, average_fill_price or "unavailable", protective_order_id,
+            )
+        # Prefer the broker's actual average fill price over the last-tick signal price used to
+        # size and validate the order -- a MARKET order can fill a little away from that price,
+        # and using the true fill keeps the position's entry price, PnL, and the monitoring page
+        # consistent with what Zerodha itself shows for the trade.
+        actual_entry_price = average_fill_price if average_fill_price and average_fill_price > 0 else signal.price
+        if actual_entry_price != signal.price:
+            logger.info("Entry price for %s adjusted from signal price %s to broker fill price %s", symbol, signal.price, actual_entry_price)
         position_side = Side.BUY if signal.action == SignalAction.BUY else Side.SELL
-        position = Position(symbol, position_side, quantity, signal.price, signal.stop_loss, signal.timestamp, signal.target_1, signal.target_2)
+        position = Position(symbol, position_side, quantity, actual_entry_price, signal.stop_loss, signal.timestamp, signal.target_1, signal.target_2)
         self.positions.add(position)
+        self.limits.record_entry()
         self.managed_positions[symbol] = ManagedPosition(
             position,
-            TrailingStop(signal.price, signal.stop_loss, self.settings.trailing_atr_multiplier, position_side.value),
+            TrailingStop(actual_entry_price, signal.stop_loss, self.settings.trailing_atr_multiplier, position_side.value),
             protective_order_id,
             getattr(self.strategy, "name", "") == "PRE_SPIKE_MOMENTUM",
             bool(signal.metadata.get("move_stop_to_breakeven_after_target_1", False)),
@@ -359,12 +481,95 @@ class TradingPipeline:
         )
         if self.activity_repository is not None and hasattr(self.activity_repository, "save_position"):
             self.activity_repository.save_position(
-                PositionRecord(symbol, position_side.value, quantity, signal.price, signal.stop_loss, signal.timestamp, signal.target_1, signal.target_2, protective_order_id, False)
+                PositionRecord(symbol, position_side.value, quantity, actual_entry_price, signal.stop_loss, signal.timestamp, signal.target_1, signal.target_2, protective_order_id, False, atr_multiplier=self.settings.trailing_atr_multiplier, strategy_name=getattr(self.strategy, "name", ""), trading_mode=self.settings.trading_mode.value)
             )
         strategy_stop_multiplier = float(getattr(self.strategy, "stop_atr", self.settings.trailing_atr_multiplier))
         if strategy_stop_multiplier > 0:
-            self.last_atr[symbol] = abs(signal.price - signal.stop_loss) / strategy_stop_multiplier
-        return self._event("entry_submitted", symbol, signal.timestamp, signal.price, order_id, signal.reason, signal.action.value, quantity, signal.price, signal.stop_loss)
+            self.last_atr[symbol] = abs(actual_entry_price - signal.stop_loss) / strategy_stop_multiplier
+        return self._event("entry_submitted", symbol, signal.timestamp, actual_entry_price, order_id, signal.reason, signal.action.value, quantity, actual_entry_price, signal.stop_loss)
+
+    def _cancel_protective_stop_with_retry(self, protective_order_id: str | None, order_id: str, entry_status: str, symbol: str) -> None:
+        """Cancel the protective stop placed alongside an entry order that was ultimately
+        rejected -- with no position behind it, that stop must not be left resting at the
+        broker. Confirmed live: the very first cancel attempt regularly fails with
+        kiteconnect.exceptions.InputException("Order cannot be cancelled as it is being
+        processed. Try later.") since Zerodha's own RMS/exchange pipeline hasn't settled the
+        just-submitted order into a stable state yet -- a short retry clears this almost every
+        time, whereas giving up on the first attempt (the previous behavior) orphaned the stop.
+        """
+        if not protective_order_id:
+            return
+        last_error: Exception | None = None
+        for attempt in range(1, self.PROTECTIVE_STOP_CANCEL_RETRY_ATTEMPTS + 1):
+            try:
+                self.orders.cancel(protective_order_id)
+                return
+            except Exception as error:
+                last_error = error
+                if attempt < self.PROTECTIVE_STOP_CANCEL_RETRY_ATTEMPTS:
+                    sleep(self.PROTECTIVE_STOP_CANCEL_RETRY_BACKOFF_SECONDS)
+        logger.error(
+            "Failed to cancel protective stop %s after entry order %s was %s for %s (tried %d time(s)): %s -- "
+            "this stop may still be resting at the broker with no position behind it; check and cancel it manually.",
+            protective_order_id, order_id, entry_status, symbol, self.PROTECTIVE_STOP_CANCEL_RETRY_ATTEMPTS, last_error,
+        )
+
+    def resolve_intraday_leverage(self, symbol: str, price: float) -> float:
+        """Ask the broker for the real MIS margin it requires for `symbol` right now and derive
+        the leverage it's actually granting, instead of assuming a fixed multiplier for every
+        stock -- Zerodha's margin varies per instrument (SEBI peak-margin category, volatility,
+        liquidity) and can change day to day, so a static number is only ever a rough guess.
+        Falls back to the configured static intraday_leverage_multiplier (self.risk's
+        default_leverage) in PAPER mode, when no live client is available, or if the lookup
+        itself fails for any reason -- a blocked entry is worse than a conservative one.
+        """
+        fallback = self.risk.default_leverage
+        if self.settings.trading_mode != TradingMode.LIVE or self.orders.client is None:
+            return fallback
+        try:
+            margin_per_share = self.orders.required_intraday_margin(symbol)
+        except Exception as error:
+            logger.warning("Live margin lookup failed for %s; using the configured %.1fx fallback: %s", symbol, fallback, error)
+            return fallback
+        if not margin_per_share or margin_per_share <= 0 or price <= 0:
+            return fallback
+        leverage = price / margin_per_share
+        return leverage if leverage >= 1.0 else fallback
+
+    def _confirm_live_entry_fill(self, order_id: str, symbol: str) -> tuple[str, float]:
+        """Poll the broker for the entry order's terminal status and fill price before trusting it.
+
+        A returned order id only means Zerodha accepted the request into its OMS queue, not
+        that the order actually filled -- the RMS/exchange accept-or-reject decision happens
+        moments later, asynchronously. Returns (status, average_price), where status is one of
+        ENTRY_FILLED_STATUSES, ENTRY_REJECTED_STATUSES, or "UNKNOWN" if no terminal status was
+        seen before the timeout, and average_price is the broker's reported average fill price
+        (0.0 if unavailable). PAPER mode and any client without order_history() are trusted
+        immediately, as before this check existed.
+        """
+        if self.settings.trading_mode != TradingMode.LIVE or self.orders.client is None or not hasattr(self.orders.client, "order_history"):
+            return "COMPLETE", 0.0
+        deadline = monotonic() + self.ENTRY_FILL_TIMEOUT_SECONDS
+        status = ""
+        average_price = 0.0
+        while True:
+            try:
+                history = self.orders.client.order_history(order_id) or []
+            except Exception as error:
+                logger.warning("order_history lookup failed for entry order %s (%s): %s", order_id, symbol, error)
+                history = []
+            if history:
+                latest = history[-1]
+                status = str(latest.get("status", "")).upper()
+                try:
+                    average_price = float(latest.get("average_price", 0) or 0)
+                except (TypeError, ValueError):
+                    average_price = 0.0
+                if status in self.ENTRY_FILLED_STATUSES or status in self.ENTRY_REJECTED_STATUSES:
+                    return status, average_price
+            if monotonic() >= deadline:
+                return status or "UNKNOWN", average_price
+            sleep(self.ENTRY_FILL_POLL_SECONDS)
 
     def _update_trailing_stop(self, symbol: str, price: float, timestamp: datetime) -> list[PipelineEvent]:
         managed = self.managed_positions.get(symbol)
@@ -387,6 +592,13 @@ class TradingPipeline:
         else:
             if target_1_reached:
                 return [self._close_position(symbol, price, timestamp, "target 1 reached")]
+        if self.settings.trading_mode == TradingMode.LIVE:
+            # The resting broker-side SL-M order (kept current by the standalone
+            # scripts/run_trailing_stop_agent.py process) is the sole trailing-stop trigger in
+            # LIVE mode; sync_broker_positions() detects the eventual fill. PAPER/backtest has
+            # no real broker order to hand off to, so the pipeline keeps simulating it below.
+            return []
+        if not managed.move_stop_to_breakeven:
             atr_value = self._atr_value(symbol)
             if atr_value > 0:
                 managed.trailing_stop.update(price, atr_value)
@@ -398,13 +610,17 @@ class TradingPipeline:
     def _move_stop_to_breakeven(self, managed: ManagedPosition, timestamp: datetime, market_price: float) -> list[PipelineEvent]:
         position = managed.position
         exit_side = Side.SELL if position.side == Side.BUY else Side.BUY
-        try:
-            self.orders.modify_protective_stop(
-                managed.protective_order_id or "",
-                OrderRequest(position.symbol, exit_side, position.quantity, market_price, position.entry_price),
-            )
-        except Exception as error:
-            return [self._event("breakeven_rejected", position.symbol, timestamp, position.entry_price, reason=f"protective stop could not move to breakeven: {error}", side=exit_side.value, quantity=position.quantity, entry_price=position.entry_price, stop_loss=position.stop_loss)]
+        if self.settings.trading_mode != TradingMode.LIVE:
+            # PAPER/backtest has no real resting broker order to hand off to the trailing-stop
+            # agent, so the pipeline keeps moving its own simulated protective stop.
+            try:
+                self.orders.modify_protective_stop(
+                    managed.protective_order_id or "",
+                    OrderRequest(position.symbol, exit_side, position.quantity, market_price, position.entry_price),
+                )
+            except Exception as error:
+                logger.exception("Failed to move protective stop to breakeven for %s (order %s)", position.symbol, managed.protective_order_id)
+                return [self._event("breakeven_rejected", position.symbol, timestamp, position.entry_price, reason=f"protective stop could not move to breakeven: {error}", side=exit_side.value, quantity=position.quantity, entry_price=position.entry_price, stop_loss=position.stop_loss)]
         position.stop_loss = position.entry_price
         managed.trailing_stop.stop = position.entry_price
         managed.target_1_hit = True
@@ -421,6 +637,9 @@ class TradingPipeline:
                     position.target_2,
                     managed.protective_order_id,
                     True,
+                    atr_multiplier=self.settings.trailing_atr_multiplier,
+                    strategy_name=getattr(self.strategy, "name", ""),
+                    trading_mode=self.settings.trading_mode.value,
                 )
             )
         return [self._event("breakeven_activated", position.symbol, timestamp, position.entry_price, reason="target 1 reached; protective stop moved to breakeven", side=exit_side.value, quantity=position.quantity, entry_price=position.entry_price, stop_loss=position.stop_loss)]
@@ -431,12 +650,14 @@ class TradingPipeline:
         try:
             order_id = self.orders.place(OrderRequest(symbol, exit_side, managed.position.quantity, price))
         except Exception as error:
+            logger.exception("Broker exit order rejected for %s (%s)", symbol, reason)
             return self._event("exit_rejected", symbol, timestamp, price, reason=f"broker order rejected: {error}", side=exit_side.value, quantity=managed.position.quantity, entry_price=managed.position.entry_price)
         cancellation_error = None
         try:
             self.orders.cancel(managed.protective_order_id or "")
         except Exception as error:
             cancellation_error = error
+            logger.exception("Failed to cancel protective stop %s while closing %s; position is now unprotected", managed.protective_order_id, symbol)
         pnl = managed.position.unrealized_pnl(price)
         self.limits.record_trade(pnl)
         self.positions.remove(symbol)
@@ -445,7 +666,29 @@ class TradingPipeline:
             self.activity_repository.delete_position(symbol)
         if cancellation_error is not None:
             reason = f"{reason}; protective stop cancellation failed: {cancellation_error}"
+        closed = ClosedPosition(symbol, managed.position.side, managed.position.quantity, managed.position.entry_price, price, pnl, timestamp, order_id, reason)
+        self.recent_closed_positions = [closed, *self.recent_closed_positions[:19]]
+        self._record_trade_history(managed, closed, reason)
         return self._event("critical_unprotected" if cancellation_error is not None else "exit_submitted", symbol, timestamp, price, order_id, reason, exit_side.value, managed.position.quantity, managed.position.entry_price, pnl=pnl)
+
+    def _record_trade_history(self, managed: ManagedPosition, closed: ClosedPosition, exit_reason: str) -> None:
+        if self.activity_repository is None or not hasattr(self.activity_repository, "save_trade"):
+            return
+        self.activity_repository.save_trade(
+            TradeRecord(
+                symbol=closed.symbol,
+                entry_time=managed.position.entry_time or closed.closed_at,
+                exit_time=closed.closed_at,
+                entry_price=closed.entry_price,
+                exit_price=closed.exit_price,
+                quantity=closed.quantity,
+                pnl=closed.pnl,
+                side=closed.side.value,
+                position_type="INTRADAY",
+                strategy_name=getattr(self.strategy, "name", ""),
+                exit_reason=exit_reason,
+            )
+        )
 
     def _broker_exit_fill(self, managed: ManagedPosition) -> tuple[float, str | None, str]:
         order_id = managed.protective_order_id
@@ -453,6 +696,7 @@ class TradingPipeline:
             try:
                 history = self.orders.client.order_history(order_id) or []
             except Exception:
+                logger.exception("order_history lookup failed while reconciling broker-side exit for %s (order %s)", managed.position.symbol, order_id)
                 history = []
             for record in reversed(history):
                 status = str(record.get("status", "")).upper()
@@ -469,6 +713,14 @@ class TradingPipeline:
         if self.activity_repository is None or not hasattr(self.activity_repository, "load_positions"):
             return
         for record in self.activity_repository.load_positions():
+            if record.position_type != "INTRADAY":
+                # This pipeline only manages intraday positions. A SWING position can share a
+                # symbol with the intraday watchlist (SwingAutoTrader persists to the same
+                # `positions` table), and pulling it in here would make this pipeline treat it
+                # as its own -- corrupting the record the next time anything re-saves it (wrong
+                # position_type, wrong strategy_name) and double-counting it against intraday's
+                # own capital/position limits.
+                continue
             if record.symbol not in self.scanner.token_to_symbol.values():
                 continue
             position_side = Side(record.side)

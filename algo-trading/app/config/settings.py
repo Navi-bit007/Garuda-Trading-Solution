@@ -30,8 +30,6 @@ class Settings(BaseSettings):
     kite_access_token: SecretStr = SecretStr("")
     trading_mode: TradingMode = TradingMode.PAPER
     initial_capital: float = Field(default=100_000, gt=0)
-    risk_per_trade: float = Field(default=0.005, gt=0, le=1)
-    max_daily_loss: float = Field(default=0.015, gt=0, le=1)
     max_open_positions: int = Field(default=3, ge=1)
     max_trades_per_day: int = Field(default=5, ge=1)
     max_capital_deployment: float = Field(default=0.80, gt=0, le=1)
@@ -39,15 +37,23 @@ class Settings(BaseSettings):
     entry_start: time = time(9, 20)
     entry_end: time = time(14, 45)
     force_exit: time = time(15, 15)
+    agent_shutdown_time: time = time(15, 40)
     trailing_atr_multiplier: float = Field(default=1.5, gt=0)
+    min_stop_improvement_pct: float = Field(default=0.25, ge=0)
     enable_telegram: bool = False
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""
     user_id: str = "default"
     signal_timeframe: str = "5minute"
-    signal_poll_seconds: int = Field(default=30, ge=5)
+    signal_poll_seconds: int = Field(default=300, ge=5)
     pre_spike_cooldown_minutes: int = Field(default=30, ge=0)
     enable_ema_progressive_strategy: bool = True
+    swing_capital_limit: float = Field(default=2_000.0, gt=0)
+    swing_quantity_limit: int = Field(default=1, ge=1)
+    swing_trailing_atr_multiplier: float = Field(default=2.0, gt=0)
+    swing_max_open_positions: int = Field(default=10, ge=1)
+    intraday_capital_limit: float = Field(default=5_000.0, gt=0)
+    intraday_leverage_multiplier: float = Field(default=1.0, ge=1.0)
 
     if PYDANTIC_V2:
         @field_validator("entry_end")
@@ -65,6 +71,14 @@ class Settings(BaseSettings):
             if value <= market_open:
                 raise ValueError("force_exit must be after market_open")
             return value
+
+        @field_validator("agent_shutdown_time")
+        @classmethod
+        def agent_shutdown_after_force_exit(cls, value: time, info):
+            force_exit = info.data.get("force_exit", time(15, 15))
+            if value <= force_exit:
+                raise ValueError("agent_shutdown_time must be after force_exit")
+            return value
     else:
         @validator("entry_end", allow_reuse=True)
         def entry_end_after_start(cls, value: time, values):
@@ -78,6 +92,13 @@ class Settings(BaseSettings):
             market_open = values.get("market_open", time(9, 15))
             if value <= market_open:
                 raise ValueError("force_exit must be after market_open")
+            return value
+
+        @validator("agent_shutdown_time", allow_reuse=True)
+        def agent_shutdown_after_force_exit(cls, value: time, values):
+            force_exit = values.get("force_exit", time(15, 15))
+            if value <= force_exit:
+                raise ValueError("agent_shutdown_time must be after force_exit")
             return value
 
 

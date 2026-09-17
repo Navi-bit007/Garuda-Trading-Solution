@@ -6,6 +6,7 @@ import pandas as pd
 from app.config.constants import SignalAction, TradingMode
 from app.config.settings import Settings
 from app.database.database import Database
+from app.database.models import PositionRecord
 from app.database.repository import Repository
 from app.execution.trading_pipeline import TradingPipeline
 from app.market.candles import TickCandleBuilder
@@ -26,6 +27,10 @@ class PreSpikeEntryStrategy(BuyStrategy):
     name = "PRE_SPIKE_MOMENTUM"
 
 
+class NamedBuyStrategy(BuyStrategy):
+    name = "VWAP EMA breakout"
+
+
 class NoSetupStrategy:
     name = "NO_SETUP"
 
@@ -34,6 +39,86 @@ class NoSetupStrategy:
 
 
 class BrokerExitClient:
+    def __init__(self, broker_quantity: int = 0, broker_average_price: float | None = None):
+        self.requests = []
+        self.modifications = []
+        self.broker_quantity = broker_quantity
+        self.broker_average_price = broker_average_price
+
+    def instruments(self, exchange=None):
+        return [{"tradingsymbol": "AAA", "tick_size": 0.05}]
+
+    def place_order(self, **request):
+        self.requests.append(request)
+        return f"ORDER-{len(self.requests)}"
+
+    def modify_order(self, **request):
+        self.modifications.append(request)
+        return request.get("order_id")
+
+    def positions(self):
+        if self.broker_quantity == 0:
+            return {"net": []}
+        position = {"tradingsymbol": "AAA", "quantity": self.broker_quantity}
+        if self.broker_average_price is not None:
+            position["average_price"] = self.broker_average_price
+        return {"net": [position]}
+
+    def order_history(self, order_id):
+        # ORDER-1 is always the entry order in these tests; fill it at the exact signal price
+        # (no slippage) so entry-price assertions stay stable. Every later order id (protective
+        # stop, exit) fills at 94.5, matching the exit-price assertions that already exist.
+        if order_id == "ORDER-1":
+            return [{"status": "COMPLETE", "filled_quantity": 10, "average_price": 100.0}]
+        return [{"status": "COMPLETE", "filled_quantity": 10, "average_price": 94.5}]
+
+
+class RejectedAfterAcceptClient:
+    """Simulates Zerodha accepting an order over HTTP (returns an order id) and only rejecting
+    it moments later, asynchronously -- the scenario behind the 2026-09-11 incident where
+    entry_submitted was logged in the activity ledger with no real position at the broker."""
+
+    def __init__(self):
+        self.requests = []
+        self.cancelled_order_ids = []
+
+    def instruments(self, exchange=None):
+        return [{"tradingsymbol": "AAA", "tick_size": 0.05}]
+
+    def place_order(self, **request):
+        self.requests.append(request)
+        return f"ORDER-{len(self.requests)}"
+
+    def cancel_order(self, **kwargs):
+        self.cancelled_order_ids.append(kwargs.get("order_id"))
+
+    def order_history(self, order_id):
+        return [{"status": "REJECTED", "filled_quantity": 0, "average_price": 0}]
+
+
+class FlakyRejectedAfterAcceptClient(RejectedAfterAcceptClient):
+    """Like RejectedAfterAcceptClient, but cancel_order() fails the first `fail_times` calls with
+    the exact kiteconnect error Zerodha returns while an order is still settling, confirmed live:
+    "Order cannot be cancelled as it is being processed. Try later." -- exercising the retry
+    added to _cancel_protective_stop_with_retry."""
+
+    def __init__(self, fail_times: int):
+        super().__init__()
+        self.fail_times = fail_times
+        self.cancel_attempts = 0
+
+    def cancel_order(self, **kwargs):
+        self.cancel_attempts += 1
+        if self.cancel_attempts <= self.fail_times:
+            raise Exception("Order cannot be cancelled as it is being processed. Try later.")
+        return super().cancel_order(**kwargs)
+
+
+class SlippedFillClient:
+    """Simulates a MARKET order filling away from the last-tick price the signal was priced
+    at -- the scenario behind the monitoring page showing an entry price that didn't match
+    what Zerodha actually filled the order at."""
+
     def __init__(self):
         self.requests = []
 
@@ -44,11 +129,29 @@ class BrokerExitClient:
         self.requests.append(request)
         return f"ORDER-{len(self.requests)}"
 
-    def positions(self):
-        return {"net": []}
+    def order_history(self, order_id):
+        return [{"status": "COMPLETE", "filled_quantity": 10, "average_price": 100.35}]
+
+
+class LeveragedMarginClient:
+    """Simulates Zerodha's margin calculator granting real per-stock MIS leverage."""
+
+    def __init__(self, margin_per_share: float):
+        self.requests = []
+        self.margin_per_share = margin_per_share
+
+    def instruments(self, exchange=None):
+        return [{"tradingsymbol": "AAA", "tick_size": 0.05}]
+
+    def place_order(self, **request):
+        self.requests.append(request)
+        return f"ORDER-{len(self.requests)}"
 
     def order_history(self, order_id):
-        return [{"status": "COMPLETE", "filled_quantity": 10, "average_price": 94.5}]
+        return [{"status": "COMPLETE", "filled_quantity": 10, "average_price": 100.0}]
+
+    def order_margins(self, params):
+        return [{"total": self.margin_per_share}]
 
 
 def build_settings(**overrides):
@@ -134,6 +237,33 @@ def test_live_pipeline_requires_authenticated_broker_client():
         TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy())
 
 
+def test_daily_trade_limit_blocks_a_new_entry_even_after_an_earlier_one_closed():
+    """A trade closing must not free up today's quota -- otherwise "max trades per day" only
+    caps how many round-trips can be open/closed in sequence, not how many entries are actually
+    taken, letting a 6th (or later) position slip through on a day where earlier ones already
+    closed. max_trades_per_day=1 here: AAA's entry uses up the day's only slot; AAA is then
+    force-exited (closed); a fresh BBB signal must still be rejected on the daily limit."""
+    pipeline = TradingPipeline(build_settings(max_trades_per_day=1), {1: "AAA", 2: "BBB"}, BuyStrategy())
+    entry_events = pipeline.on_ticks([
+        {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 20), "last_price": 100, "volume_traded": 100},
+        {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 21), "last_price": 100, "volume_traded": 150},
+    ])
+    assert [event.kind for event in entry_events] == ["entry_submitted"]
+
+    close_events = pipeline.on_ticks([
+        {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 15, 15), "last_price": 101, "volume_traded": 180},
+    ])
+    assert [event.kind for event in close_events] == ["exit_submitted"]
+    assert not pipeline.managed_positions
+
+    rejected_events = pipeline.on_ticks([
+        {"instrument_token": 2, "timestamp": datetime(2026, 1, 1, 9, 20), "last_price": 200, "volume_traded": 100},
+        {"instrument_token": 2, "timestamp": datetime(2026, 1, 1, 9, 21), "last_price": 200, "volume_traded": 150},
+    ])
+    assert [event.kind for event in rejected_events] == ["entry_rejected"]
+    assert rejected_events[0].reason == "daily trade limit reached (1/1 trades today)"
+
+
 def test_pipeline_moves_broker_sold_position_to_recently_closed_with_realized_pnl():
     client = BrokerExitClient()
     pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client)
@@ -150,8 +280,218 @@ def test_pipeline_moves_broker_sold_position_to_recently_closed_with_realized_pn
     assert pipeline.recent_closed_positions[0].pnl == -55.0
 
 
-def test_pipeline_rejects_entry_when_risk_size_is_zero():
-    pipeline = TradingPipeline(build_settings(risk_per_trade=0.000001), {1: "AAA"}, BuyStrategy())
+def test_entry_rejected_when_broker_accepts_then_rejects_the_order(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = RejectedAfterAcceptClient()
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+
+    event = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+
+    assert event.kind == "entry_rejected"
+    assert "rejected" in event.reason.lower()
+    assert not pipeline.managed_positions
+    # The entry order is ORDER-1; the protective stop submitted right after it is ORDER-2, and
+    # that resting protective stop must be cancelled once the entry itself turns out rejected.
+    assert client.cancelled_order_ids == ["ORDER-2"]
+    rows = database.connection.execute("SELECT event_kind FROM activity ORDER BY id").fetchall()
+    assert [row[0] for row in rows] == ["entry_rejected"]
+    database.close()
+
+
+def test_protective_stop_cancel_retries_after_a_transient_rejection(tmp_path):
+    """Zerodha regularly refuses to cancel the just-placed protective stop the instant its
+    sibling entry order is rejected -- "Order cannot be cancelled as it is being processed. Try
+    later." -- since its own RMS/exchange pipeline hasn't settled the order yet. The cancel must
+    be retried rather than giving up and leaving that stop resting at the broker unprotected."""
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = FlakyRejectedAfterAcceptClient(fail_times=2)
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+    pipeline.PROTECTIVE_STOP_CANCEL_RETRY_BACKOFF_SECONDS = 0.001
+
+    event = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+
+    assert event.kind == "entry_rejected"
+    assert client.cancel_attempts == 3
+    assert client.cancelled_order_ids == ["ORDER-2"]
+    database.close()
+
+
+def test_protective_stop_cancel_gives_up_cleanly_after_retries_exhausted(tmp_path):
+    """Even if every retry attempt fails, the failure must stay contained (logged, not raised) --
+    the entry is still correctly reported as rejected and no position is opened."""
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = FlakyRejectedAfterAcceptClient(fail_times=99)
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+    pipeline.PROTECTIVE_STOP_CANCEL_RETRY_BACKOFF_SECONDS = 0.001
+
+    event = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+
+    assert event.kind == "entry_rejected"
+    assert not pipeline.managed_positions
+    assert client.cancel_attempts == pipeline.PROTECTIVE_STOP_CANCEL_RETRY_ATTEMPTS
+    database.close()
+
+
+def test_entry_price_reflects_broker_fill_price_not_signal_price(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = SlippedFillClient()
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+
+    event = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+
+    assert event.kind == "entry_submitted"
+    assert event.price == 100.35
+    assert event.entry_price == 100.35
+    assert pipeline.managed_positions["AAA"].position.entry_price == 100.35
+    [saved] = repository.load_positions()
+    assert saved.entry_price == 100.35
+    database.close()
+
+
+def test_sync_broker_positions_corrects_a_stale_entry_price(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = BrokerExitClient(broker_quantity=10, broker_average_price=101.75)
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+    entry = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+    assert entry.entry_price == 100.0
+
+    events = pipeline.sync_broker_positions()
+
+    assert events == []
+    assert pipeline.managed_positions["AAA"].position.entry_price == 101.75
+    [saved] = repository.load_positions()
+    assert saved.entry_price == 101.75
+    database.close()
+
+
+def test_live_entry_quantity_uses_real_time_broker_leverage():
+    # Price 100, margin 20 per share -> Zerodha is granting 5x leverage for this stock right now.
+    client = LeveragedMarginClient(margin_per_share=20.0)
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client)
+
+    entry = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25))
+
+    assert entry.kind == "entry_submitted"
+    # 100_000 * 0.80 deployment * 5x leverage / 100 price == 4_000, not the unleveraged 800.
+    assert pipeline.managed_positions["AAA"].position.quantity == 4_000
+
+
+def test_live_entry_quantity_falls_back_to_configured_leverage_when_lookup_fails():
+    class BrokenMarginClient(LeveragedMarginClient):
+        def order_margins(self, params):
+            raise RuntimeError("margin API unavailable")
+
+    client = BrokenMarginClient(margin_per_share=20.0)
+    pipeline = TradingPipeline(
+        build_settings(trading_mode=TradingMode.LIVE, intraday_leverage_multiplier=2.0),
+        {1: "AAA"},
+        BuyStrategy(),
+        client,
+    )
+
+    entry = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25))
+
+    assert entry.kind == "entry_submitted"
+    # Live margin lookup failed, so this falls back to the configured 2x multiplier:
+    # 100_000 * 0.80 * 2 / 100 == 1_600.
+    assert pipeline.managed_positions["AAA"].position.quantity == 1_600
+
+
+def test_paper_mode_entry_quantity_is_unchanged_with_default_leverage():
+    # Default intraday_leverage_multiplier is 1x, so plain PAPER sizing is untouched unless a
+    # user explicitly configures a higher fallback.
+    pipeline = TradingPipeline(build_settings(), {1: "AAA"}, BuyStrategy())
+
+    entry = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25))
+
+    assert entry.kind == "entry_submitted"
+    assert pipeline.managed_positions["AAA"].position.quantity == 800
+
+
+def test_paper_mode_entry_quantity_applies_the_configured_fallback_leverage():
+    # PAPER mode has no broker to ask for real leverage, so it simulates using the same
+    # configured fallback multiplier LIVE would use if the live lookup failed -- this way
+    # paper trading exercises the same sizing behavior a user intends to run live.
+    pipeline = TradingPipeline(build_settings(intraday_leverage_multiplier=5.0), {1: "AAA"}, BuyStrategy())
+
+    entry = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25))
+
+    assert entry.kind == "entry_submitted"
+    assert pipeline.managed_positions["AAA"].position.quantity == 4_000
+
+
+def test_intraday_position_record_persists_the_strategy_name(tmp_path):
+    """The Live monitor page's "Strategy" column reads PositionRecord.strategy_name -- without
+    this, every intraday position showed a blank "-" regardless of which strategy opened it."""
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    pipeline = TradingPipeline(build_settings(), {1: "AAA"}, NamedBuyStrategy(), activity_repository=repository)
+
+    entry = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+
+    assert entry.kind == "entry_submitted"
+    [saved] = repository.load_positions()
+    assert saved.strategy_name == "VWAP EMA breakout"
+    database.close()
+
+
+def test_live_pipeline_does_not_auto_close_on_trailing_stop_breach():
+    client = BrokerExitClient(broker_quantity=10)
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client)
+    entry = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+    assert entry.kind == "entry_submitted"
+
+    events = pipeline.monitor_ticks([{"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 26), "last_price": 90}])
+
+    assert events == []
+    assert "AAA" in pipeline.managed_positions
+
+
+def test_live_pipeline_breakeven_flags_target_1_hit_without_modifying_broker_stop(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = BrokerExitClient(broker_quantity=10)
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+    signal = Signal(
+        "AAA",
+        SignalAction.BUY,
+        datetime(2026, 1, 1, 9, 25),
+        100,
+        95,
+        "high conviction",
+        score=95,
+        target_1=101,
+        target_2=102,
+        metadata={"move_stop_to_breakeven_after_target_1": True},
+    )
+    assert pipeline.submit_strategy_entry(signal, quantity=10).kind == "entry_submitted"
+
+    events = pipeline.monitor_ticks([{"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 26), "last_price": 101}])
+
+    assert [event.kind for event in events] == ["breakeven_activated"]
+    assert pipeline.managed_positions["AAA"].position.stop_loss == 100
+    assert pipeline.managed_positions["AAA"].target_1_hit is True
+    assert client.modifications == []
+    [saved] = repository.load_positions()
+    assert saved.target_1_hit is True
+    assert saved.stop_loss == 100
+    database.close()
+
+
+def test_pipeline_rejects_entry_when_deployment_size_is_zero():
+    pipeline = TradingPipeline(build_settings(max_capital_deployment=0.0000001), {1: "AAA"}, BuyStrategy())
     events = pipeline.on_ticks([
         {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 20), "last_price": 100, "volume_traded": 100},
         {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 21), "last_price": 100, "volume_traded": 150},
@@ -163,9 +503,9 @@ def test_pipeline_rejects_entry_when_risk_size_is_zero():
 @pytest.mark.parametrize(
     ("price", "stop_loss", "quantity", "reason"),
     [
-        (0, 95, None, "entry price must be positive"),
-        (100, 0, None, "stop loss must be positive"),
-        (100, 95, 0, "quantity must be positive"),
+        (0, 95, None, "entry price must be positive (received 0)"),
+        (100, 0, None, "stop loss must be positive (received 0)"),
+        (100, 95, 0, "quantity must be positive (requested 0)"),
     ],
 )
 def test_pipeline_rejects_malformed_strategy_entries(price, stop_loss, quantity, reason):
@@ -179,12 +519,12 @@ def test_pipeline_rejects_malformed_strategy_entries(price, stop_loss, quantity,
     assert pipeline.orders.paper_orders == []
 
 
-def test_manual_entry_is_risk_sized_and_monitor_closes_position():
+def test_manual_entry_is_deployment_sized_and_monitor_closes_position():
     pipeline = TradingPipeline(build_settings(), {1: "AAA"}, BuyStrategy())
     entry = pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25))
 
     assert entry.kind == "entry_submitted"
-    assert pipeline.managed_positions["AAA"].position.quantity == 100
+    assert pipeline.managed_positions["AAA"].position.quantity == 800
 
     exits = pipeline.monitor_ticks([
         {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 26), "last_price": 94},
@@ -193,6 +533,45 @@ def test_manual_entry_is_risk_sized_and_monitor_closes_position():
     assert [event.kind for event in exits] == ["exit_submitted"]
     assert exits[0].reason == "trailing stop"
     assert not pipeline.managed_positions
+
+
+def test_app_initiated_exit_persists_trade_history(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    pipeline = TradingPipeline(build_settings(), {1: "AAA"}, BuyStrategy(), activity_repository=repository)
+    pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25))
+
+    exits = pipeline.monitor_ticks([
+        {"instrument_token": 1, "timestamp": datetime(2026, 1, 1, 9, 26), "last_price": 94},
+    ])
+
+    assert [event.kind for event in exits] == ["exit_submitted"]
+    [trade] = repository.load_trades()
+    assert trade.symbol == "AAA"
+    assert trade.entry_price == 100
+    assert trade.exit_price == 94
+    assert trade.exit_reason == "trailing stop"
+    assert trade.position_type == "INTRADAY"
+    database.close()
+
+
+def test_broker_detected_exit_persists_trade_history(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = BrokerExitClient()
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), client, repository)
+    pipeline.submit_manual_entry("AAA", 100, 95, datetime(2026, 1, 1, 9, 25), quantity=10)
+
+    events = pipeline.sync_broker_positions()
+
+    assert [event.kind for event in events] == ["broker_exit_detected"]
+    [trade] = repository.load_trades()
+    assert trade.symbol == "AAA"
+    assert trade.exit_price == 94.5
+    assert "broker-side position closed" in trade.exit_reason
+    database.close()
 
 
 def test_manual_entry_rejects_stop_above_entry():
@@ -204,13 +583,13 @@ def test_manual_entry_rejects_stop_above_entry():
     assert pipeline.orders.paper_orders == []
 
 
-def test_manual_entry_rejects_quantity_above_risk_limit():
+def test_manual_entry_rejects_quantity_above_deployment_limit():
     pipeline = TradingPipeline(build_settings(), {1: "AAA"}, BuyStrategy())
 
-    event = pipeline.submit_manual_entry("AAA", 100, 95, quantity=101)
+    event = pipeline.submit_manual_entry("AAA", 100, 95, quantity=801)
 
     assert event.kind == "entry_rejected"
-    assert "risk limit" in event.reason
+    assert "capital deployment limit" in event.reason
     assert pipeline.orders.paper_orders == []
 
 
@@ -269,6 +648,41 @@ def test_pipeline_restores_open_positions_from_repository(tmp_path):
 
     assert restored.managed_positions["AAA"].position.quantity == 10
     assert restored.managed_positions["AAA"].position.stop_loss == 95
+    database.close()
+
+
+def test_pipeline_never_adopts_a_swing_position_sharing_its_watchlist_symbol(tmp_path):
+    """A SWING position (persisted by SwingAutoTrader) can share a symbol with the intraday
+    watchlist. Restoring it into this pipeline's own managed_positions would make intraday
+    treat it as its own -- corrupting the record the next time anything re-saves it (defaulting
+    position_type back to INTRADAY, overwriting strategy_name with whatever intraday strategy
+    is selected) and double-counting it against intraday's own capital/position limits. This is
+    exactly what happened to a real NSE:JUBLPHARMA swing position."""
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    repository.save_position(
+        PositionRecord(
+            symbol="AAA",
+            side="BUY",
+            quantity=1,
+            entry_price=1018.4,
+            stop_loss=961.8,
+            entry_time=datetime(2026, 9, 11),
+            protective_order_id="260915190379505",
+            position_type="SWING",
+            strategy_name="EMA 9/200 swing",
+            atr_multiplier=2.0,
+            trading_mode="LIVE",
+        )
+    )
+
+    pipeline = TradingPipeline(build_settings(trading_mode=TradingMode.LIVE), {1: "AAA"}, BuyStrategy(), broker_client=object(), activity_repository=repository)
+
+    assert "AAA" not in pipeline.managed_positions
+    [saved] = repository.load_positions()
+    assert saved.position_type == "SWING"
+    assert saved.strategy_name == "EMA 9/200 swing"
     database.close()
 
 

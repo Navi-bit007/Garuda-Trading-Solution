@@ -36,7 +36,11 @@ class Database:
             entry_price REAL NOT NULL,
             exit_price REAL NOT NULL,
             quantity INTEGER NOT NULL,
-            pnl REAL NOT NULL
+            pnl REAL NOT NULL,
+            side TEXT NOT NULL DEFAULT 'BUY',
+            position_type TEXT NOT NULL DEFAULT 'INTRADAY',
+            strategy_name TEXT NOT NULL DEFAULT '',
+            exit_reason TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS activity (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,7 +55,8 @@ class Database:
             entry_price REAL,
             stop_loss REAL,
             pnl REAL,
-            reason TEXT NOT NULL DEFAULT ''
+            reason TEXT NOT NULL DEFAULT '',
+            previous_stop REAL
         );
         CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,7 +178,22 @@ class Database:
             target_1 REAL,
             target_2 REAL,
             protective_order_id TEXT,
-            target_1_hit INTEGER NOT NULL DEFAULT 0
+            target_1_hit INTEGER NOT NULL DEFAULT 0,
+            instrument_token INTEGER,
+            position_type TEXT NOT NULL DEFAULT 'INTRADAY',
+            atr_multiplier REAL,
+            strategy_name TEXT NOT NULL DEFAULT '',
+            trading_mode TEXT NOT NULL DEFAULT 'LIVE'
+        );
+        CREATE TABLE IF NOT EXISTS agent_heartbeat (
+            engine_name TEXT PRIMARY KEY,
+            last_run_at TEXT NOT NULL,
+            last_error TEXT NOT NULL DEFAULT '',
+            heartbeat_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_preferences (
+            user_id TEXT PRIMARY KEY,
+            auto_start_trailing_agent INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS strategy_presets (
             name TEXT PRIMARY KEY,
@@ -182,9 +202,34 @@ class Database:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS decision_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            strategy_name TEXT NOT NULL DEFAULT '',
+            mode TEXT NOT NULL DEFAULT 'LIVE',
+            decision TEXT NOT NULL DEFAULT '',
+            rationale TEXT NOT NULL DEFAULT '',
+            inputs TEXT NOT NULL DEFAULT '{}',
+            outputs TEXT NOT NULL DEFAULT '{}',
+            confidence REAL,
+            correlation_id TEXT NOT NULL DEFAULT '',
+            outcome TEXT,
+            source_table TEXT NOT NULL DEFAULT '',
+            source_id TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS ix_decision_log_symbol_timestamp ON decision_log(symbol, timestamp);
+        CREATE INDEX IF NOT EXISTS ix_decision_log_correlation ON decision_log(correlation_id);
+        CREATE INDEX IF NOT EXISTS ix_decision_log_event_type ON decision_log(event_type);
         CREATE TABLE IF NOT EXISTS dashboard_settings (
             user_id TEXT PRIMARY KEY,
             settings TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS kite_session (
+            user_id TEXT PRIMARY KEY,
+            access_token TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
         """)
@@ -194,6 +239,9 @@ class Database:
             self._migrate_progressive_cycles()
             self._migrate_dynamic_watchlists()
             self._migrate_positions()
+            self._migrate_trades()
+            self._migrate_agent_heartbeat()
+            self._migrate_activity()
             self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_user_signal ON signals(user_id, signal_id)")
             self.connection.execute("CREATE INDEX IF NOT EXISTS ix_pre_spike_events_lookup ON pre_spike_events(user_id, strategy, symbol, timeframe, trading_date, latest_time)")
             self.connection.commit()
@@ -226,6 +274,37 @@ class Database:
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(positions)").fetchall()}
         if "target_1_hit" not in columns:
             self.connection.execute("ALTER TABLE positions ADD COLUMN target_1_hit INTEGER NOT NULL DEFAULT 0")
+        if "instrument_token" not in columns:
+            self.connection.execute("ALTER TABLE positions ADD COLUMN instrument_token INTEGER")
+        if "position_type" not in columns:
+            self.connection.execute("ALTER TABLE positions ADD COLUMN position_type TEXT NOT NULL DEFAULT 'INTRADAY'")
+        if "atr_multiplier" not in columns:
+            self.connection.execute("ALTER TABLE positions ADD COLUMN atr_multiplier REAL")
+        if "strategy_name" not in columns:
+            self.connection.execute("ALTER TABLE positions ADD COLUMN strategy_name TEXT NOT NULL DEFAULT ''")
+        if "trading_mode" not in columns:
+            self.connection.execute("ALTER TABLE positions ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'LIVE'")
+
+    def _migrate_agent_heartbeat(self) -> None:
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(agent_heartbeat)").fetchall()}
+        if "pid" not in columns:
+            self.connection.execute("ALTER TABLE agent_heartbeat ADD COLUMN pid INTEGER")
+
+    def _migrate_activity(self) -> None:
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(activity)").fetchall()}
+        if "previous_stop" not in columns:
+            self.connection.execute("ALTER TABLE activity ADD COLUMN previous_stop REAL")
+
+    def _migrate_trades(self) -> None:
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(trades)").fetchall()}
+        if "side" not in columns:
+            self.connection.execute("ALTER TABLE trades ADD COLUMN side TEXT NOT NULL DEFAULT 'BUY'")
+        if "position_type" not in columns:
+            self.connection.execute("ALTER TABLE trades ADD COLUMN position_type TEXT NOT NULL DEFAULT 'INTRADAY'")
+        if "strategy_name" not in columns:
+            self.connection.execute("ALTER TABLE trades ADD COLUMN strategy_name TEXT NOT NULL DEFAULT ''")
+        if "exit_reason" not in columns:
+            self.connection.execute("ALTER TABLE trades ADD COLUMN exit_reason TEXT NOT NULL DEFAULT ''")
 
     def _migrate_signals(self) -> None:
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(signals)").fetchall()}

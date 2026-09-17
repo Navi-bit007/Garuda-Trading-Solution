@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pandas as pd
@@ -5,6 +6,8 @@ import pytest
 from kiteconnect.exceptions import InputException
 
 from app.config.constants import TradingMode
+from app.database.database import Database
+from app.database.repository import Repository
 from app.execution.swing_auto_trader import SwingAutoTrader
 from app.strategy.base import NoSignal
 from app.strategy.ema_9_200_swing import Ema9200SwingStrategy
@@ -75,7 +78,19 @@ def test_swing_strategy_requires_a_fresh_daily_ema9_cross():
         strategy.generate_signal("AAA", swing_frame(last_close=100.0))
 
 
-def test_swing_trader_places_cnc_entry_and_zerodha_side_stop_then_trails():
+def test_market_order_helpers_route_through_mode_aware_order_api_in_paper_mode():
+    client = StubKiteClient()
+    trader = SwingAutoTrader(client, TradingMode.PAPER)
+
+    entry_order_id = trader._place_market_order("NSE", "AAA", 5, 100.0)
+    exit_order_id = trader._place_market_exit("NSE:AAA", 5, 100.0)
+
+    assert entry_order_id.startswith("PAPER-")
+    assert exit_order_id.startswith("PAPER-")
+    assert client.requests == []
+
+
+def test_swing_trader_places_cnc_entry_and_zerodha_side_stop():
     client = StubKiteClient()
     trader = SwingAutoTrader(client, TradingMode.LIVE)
     result = trader.scan({"NSE:AAA": 1}, lambda token: swing_frame())
@@ -94,20 +109,6 @@ def test_swing_trader_places_cnc_entry_and_zerodha_side_stop_then_trails():
     assert client.requests[1]["market_protection"] == -1
     assert client.requests[1]["tradingsymbol"] == "AAA"
 
-    trailing_frame = swing_frame(last_close=130.0, rows=202)
-    trailing_frame.loc[201, "close"] = 150.0
-    trailing_frame.loc[201, "open"] = 150.0
-    trailing_frame.loc[201, "high"] = 152.0
-    trailing_frame.loc[201, "low"] = 148.0
-    new_stop = trader.trail_position("NSE:AAA", trailing_frame)
-
-    assert new_stop is not None
-    assert client.modifications[0]["order_id"] == order_result.protective_order_id
-    assert client.modifications[0]["product"] == "CNC"
-    assert client.modifications[0]["order_type"] == "SL-M"
-    assert client.modifications[0]["market_protection"] == -1
-    assert client.modifications[0]["trigger_price"] == new_stop
-
 
 def test_swing_trader_caps_quantity_by_amount():
     client = StubKiteClient()
@@ -117,7 +118,7 @@ def test_swing_trader_caps_quantity_by_amount():
     result = trader.submit_candidate(candidate, amount_limit=100, quantity_limit=100)
 
     assert result.status == "rejected"
-    assert result.reason == "amount limit is smaller than one share"
+    assert "amount limit" in result.reason and "100.00" in result.reason
     assert client.requests == []
 
 
@@ -150,27 +151,6 @@ def test_swing_trader_waits_for_holding_before_submitting_stop():
     assert result.status == "submitted"
     assert [request["order_type"] for request in client.requests] == ["MARKET", "SL-M"]
     assert client.requests[1]["quantity"] == 7
-
-
-def test_swing_trend_exit_cancels_broker_protective_stop():
-    client = StubKiteClient()
-    trader = SwingAutoTrader(client, TradingMode.LIVE)
-    candidate = trader.scan({"NSE:AAA": 1}, lambda token: swing_frame()).candidates[0]
-    entry = trader.submit_candidate(candidate, amount_limit=1_000, quantity_limit=10)
-    assert entry.status == "submitted"
-    trader.active_positions["NSE:AAA"].strategy_name = "SWING_TREND_BREAKOUT"
-
-    exit_close = trader.active_positions["NSE:AAA"].stop_loss + 1.0
-    exit_frame = swing_frame(last_close=exit_close, rows=202)
-    exit_frame.loc[:200, ["open", "high", "low", "close"]] = [exit_close + 10.0, exit_close + 12.0, exit_close + 8.0, exit_close + 10.0]
-    exit_frame.loc[201, ["open", "high", "low", "close"]] = [exit_close, exit_close + 2.0, exit_close - 2.0, exit_close]
-
-    result = trader.manage_position("NSE:AAA", exit_frame)
-
-    assert result is not None
-    assert result.status == "exited"
-    assert client.cancellations == [{"variety": "regular", "order_id": entry.protective_order_id}]
-    assert "NSE:AAA" not in trader.active_positions
 
 
 def test_swing_trader_keeps_pending_entry_retryable_until_holding_is_confirmed():
@@ -239,6 +219,66 @@ def test_swing_scan_skips_symbols_without_ema_warmup_history():
     assert result.insufficient_history == ("NSE:NEWSTOCK",)
 
 
+def test_evaluate_symbol_is_safe_under_concurrent_use():
+    """The dashboard now fetches candles for many symbols in a ThreadPoolExecutor and calls
+    evaluate_symbol() for each as its fetch completes, submitting a candidate the moment it's
+    found instead of waiting for the whole universe. This proves each thread's captured candles
+    never leak across symbols."""
+    client = StubKiteClient()
+    trader = SwingAutoTrader(client, TradingMode.LIVE)
+    frames = {1: swing_frame(last_close=130.0), 2: swing_frame(last_close=100.0)}
+    selected = {"NSE:AAA": 1, "NSE:FLAT": 2}
+
+    def evaluate(symbol: str, token: int):
+        return trader.evaluate_symbol(symbol, token, lambda _token, frame=frames[token]: frame)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {symbol: executor.submit(evaluate, symbol, token) for symbol, token in selected.items()}
+        results = {symbol: future.result() for symbol, future in futures.items()}
+
+    assert results["NSE:AAA"].candidate is not None
+    assert results["NSE:AAA"].candidate.symbol == "NSE:AAA"
+    assert results["NSE:FLAT"].candidate is None
+    assert results["NSE:FLAT"].no_signal_reasons and "freshly cross" in results["NSE:FLAT"].no_signal_reasons[0]
+
+
+def test_swing_scan_records_no_signal_reason_for_unmatched_symbols():
+    client = StubKiteClient()
+    trader = SwingAutoTrader(client, TradingMode.LIVE)
+
+    result = trader.scan({"NSE:FLAT": 1}, lambda token: swing_frame(last_close=100.0))
+
+    assert result.candidates == ()
+    assert len(result.no_signal) == 1
+    symbol, reason = result.no_signal[0]
+    assert symbol == "NSE:FLAT"
+    assert "freshly cross" in reason
+
+
+def test_swing_scan_reports_progress_per_symbol_in_order():
+    client = StubKiteClient()
+    trader = SwingAutoTrader(client, TradingMode.LIVE)
+    progress_calls: list[tuple[int, int, str]] = []
+
+    trader.scan(
+        {"NSE:AAA": 1, "NSE:BBB": 2},
+        lambda token: swing_frame(),
+        on_progress=lambda index, total, symbol: progress_calls.append((index, total, symbol)),
+    )
+
+    assert progress_calls == [(1, 2, "NSE:AAA"), (2, 2, "NSE:BBB")]
+
+
+def test_swing_scan_result_no_signal_defaults_to_empty_tuple():
+    client = StubKiteClient()
+    trader = SwingAutoTrader(client, TradingMode.LIVE)
+
+    result = trader.scan({"NSE:AAA": 1}, lambda token: swing_frame())
+
+    assert isinstance(result.no_signal, tuple)
+    assert result.no_signal == ()
+
+
 def test_stop_prices_are_rounded_down_to_the_instrument_tick():
     assert SwingAutoTrader._round_down_to_tick(123.47, 0.05) == 123.45
     assert SwingAutoTrader._round_down_to_tick(123.479, 0.01) == 123.47
@@ -255,4 +295,32 @@ def test_repeated_scan_does_not_submit_the_same_signal_twice():
     assert first.status == "submitted"
     assert second.status == "skipped"
     assert second.reason == "position is already open"
+
+
+def test_swing_trader_persists_position_lifecycle_when_repository_is_supplied(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = StubKiteClient()
+    trader = SwingAutoTrader(client, TradingMode.LIVE, repository=repository)
+    candidate = trader.scan({"NSE:AAA": 1}, lambda token: swing_frame()).candidates[0]
+
+    order_result = trader.submit_candidate(candidate, amount_limit=1_000, quantity_limit=10)
+    assert order_result.status == "submitted"
+
+    [saved] = repository.load_positions()
+    assert saved.symbol == "NSE:AAA"
+    assert saved.position_type == "SWING"
+    assert saved.protective_order_id == order_result.protective_order_id
+    assert saved.trading_mode == "LIVE"
+
+    client.holding_quantities = [0]
+    trader.sync_broker_positions()
+
+    assert repository.load_positions() == []
+    [trade] = repository.load_trades()
+    assert trade.symbol == "NSE:AAA"
+    assert trade.position_type == "SWING"
+    assert trade.quantity == 7
+    database.close()
     assert len(client.requests) == 2

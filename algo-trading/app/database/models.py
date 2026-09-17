@@ -22,6 +22,10 @@ class TradeRecord:
     exit_price: float
     quantity: int
     pnl: float
+    side: str = "BUY"
+    position_type: str = "INTRADAY"
+    strategy_name: str = ""
+    exit_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,7 @@ class ActivityRecord:
     stop_loss: float | None = None
     pnl: float | None = None
     reason: str = ""
+    previous_stop: float | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +173,19 @@ class PositionRecord:
     target_2: float | None = None
     protective_order_id: str | None = None
     target_1_hit: bool = False
+    instrument_token: int | None = None
+    position_type: str = "INTRADAY"
+    atr_multiplier: float | None = None
+    strategy_name: str = ""
+    trading_mode: str = "PAPER"
+
+
+@dataclass(frozen=True)
+class AgentHeartbeat:
+    engine_name: str
+    last_run_at: datetime
+    last_error: str = ""
+    heartbeat_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -177,3 +195,32 @@ class StrategyPresetRecord:
     parameters: dict
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class DecisionLogRecord:
+    """One row per decision/calculation the system makes, in a shape meant to be read by an
+    LLM later (training, forecasting, strategy review) rather than only by this app's own UI.
+
+    Every existing table (signals, positions, trades, activity, pre_spike_events, ...) stays
+    the source of truth for its own domain -- this is a derived, append-only narrative layer
+    that sits alongside them: `source_table`/`source_id` point back to the detailed row, and
+    `correlation_id` threads together every decision belonging to the same trade/signal
+    lifecycle (e.g. signal -> entry -> N stop trails -> exit) so an outcome can be joined back
+    onto every earlier decision once it's known.
+    """
+
+    timestamp: datetime
+    symbol: str
+    event_type: str
+    strategy_name: str = ""
+    mode: str = "LIVE"
+    decision: str = ""
+    rationale: str = ""
+    inputs: dict[str, object] = field(default_factory=dict)
+    outputs: dict[str, object] = field(default_factory=dict)
+    confidence: float | None = None
+    correlation_id: str = ""
+    outcome: dict[str, object] | None = None
+    source_table: str = ""
+    source_id: str = ""

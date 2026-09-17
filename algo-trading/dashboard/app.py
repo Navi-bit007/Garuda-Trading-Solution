@@ -5,12 +5,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as datetime_time, timedelta
 import json
 from html import escape
+import logging
 from pathlib import Path
 import re
 import sys
 import time
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -20,19 +20,38 @@ if str(PROJECT_ROOT) in sys.path:
     sys.path.remove(str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Streamlit reruns this module on every interaction/fragment tick, so guard against attaching
+# duplicate handlers to the root logger each time. Without a real log file here, an exception
+# caught only as a transient st.warning/st.error (e.g. broker reconciliation failing because a
+# Kite access token expired) leaves no trace anywhere once the toast disappears on the next
+# rerun -- this is what made the missing-broker-order incident on 2026-09-11 hard to diagnose.
+_DASHBOARD_LOG_PATH = PROJECT_ROOT / "data" / "dashboard.log"
+if not logging.getLogger().handlers:
+    _DASHBOARD_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[logging.FileHandler(_DASHBOARD_LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
+    )
+logger = logging.getLogger(__name__)
+
 from app.config.constants import Side, SignalAction, TradingMode
 from app.broker.authentication import AccessToken, AuthenticationError, exchange_request_token
 from app.broker.kite_client import KiteClient
 from app.broker.market_data import MarketData
+from app.broker.order_api import OrderAPI
 from app.broker.positions_api import PositionsAPI
 from app.config.settings import get_settings
 from app.database.database import Database
-from app.database.models import DynamicWatchlistRecord, NotificationRecord, SignalRecord, WatchlistRecord
+from app.database.models import ActivityRecord, DynamicWatchlistRecord, NotificationRecord, PositionRecord, SignalRecord, WatchlistRecord
 from app.database.repository import Repository
+from app.execution.exit_actions import close_position_at_market
 from app.execution.position_manager import Position, PositionManager
 from app.execution.reconciliation import reconcile
-from app.execution.swing_auto_trader import SwingAutoTrader
+from app.execution.agent_launcher import agent_heartbeat_is_fresh, launch_trailing_stop_agent, maybe_autostart_trailing_agent, stop_trailing_stop_agent, trailing_agent_env_from_settings
+from app.execution.swing_auto_trader import SwingAutoTrader, SwingOrderResult, SwingScanResult
 from app.market.candles import validate_ohlcv
+from app.market.indicators import atr as compute_atr
 from app.market.dynamic_watchlist import (
     DYNAMIC_AUTO_REFRESH_CANDLES,
     DYNAMIC_INTERVAL,
@@ -45,7 +64,7 @@ from app.market.dynamic_watchlist import (
 )
 from app.market.historical_scan import HistoricalScanResult, scan_historical_watchlist
 from app.market.scanner import Nifty500Scanner
-from app.market.signal_scanner import StrategySignalScanner
+from app.market.signal_scanner import SignalScanResult, StrategySignalScanner
 from app.market.universe import SUPPORTED_INDEXES, load_nifty_index_universe_from_api
 from app.monitoring.notifications import Notifier, save_signal_notifications
 from app.monitoring.signal_engine import build_signal_engine
@@ -55,6 +74,7 @@ from app.execution.trading_pipeline import TradingPipeline
 from app.strategy.atr_momentum import AtrMomentumStrategy
 from app.strategy.ema_200_close import Ema200CloseStrategy
 from app.strategy.ema_9_200_swing import Ema9200SwingStrategy
+from app.strategy.ema_9_200_progressive import Ema9200ProgressiveStrategy
 from app.strategy.swing_trend_breakout import SwingTrendBreakoutStrategy
 from app.strategy.ema_trend import EmaTrendStrategy
 from app.strategy.high_conviction_long import HighConvictionLongStrategy
@@ -74,15 +94,15 @@ from app.strategy.preset_builder import (
 from app.strategy.signal import Signal
 from app.strategy.vwap_momentum import VwapMomentumStrategy
 from app.strategy.vwap_ema_breakout import MarketRegimeContext, TimeframeConfirmation, VwapEmaBreakoutStrategy
+from app.market.backtest_data import KiteHistoricalDataLoader
 from backtest.engine import BacktestEngine
 from backtest.metrics import calculate_metrics
+from backtest.runner import run_strategy_backtest
 
 
 EDITABLE_SETTINGS = (
     "trading_mode",
     "initial_capital",
-    "risk_per_trade",
-    "max_daily_loss",
     "max_open_positions",
     "max_trades_per_day",
     "max_capital_deployment",
@@ -91,9 +111,20 @@ EDITABLE_SETTINGS = (
     "entry_end",
     "force_exit",
     "trailing_atr_multiplier",
+    "min_stop_improvement_pct",
+    "swing_capital_limit",
+    "swing_quantity_limit",
+    "swing_trailing_atr_multiplier",
+    "swing_max_open_positions",
+    "intraday_capital_limit",
+    "intraday_leverage_multiplier",
 )
 
 SWING_LOOKBACK_DAYS = 600
+# Kite Connect's historical-candle endpoint is rate-limited (documented ~3 req/s); this bounds
+# how many symbols the intraday/swing scanners fetch candles for concurrently. Matches
+# DYNAMIC_MAX_WORKERS' reasoning for the dynamic watchlist scan.
+SCAN_MAX_WORKERS = 4
 
 
 def settings_values(settings) -> dict:
@@ -183,6 +214,19 @@ PRE_SPIKE_LIVE_LABEL = "Pre-Spike Momentum"
 PREVIOUS_DAY_HIGH_LABEL = "Previous day high breakout"
 EMA_200_CLOSE_LIVE_LABEL = "EMA 200 close-above"
 HIGH_CONVICTION_LIVE_LABEL = "High-conviction long"
+BACKTEST_PROGRESSIVE_LABEL = "EMA 9/200 progressive"
+BACKTEST_SWING_TREND_LABEL = "Trend breakout (next-session confirmation)"
+BACKTEST_STRATEGY_LABELS = [
+    BACKTEST_PROGRESSIVE_LABEL,
+    PRE_SPIKE_LIVE_LABEL,
+    PREVIOUS_DAY_HIGH_LABEL,
+    EMA_200_CLOSE_LIVE_LABEL,
+    HIGH_CONVICTION_LIVE_LABEL,
+    CURRENT_STRATEGY_LABEL,
+    EMA_ONLY_STRATEGY_LABEL,
+    "EMA 9/200 swing",
+    BACKTEST_SWING_TREND_LABEL,
+]
 DAILY_SCAN_STRATEGIES = {
     "EMA 9/200 swing": Ema9200SwingStrategy,
     "EMA 200 close-above": Ema200CloseStrategy,
@@ -194,14 +238,46 @@ SWING_STRATEGIES = {
 }
 WORKSPACE_PAGES = [
     "Overview",
+    "Live monitor",
+    "P&L statement",
     "Watchlists",
     "Scanner & signals",
+    "Backtesting",
     "Swing auto trading",
-    "Historical day scan",
-    "Automatic trading",
+    "Intratrading",
     "Risk & settings",
     "Kite authentication",
 ]
+SIDEBAR_PAGE_ICONS = {
+    "Overview": "dashboard",
+    "Live monitor": "monitor_heart",
+    "P&L statement": "receipt_long",
+    "Watchlists": "list_alt",
+    "Scanner & signals": "radar",
+    "Backtesting": "history",
+    "Swing auto trading": "trending_up",
+    "Intratrading": "bolt",
+    "Risk & settings": "settings",
+    "Kite authentication": "key",
+}
+SIDEBAR_LOGO_SVG_BASE64 = (
+    "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+"
+    "CjxyZWN0IHg9IjQuNSIgeT0iMSIgd2lkdGg9IjEuMyIgaGVpZ2h0PSI0IiByeD0iMC42NSIgZmlsbD0i"
+    "IzE0MTcxYiIvPgo8cmVjdCB4PSI3LjIiIHk9IjEiIHdpZHRoPSIxLjMiIGhlaWdodD0iNCIgcng9IjAu"
+    "NjUiIGZpbGw9IiMxNDE3MWIiLz4KPHJlY3QgeD0iMTAuMCIgeT0iMSIgd2lkdGg9IjEuMyIgaGVpZ2h0"
+    "PSI0IiByeD0iMC42NSIgZmlsbD0iIzE0MTcxYiIvPgo8cmVjdCB4PSIxMi43IiB5PSIxIiB3aWR0aD0i"
+    "MS4zIiBoZWlnaHQ9IjQiIHJ4PSIwLjY1IiBmaWxsPSIjMTQxNzFiIi8+CjxyZWN0IHg9IjE1LjUiIHk9"
+    "IjEiIHdpZHRoPSIxLjMiIGhlaWdodD0iNCIgcng9IjAuNjUiIGZpbGw9IiMxNDE3MWIiLz4KPHJlY3Qg"
+    "eD0iMTguMiIgeT0iMSIgd2lkdGg9IjEuMyIgaGVpZ2h0PSI0IiByeD0iMC42NSIgZmlsbD0iIzE0MTcx"
+    "YiIvPgo8cmVjdCB4PSIyIiB5PSI0IiB3aWR0aD0iMjAiIGhlaWdodD0iMTgiIHJ4PSIyLjIiIGZpbGw9"
+    "IiMxNDE3MWIiLz4KPHJlY3QgeD0iNS41IiB5PSI3LjMiIHdpZHRoPSIxMyIgaGVpZ2h0PSIxLjYiIHJ4"
+    "PSIwLjgiIGZpbGw9IiNmZmZmZmYiLz4KPHJlY3QgeD0iNS41IiB5PSIxMC4xIiB3aWR0aD0iOCIgaGVp"
+    "Z2h0PSIxLjYiIHJ4PSIwLjgiIGZpbGw9IiNmZmZmZmYiLz4KPGNpcmNsZSBjeD0iMTIiIGN5PSIxNiIg"
+    "cj0iNS4zIiBmaWxsPSIjZmZmZmZmIi8+Cjx0ZXh0IHg9IjEyIiB5PSIxOC42IiBmb250LXNpemU9IjciIGZv"
+    "bnQtZmFtaWx5PSJBcmlhbCwgc2Fucy1zZXJpZiIgZm9udC13ZWlnaHQ9IjcwMCIgdGV4dC1hbmNob3I9Im1p"
+    "ZGRsZSIgZmlsbD0iIzE0MTcxYiI+JDwvdGV4dD4KPHJlY3QgeD0iNS41IiB5PSIxOS42IiB3aWR0aD0iMTMi"
+    "IGhlaWdodD0iMiIgcng9IjEiIGZpbGw9IiNmZmZmZmYiLz4KPC9zdmc+"
+)
 
 
 def load_dashboard_strategy_options(
@@ -243,6 +319,28 @@ def build_dashboard_strategy(repository: Repository, selected_label: str, pre_sp
     if preset.strategy_type == EMA_ONLY_STRATEGY_TYPE:
         return build_ema_preset_strategy(preset.name, preset.parameters)
     return build_preset_strategy(preset.name, preset.parameters)
+
+
+def build_backtest_strategy(selected_label: str, interval: str):
+    if selected_label == BACKTEST_PROGRESSIVE_LABEL:
+        return Ema9200ProgressiveStrategy(timeframe=interval)
+    if selected_label == PRE_SPIKE_LIVE_LABEL:
+        return PreSpikeMomentumStrategy(timeframe=interval)
+    if selected_label == PREVIOUS_DAY_HIGH_LABEL:
+        return PreviousDayHighBreakoutStrategy()
+    if selected_label == EMA_200_CLOSE_LIVE_LABEL:
+        return Ema200CloseStrategy()
+    if selected_label == HIGH_CONVICTION_LIVE_LABEL:
+        return HighConvictionLongStrategy()
+    if selected_label == CURRENT_STRATEGY_LABEL:
+        return current_strategy()
+    if selected_label == EMA_ONLY_STRATEGY_LABEL:
+        return EmaTrendStrategy(**EMA_ONLY_DEFAULT_PARAMETERS)
+    if selected_label == "EMA 9/200 swing":
+        return Ema9200SwingStrategy()
+    if selected_label == BACKTEST_SWING_TREND_LABEL:
+        return SwingTrendBreakoutStrategy()
+    raise ValueError(f"unsupported backtest strategy: {selected_label}")
 
 
 def build_live_signal_strategy(selected_label: str, timeframe: str, pre_spike_config: PreSpikeMomentumConfig | None = None):
@@ -398,7 +496,7 @@ def inject_styles(st) -> None:
         :root { --ink: #17211b; --muted: #66736a; --paper: #f4f6ef; --line: #d8dfd3; --mint: #b9e8cf; }
         html, body, .stApp { font-family: "Segoe UI Variable", "Segoe UI", sans-serif; color: var(--ink) !important; }
         .stApp { background: var(--paper); }
-        [data-testid="stMainBlockContainer"] { padding-top: 3rem; }
+        [data-testid="stMainBlockContainer"] { padding-top: 1.25rem; }
         [data-testid="stSidebar"] { background: #e6efe5; border-right: 1px solid var(--line); }
         [data-testid="stSidebar"] * { color: var(--ink) !important; opacity: 1 !important; }
         [data-testid="stSidebar"] [data-testid="stRadio"] { width: 100%; }
@@ -420,6 +518,12 @@ def inject_styles(st) -> None:
         [data-testid="stSidebar"] [data-testid="stRadio"] label p { font-size: .94rem; font-weight: 600; }
         [data-testid="stSidebar"] [data-testid="stButton"] button { min-height: 44px; font-weight: 650; }
         [data-testid="stSidebar"] [data-testid="stCaption"] { font-size: .8rem; }
+        /* The native radio dot is purely decorative here -- selection is already shown via the
+           pill background/border above, so hide the dot and keep only the icon + label. */
+        [data-testid="stSidebar"] [data-testid="stRadioOption"] div:has(> [data-testid="stMarkdownContainer"]) > *:not([data-testid="stMarkdownContainer"]) {
+            display: none !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stRadio"] label [data-testid="stIconMaterial"] { font-size: 1.45rem; }
         [data-testid="stMetric"] { background: rgba(255,255,255,.72); border: 1px solid var(--line); padding: 15px 17px; border-radius: 7px; }
         [data-testid="stMetric"] * { color: var(--ink) !important; opacity: 1 !important; }
         [data-testid="stMetricDelta"] svg { fill: currentColor; }
@@ -476,6 +580,40 @@ def inject_styles(st) -> None:
         .selection-tray { border: 1px solid #a9cbb4; background: #f2faf3; padding: 14px 16px; border-radius: 7px; margin: 12px 0; }
         .selection-tray strong { color: #176b4d; }
         .result-meta { color: var(--muted); font-size: .82rem; padding-top: 2px; }
+        .auth-step { border: 1px solid var(--line); background: rgba(255,255,255,.55); border-radius: 9px; padding: 18px 20px; margin-bottom: 14px; }
+        .auth-step.locked { opacity: .55; }
+        .auth-step-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+        .auth-step-number { display: grid; place-items: center; width: 26px; height: 26px; flex: 0 0 26px; border-radius: 50%; background: #176b4d; color: #ffffff !important; font-size: .8rem; font-weight: 800; }
+        .auth-step.locked .auth-step-number { background: #9aa89a; }
+        .auth-step.done .auth-step-number { background: #176b4d; }
+        .auth-step-title { font-weight: 700; font-size: 1rem; color: var(--ink); }
+        .auth-step-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+        .auth-step-row [data-testid="stButton"], .auth-step-row [data-testid="stLinkButton"] { margin: 0; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"""
+        <style>
+        /* Streamlit's own sidebar-collapse arrow is redundant now -- the logo button below is
+           the only expand/collapse control we want, so hide the native one entirely. */
+        [data-testid="stSidebarCollapseButton"] {{ display: none !important; }}
+        [data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {{ align-items: center; }}
+        [data-testid="stSidebar"] .st-key-sidebar_logo_toggle [data-testid="stButton"] button {{
+            background: #ffffff url("data:image/svg+xml;base64,{SIDEBAR_LOGO_SVG_BASE64}") no-repeat center / 38px 38px !important;
+            color: transparent !important;
+            font-size: 0 !important;
+            min-height: 52px !important;
+            height: 52px !important;
+            width: 52px !important;
+            padding: 0 !important;
+        }}
+        [data-testid="stSidebar"] .st-key-sidebar_logo_toggle [data-testid="stButton"] button:hover {{
+            background: #edf4ed url("data:image/svg+xml;base64,{SIDEBAR_LOGO_SVG_BASE64}") no-repeat center / 38px 38px !important;
+            border-color: #176b4d !important;
+        }}
+        .sidebar-brand-title {{ font-size: 1.32rem; font-weight: 800; line-height: 52px; margin: 0; }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -483,13 +621,87 @@ def inject_styles(st) -> None:
 
 
 def runtime_access_token(st, settings) -> str:
+    if st.session_state.get("kite_logged_out"):
+        return ""
     session_token = st.session_state.get("kite_access_token", "")
     if session_token.strip():
         return session_token.strip()
     entered_token = st.session_state.get("kite_access_token_input", "")
     if entered_token.strip():
         return entered_token.strip()
+    # Streamlit gives every browser tab its own st.session_state, even a duplicated tab --
+    # there's no way to share one AppSession across tabs. Without this, each new/duplicated tab
+    # would have to repeat the Kite login flow even though another tab is already authenticated
+    # for the day. The DB-persisted token (set on successful login below) lets any tab pick up
+    # that same session; it's cleared on explicit logout and naturally goes stale once Zerodha
+    # invalidates it at the next trading day's reset.
+    persisted_token = get_dashboard_repository(st).load_kite_access_token(dashboard_user_id(settings))
+    if persisted_token.strip():
+        st.session_state.kite_access_token = persisted_token.strip()
+        return persisted_token.strip()
     return settings.kite_access_token.get_secret_value().strip()
+
+
+KITE_TOKEN_VALIDATION_CACHE_SECONDS = 60
+
+
+def verified_kite_access_token(st, settings) -> str:
+    """Like runtime_access_token, but actively confirms the token still works at Zerodha before
+    trusting it, instead of only checking that a token string is stored.
+
+    Kite invalidates every access token once a trading day, with no refresh grant -- a token
+    persisted from yesterday is worthless today, but `runtime_access_token` alone can't tell the
+    difference, so the app used to keep declaring "Kite authenticated" the next morning right up
+    until some other page's broker call failed. Cached per token for
+    KITE_TOKEN_VALIDATION_CACHE_SECONDS so this doesn't cost an API call on every rerun.
+
+    Only Kite's own `TokenException` (a real "this token is dead" answer from the broker) is
+    treated as invalid; any other error (a network blip, Kite being briefly unreachable) leaves
+    the cached result untouched and the token is trusted as-is -- otherwise a transient failure
+    here would force everyone into a false "please sign in again" on every hiccup.
+    """
+    token = runtime_access_token(st, settings)
+    if not token or not broker_credentials_configured(settings):
+        return token
+    cache_key = f"kite_token_verified::{token}"
+    cached = st.session_state.get(cache_key)
+    now = datetime.now()
+    if cached is not None and (now - cached["checked_at"]).total_seconds() < KITE_TOKEN_VALIDATION_CACHE_SECONDS:
+        return token if cached["valid"] else ""
+    try:
+        from kiteconnect.exceptions import TokenException
+    except ImportError:
+        return token
+    try:
+        connect_kite(settings, token).client.profile()
+    except TokenException:
+        st.session_state[cache_key] = {"checked_at": now, "valid": False}
+        repository = get_dashboard_repository(st)
+        st.session_state.pop("kite_access_token", None)
+        repository.clear_kite_access_token(dashboard_user_id(settings))
+        st.session_state.kite_session_expired_notice = True
+        return ""
+    except Exception:
+        return token
+    st.session_state[cache_key] = {"checked_at": now, "valid": True}
+    return token
+
+
+def log_out_of_kite(st, repository=None, user_id: str = "") -> None:
+    for key in (
+        "kite_access_token",
+        "kite_request_token",
+        "kite_access_token_input",
+        "kite_auth_notice",
+        "dashboard_kite_client",
+        "dashboard_pipeline",
+    ):
+        st.session_state.pop(key, None)
+    st.session_state.kite_logged_out = True
+    st.session_state.pop("active_page", None)
+    st.query_params.clear()
+    if repository is not None and user_id:
+        repository.clear_kite_access_token(user_id)
 
 
 def connect_kite(settings, access_token: str) -> KiteClient:
@@ -812,24 +1024,6 @@ def load_manual_stock_universe(uploaded_file, kite_client) -> pd.DataFrame:
     return universe.drop_duplicates("instrument_token").reset_index(drop=True)
 
 
-class ScanProgress:
-    def __init__(self, st, title: str) -> None:
-        self.started_at = datetime.now()
-        self.status = st.status(f"{title} · 0.0s", expanded=True)
-
-    def update(self, message: str) -> None:
-        elapsed = (datetime.now() - self.started_at).total_seconds()
-        self.status.update(label=f"{message} · {elapsed:.1f}s", state="running", expanded=True)
-
-    def complete(self, message: str) -> None:
-        elapsed = (datetime.now() - self.started_at).total_seconds()
-        self.status.update(label=f"{message} · completed in {elapsed:.1f}s", state="complete", expanded=False)
-
-    def error(self, message: str) -> None:
-        elapsed = (datetime.now() - self.started_at).total_seconds()
-        self.status.update(label=f"{message} · failed after {elapsed:.1f}s", state="error", expanded=True)
-
-
 def load_live_scanner_snapshot(settings, access_token: str, token_to_symbol: dict[int, str], scanner_limit: int = 20) -> pd.DataFrame:
     client = connect_kite(settings, access_token)
     return Nifty500Scanner(token_to_symbol, max_candidates=scanner_limit).rank_ticks(load_live_quote_ticks(client.client, token_to_symbol))
@@ -1026,7 +1220,11 @@ def render_broker_reconciliation(st, settings, access_token: str) -> None:
                     "quantity_mismatches": quantity_mismatches,
                 }
             except Exception as error:
-                st.error(f"Broker positions could not be loaded: {error}")
+                logger.exception("Manual broker reconciliation failed")
+                if "timed out" in str(error).lower():
+                    st.error("Kite API did not respond in time. It may be under heavy load right now — wait a moment and click Refresh broker positions again.")
+                else:
+                    st.error(f"Broker positions could not be loaded: {error}")
         reconciliation = st.session_state.get("broker_reconciliation")
         if reconciliation is None:
             st.caption("No broker comparison has been run in this session.")
@@ -1066,15 +1264,13 @@ def render_broker_reconciliation(st, settings, access_token: str) -> None:
         st.caption(f"Last checked {reconciliation['checked_at'].strftime('%H:%M:%S')}")
 
 
-def render_control_center(st, settings, activity: pd.DataFrame, day_pnl: float) -> None:
+def render_control_center(st, settings, activity: pd.DataFrame) -> None:
     st.subheader("Trading control center")
     access_token = runtime_access_token(st, settings)
     connection_status, connection_detail = broker_connection_state(st, settings, access_token)
     pipeline = st.session_state.get("dashboard_pipeline")
     managed_positions = local_position_manager(st).positions
     open_exposure = sum(position.entry_price * position.quantity for position in managed_positions.values())
-    daily_loss_limit = settings.initial_capital * settings.max_daily_loss
-    loss_remaining = max(0.0, daily_loss_limit + day_pnl)
     trades_today = int(activity.loc[activity["timestamp"].astype(str).str.startswith(date.today().isoformat()), "event_kind"].eq("exit_submitted").sum()) if not activity.empty else 0
     selected_watchlists = get_dashboard_repository(st).load_watchlists(dashboard_user_id(settings), selected_only=True)
     signal_engine_status = "Monitoring" if selected_watchlists else "Waiting"
@@ -1084,11 +1280,10 @@ def render_control_center(st, settings, activity: pd.DataFrame, day_pnl: float) 
     checked_time = checked["checked_at"].strftime("%H:%M:%S") if checked else "not checked"
     last_market_data = st.session_state.get("last_market_data_at")
     last_market_data_label = last_market_data.strftime("%H:%M:%S") if isinstance(last_market_data, datetime) else "not available"
-    status_columns = st.columns(4)
+    status_columns = st.columns(3)
     status_columns[0].metric("Broker", connection_status)
     status_columns[1].metric("Signal engine", signal_engine_status)
     status_columns[2].metric("Open positions", f"{len(managed_positions)} / {settings.max_open_positions}")
-    status_columns[3].metric("Daily loss remaining", f"₹{loss_remaining:,.0f}", f"limit ₹{daily_loss_limit:,.0f}")
     st.caption(f"{connection_detail} Last check: {checked_time} · Last market data: {last_market_data_label}")
     action_columns = st.columns(3)
     if action_columns[0].button("Check broker connection", key="check_broker_connection", icon=":material/cloud_done:"):
@@ -1164,6 +1359,7 @@ def render_position_monitor(st, settings, access_token: str) -> None:
                 events.extend(pipeline.monitor_candle_closes(completed_candles))
             record_dashboard_events(st, events)
         except Exception as error:
+            logger.exception("Position monitoring cycle failed for %s open intraday position(s); positions were not reconciled against the broker this cycle", len(pipeline.managed_positions))
             st.warning(f"Position monitoring paused: {error}")
 
     positions = []
@@ -1261,52 +1457,759 @@ def render_position_monitor(st, settings, access_token: str) -> None:
         st.caption(" · ".join(f"{event.kind}: {event.symbol}" for event in recent_events))
 
 
+def render_manual_exit_action(st, settings, repository: Repository, record: PositionRecord, access_token: str, quotes: dict) -> None:
+    """Let the user force-close the selected Live monitor row on demand: market-exit it and
+    cancel its resting SL-M, mirroring the standalone agent's own force-exit mechanics
+    (app.execution.exit_actions.close_position_at_market) but triggered by a click instead of
+    the configured force-exit time. Works for both INTRADAY and SWING rows, since -- unlike the
+    Intraday desk's own "Exit" button, which only ever sees symbols in that dashboard session's
+    in-memory pipeline -- this acts directly on whatever PositionRecord Live monitor is already
+    displaying, straight from the shared `positions` table the agent itself reads.
+    """
+    if not broker_credentials_configured(settings) or not access_token:
+        st.info("Connect to Zerodha (Kite authentication page) to send a live exit order.", icon=":material/link_off:")
+        return
+
+    key = record.symbol if ":" in record.symbol else f"NSE:{record.symbol}"
+    live_quote = quotes.get(key) or {}
+    last_price = float(live_quote.get("last_price", 0) or 0) or record.entry_price
+
+    with st.container(border=True):
+        st.markdown(f"**Exit {record.symbol} at market**")
+        st.caption(
+            f"{record.side} {record.quantity} · entry ₹{record.entry_price:,.2f} · stop ₹{record.stop_loss:,.2f} · "
+            f"last ₹{last_price:,.2f} · {record.position_type}"
+        )
+        with st.form(f"manual_exit_form_{record.symbol}"):
+            confirmed = st.checkbox(
+                f"I understand this will send a live MARKET exit order for {record.symbol} and cancel its resting protective stop.",
+                key=f"manual_exit_confirm_{record.symbol}",
+            )
+            submitted = st.form_submit_button(f"Exit {record.symbol} now", type="primary", icon=":material/close:")
+
+        if not submitted:
+            return
+        if not confirmed:
+            st.warning("Confirm the checkbox above to send the exit order.")
+            return
+
+        # Re-check the position immediately before acting -- it may have been closed by the
+        # standalone agent (a stop hit, or its own force-exit) in the few seconds between this
+        # row being rendered and the button being clicked. Using the freshest record also
+        # targets the current protective_order_id if the agent re-armed or replaced it since.
+        fresh_record = next((row for row in repository.load_positions() if row.symbol == record.symbol), None)
+        if fresh_record is None:
+            st.info(f"{record.symbol} is no longer open -- it may have just been closed by the trailing-stop agent or at the broker.")
+            st.rerun()
+            return
+
+        try:
+            client = connect_kite(settings, access_token)
+        except Exception as error:
+            st.error(f"Could not connect to Zerodha to send the exit order: {error}")
+            return
+        orders = OrderAPI(TradingMode.LIVE, client.client)
+        outcome = close_position_at_market(
+            repository,
+            orders,
+            fresh_record,
+            price=last_price,
+            timestamp=datetime.now(),
+            reason="Manual exit (Live monitor)",
+            event_kind="manual_exit",
+            decision="MANUAL_EXIT",
+        )
+        if not outcome.success:
+            st.error(f"Exit order failed for {record.symbol}: {outcome.error}")
+            return
+        if outcome.cancel_error:
+            st.warning(
+                f"{record.symbol} closed at ₹{outcome.exit_price:,.2f} (pnl ₹{outcome.pnl:,.2f}), but cancelling its "
+                f"resting stop failed: {outcome.cancel_error}. Check for a stale SL-M order at the broker."
+            )
+        else:
+            st.success(f"{record.symbol} closed at ₹{outcome.exit_price:,.2f} (pnl ₹{outcome.pnl:,.2f}).")
+        st.rerun()
+
+
+def render_live_monitor(st, settings) -> None:
+    @st.fragment(run_every=10)
+    def render_live_monitor_content() -> None:
+        st.markdown('<div class="eyebrow">Unified position tracker</div>', unsafe_allow_html=True)
+        repository = get_dashboard_repository(st)
+        access_token = runtime_access_token(st, settings)
+
+        heartbeat = repository.load_agent_heartbeat("trailing_stop_agent")
+        heartbeat_age = (datetime.now() - heartbeat.heartbeat_at).total_seconds() if heartbeat else None
+        if heartbeat is None:
+            agent_state = "stopped"
+        elif heartbeat.last_error:
+            agent_state = "error"
+        elif heartbeat_age is not None and heartbeat_age > 90:
+            agent_state = "stalled"
+        else:
+            agent_state = "running"
+        # A full-width banner here (the same visual treatment other pages use for their own scan
+        # status) pushed every position table below the fold on a small monitor -- the agent's
+        # status matters, but not enough to cost that much vertical space on every single render.
+        # A small badge next to the title keeps that detail one click away instead of always on.
+        status_badge_copy = {
+            "running": ("🟢", "Agent active"),
+            "stalled": ("🟡", "Heartbeat stale"),
+            "error": ("🔴", "Needs attention"),
+            "stopped": ("⚪", "Agent stopped"),
+        }[agent_state]
+        title_column, status_column = st.columns([5, 2], vertical_alignment="bottom")
+        with title_column:
+            st.title("Live monitor")
+        with status_column:
+            with st.popover(f"{status_badge_copy[0]} {status_badge_copy[1]}", width="stretch"):
+                if agent_state in {"running", "stalled", "error"}:
+                    state_copy = {
+                        "running": ("Trailing-stop agent active", f"Last heartbeat {heartbeat_age:.0f}s ago -- protective stops are being kept current"),
+                        "stalled": ("Trailing-stop agent heartbeat is stale", f"No heartbeat in {heartbeat_age:.0f}s -- positions may not be protected; check the standalone agent process"),
+                        "error": ("Trailing-stop agent needs attention", escape((heartbeat.last_error if heartbeat else "")[:240] or "The latest agent cycle reported an error")),
+                    }[agent_state]
+                    render_scan_activity_banner(st, agent_state, *state_copy)
+                else:
+                    st.warning("Trailing-stop agent has no heartbeat yet -- start it to protect open positions.")
+                    start_disabled = not broker_credentials_configured(settings) or not access_token
+                    if st.button("Start agent now", icon=":material/play_arrow:", disabled=start_disabled, width="stretch"):
+                        launch_trailing_stop_agent(
+                            settings.kite_api_key,
+                            settings.kite_api_secret.get_secret_value(),
+                            access_token,
+                            repository,
+                            extra_env=trailing_agent_env_from_settings(settings),
+                        )
+                        st.rerun()
+        st.caption(
+            "Every open LIVE-mode intraday and swing position, read straight from the database the "
+            "standalone trailing-stop agent maintains -- cross-checked against Zerodha's own "
+            "live positions so drift between the two is visible immediately. PAPER-mode positions are "
+            "simulated locally and are not shown here or managed by the trailing-stop agent."
+        )
+
+        records = [record for record in repository.load_positions() if record.trading_mode == "LIVE"]
+        if not records:
+            st.markdown('<div class="empty">No open LIVE positions.</div>', unsafe_allow_html=True)
+            return
+
+        activity = load_activity()[2]
+        # "stop_trailed" is an ATR/EMA-driven move; "stop_rearmed" is a same-price re-placement
+        # after Zerodha's overnight day-order expiry -- both are broker-side changes to the
+        # resting SL-M and belong in the same history, or a freshly re-armed order (a new
+        # order id at the broker, confirmed by "Broker status") would show no explanation at all.
+        stop_update_kinds = ["stop_trailed", "stop_rearmed"]
+        stop_trail_events = pd.DataFrame(columns=["timestamp", "symbol", "reason", "stop_loss", "previous_stop"])
+        if not activity.empty:
+            stop_trail_events = activity.loc[
+                activity["event_kind"].isin(stop_update_kinds), ["timestamp", "symbol", "reason", "stop_loss", "previous_stop"]
+            ].copy()
+            stop_trail_events["timestamp"] = pd.to_datetime(stop_trail_events["timestamp"], errors="coerce")
+        stop_trail_counts = stop_trail_events["symbol"].value_counts().to_dict() if not stop_trail_events.empty else {}
+        # st.dataframe has no per-cell hover tooltip -- column_config "help" is one static string
+        # for the whole column -- so instead of a hover, show the latest move's from/to prices
+        # directly as a column: the most recent stop-price-moving activity row per symbol (a
+        # re-arm never changes the price, so it's naturally skipped below via previous_stop).
+        latest_stop_move: dict[str, str] = {}
+        if not stop_trail_events.empty:
+            for _, event_row in stop_trail_events.sort_values("timestamp").iterrows():
+                previous_stop = event_row["previous_stop"]
+                if pd.notna(previous_stop):
+                    latest_stop_move[event_row["symbol"]] = f"₹{float(previous_stop):,.2f} → ₹{float(event_row['stop_loss']):,.2f}"
+
+        quotes: dict = {}
+        broker_open_tradingsymbols: set[str] | None = None
+        atr_values: dict[str, float] = {}
+        if broker_credentials_configured(settings) and access_token:
+            try:
+                client = connect_kite(settings, access_token)
+                keys = [record.symbol if ":" in record.symbol else f"NSE:{record.symbol}" for record in records]
+                quotes = client.client.ltp(keys)
+                broker_positions = client.client.positions().get("net", [])
+                broker_open_tradingsymbols = {
+                    str(position.get("tradingsymbol", "")).strip().upper()
+                    for position in broker_positions
+                    if int(position.get("quantity", 0) or 0) != 0
+                }
+                # A CNC (swing) buy drops out of positions() once it settles into a holding --
+                # commonly the next trading day or two -- even though nothing was ever sold.
+                # Without also checking holdings(), every swing position would eventually show
+                # as "Not found at broker" here purely from settlement, a few days after entry.
+                for holding in client.client.holdings():
+                    total_quantity = int(holding.get("quantity", 0) or 0) + int(holding.get("t1_quantity", 0) or 0)
+                    if total_quantity > 0:
+                        broker_open_tradingsymbols.add(str(holding.get("tradingsymbol", "")).strip().upper())
+            except Exception as error:
+                st.warning(f"Live broker data unavailable right now: {error}")
+            else:
+                for record in records:
+                    if record.instrument_token is None:
+                        continue
+                    try:
+                        interval = "15minute" if record.position_type == "INTRADAY" else "day"
+                        lookback_days = 5 if record.position_type == "INTRADAY" else SWING_LOOKBACK_DAYS
+                        candles = load_live_candles_from_client(client.client, record.instrument_token, interval, lookback_days)
+                        if len(candles) > 14:
+                            value = float(compute_atr(candles, 14).iloc[-1])
+                            if pd.notna(value) and value > 0:
+                                atr_values[record.symbol] = value
+                    except Exception:
+                        logger.exception("ATR lookup failed for %s in the live monitor", record.symbol)
+
+        def tradingsymbol(symbol: str) -> str:
+            return symbol.split(":", 1)[1].strip().upper() if ":" in symbol else symbol.strip().upper()
+
+        def build_rows(position_type: str) -> list[dict]:
+            rows = []
+            for record in records:
+                if record.position_type != position_type:
+                    continue
+                key = record.symbol if ":" in record.symbol else f"NSE:{record.symbol}"
+                live_quote = quotes.get(key) or {}
+                last_price = float(live_quote.get("last_price", 0) or 0) or record.entry_price
+                direction = 1 if record.side == "BUY" else -1
+                pnl = (last_price - record.entry_price) * record.quantity * direction
+                invested = record.entry_price * record.quantity
+                pnl_pct = (pnl / invested * 100) if invested else 0.0
+                stop_distance_pct = abs(last_price - record.stop_loss) / last_price * 100 if last_price else 0.0
+                if broker_open_tradingsymbols is None:
+                    broker_status = "Unknown"
+                elif tradingsymbol(record.symbol) in broker_open_tradingsymbols:
+                    broker_status = "Matches broker"
+                else:
+                    broker_status = "Not found at broker"
+                rows.append(
+                    {
+                        "Symbol": record.symbol,
+                        "Strategy": record.strategy_name or "-",
+                        "Side": record.side,
+                        "Qty": record.quantity,
+                        "Entry": record.entry_price,
+                        "Last": last_price,
+                        "Stop": record.stop_loss,
+                        "Stop distance %": stop_distance_pct,
+                        "ATR": atr_values.get(record.symbol),
+                        "ATR mult.": record.atr_multiplier,
+                        "P&L": pnl,
+                        "P&L %": pnl_pct,
+                        "Target 1": record.target_1,
+                        "Target 1 hit": "Yes" if record.target_1_hit else "No",
+                        "Stop updates": int(stop_trail_counts.get(record.symbol, 0)),
+                        "Last stop move": latest_stop_move.get(record.symbol, "-"),
+                        "Protective order": record.protective_order_id or "Unavailable",
+                        "Broker status": broker_status,
+                        "Entered": record.entry_time,
+                    }
+                )
+            return rows
+
+        column_config = {
+            "Entry": st.column_config.NumberColumn(format="₹%.2f"),
+            "Last": st.column_config.NumberColumn(format="₹%.2f"),
+            "Stop": st.column_config.NumberColumn(format="₹%.2f", help="The current SL-M trigger price resting at the broker."),
+            "Stop distance %": st.column_config.NumberColumn(format="%.2f%%", help="How far the last traded price is from the stop, as a percentage of the last price: |Last - Stop| / Last x 100."),
+            "ATR": st.column_config.NumberColumn(format="₹%.2f", help="The current ATR14 value in rupees -- the average true range over the last 14 completed candles (15-minute for intraday, daily for swing). Blank if there isn't enough candle history or live broker data yet."),
+            "ATR mult.": st.column_config.NumberColumn(format="%.2f", help="The trailing-stop agent's ATR multiplier for this position. Its candidate stop is Last price minus (ATR14 x this multiplier) for a BUY, calculated on 15-minute candles for intraday and daily candles for swing -- and it only ever moves in your favor, never back toward the entry."),
+            "P&L": st.column_config.NumberColumn(format="₹%.2f"),
+            "P&L %": st.column_config.NumberColumn(format="%.2f%%", help="P&L as a percentage of entry price x quantity: (Last - Entry) / Entry x 100, signed for the trade's side."),
+            "Target 1": st.column_config.NumberColumn(format="₹%.2f", help="The price that triggers the target-1 action (move stop to breakeven, or close the position, depending on strategy). Blank means the strategy didn't set one."),
+            "Stop updates": st.column_config.NumberColumn(
+                help="How many times the trailing-stop agent has moved or re-armed this position's SL-M since entry. Select the row to filter 'Recent stop-loss updates' below to just this symbol."
+            ),
+            "Last stop move": st.column_config.TextColumn(help="The most recent trailing-stop move for this position (old price → new price)."),
+            "Entered": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
+        }
+
+        def render_table(title: str, position_type: str, table_key: str) -> str:
+            st.subheader(title)
+            rows = build_rows(position_type)
+            if not rows:
+                st.markdown('<div class="empty">No open positions.</div>', unsafe_allow_html=True)
+                return ""
+            frame = pd.DataFrame(rows).sort_values("Entered", ascending=False).reset_index(drop=True)
+            # A LinkColumn ("?stop_symbol=...") used to drive this instead -- but Streamlit
+            # renders that as a real <a href>, so clicking it forced a full browser navigation
+            # to the bare query string. That tore down the whole app (new Streamlit session,
+            # sidebar navigation reset to its default page) instead of just re-running this
+            # fragment, which is why it flickered and dropped back to the very first workspace
+            # page. Row selection re-runs in place -- no navigation, no lost session state.
+            event = st.dataframe(
+                frame,
+                width="stretch",
+                hide_index=True,
+                column_config=column_config,
+                on_select="rerun",
+                selection_mode="single-row",
+                key=table_key,
+            )
+            selected_rows = event.selection.rows if event and event.selection else []
+            if selected_rows:
+                return str(frame.iloc[selected_rows[0]]["Symbol"])
+            return ""
+
+        st.caption(
+            "Stop distance % = |Last − Stop| ÷ Last × 100. Stop trailing = (ATR × ATR mult.) below the last price for a "
+            "BUY (above it for a SELL) on 15-minute candles for intraday / daily candles for swing, moved only in your "
+            "favor -- never back toward entry. ATR is the current ATR14 value in rupees, live from the same candles. "
+            "Target 1 is the price that triggers that strategy's target-1 action (move stop to breakeven, or close "
+            "outright); hover any column header for its exact definition. Select a row to filter its stop-loss "
+            "history below."
+        )
+        selected_in_intraday = render_table("Intraday positions", "INTRADAY", "live_monitor_intraday_table")
+        selected_in_swing = render_table("Swing positions", "SWING", "live_monitor_swing_table")
+        selected_stop_symbol = selected_in_intraday or selected_in_swing
+
+        if not stop_trail_events.empty:
+            tracked_symbols = {record.symbol for record in records}
+            recent_updates = stop_trail_events.loc[stop_trail_events["symbol"].isin(tracked_symbols)].sort_values("timestamp", ascending=False).head(30)
+            if selected_stop_symbol:
+                selected_updates = recent_updates.loc[recent_updates["symbol"] == selected_stop_symbol]
+                updates_title = f"SL-M stop updates: {selected_stop_symbol} ({len(selected_updates)})"
+            else:
+                selected_updates = recent_updates
+                updates_title = f"Recent stop-loss updates ({len(recent_updates)})"
+            with st.expander(updates_title, expanded=bool(selected_stop_symbol)):
+                st.caption(
+                    "Every SL-M change the trailing-stop agent has made at the broker, most recent first -- including a "
+                    "same-price re-arm after Zerodha's overnight day-order expiry, not just an actual trailing move. From "
+                    "and To are the broker trigger prices (equal for a re-arm, since the level itself didn't change); "
+                    "Calculation details is the exact trailing-stop math for a move, or the re-arm's reason otherwise."
+                )
+                detail_rows = selected_updates.copy()
+                # Rows logged before the calculation-detail upgrade have no previous_stop and
+                # phrase "reason" as "trailing stop moved from X to Y" instead of a formula --
+                # fall back to parsing that legacy text so "From" isn't blank for older history.
+                legacy_from = detail_rows["reason"].str.extract(r"from ([\d.]+)", expand=False).astype(float)
+                detail_rows["From"] = detail_rows["previous_stop"].fillna(legacy_from)
+                detail_rows["To"] = detail_rows["stop_loss"]
+                detail_rows["Calculation details"] = detail_rows["reason"]
+                st.dataframe(
+                    detail_rows.rename(columns={"timestamp": "Time", "symbol": "Symbol"})[
+                        ["Time", "Symbol", "From", "To", "Calculation details"]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss", width="small"),
+                        "Symbol": st.column_config.TextColumn(width="small"),
+                        "From": st.column_config.NumberColumn(format="₹%.2f", width="small"),
+                        "To": st.column_config.NumberColumn(format="₹%.2f", width="small"),
+                        "Calculation details": st.column_config.TextColumn(width="large"),
+                    },
+                )
+
+        if selected_stop_symbol:
+            selected_record = next((row for row in records if row.symbol == selected_stop_symbol), None)
+            if selected_record is not None:
+                render_manual_exit_action(st, settings, repository, selected_record, access_token, quotes)
+
+        if broker_open_tradingsymbols is not None:
+            tracked_tradingsymbols = {tradingsymbol(record.symbol) for record in records}
+            untracked = sorted(broker_open_tradingsymbols - tracked_tradingsymbols)
+            if untracked:
+                st.warning(
+                    "Zerodha shows open position(s) this app isn't tracking at all -- "
+                    "possibly a manual trade or a dropped record: " + ", ".join(untracked)
+                )
+
+        intraday_count = sum(1 for record in records if record.position_type == "INTRADAY")
+        swing_count = len(records) - intraday_count
+        st.caption(f"{intraday_count} intraday · {swing_count} swing position(s) · refreshes every 10 seconds.")
+
+    render_live_monitor_content()
+
+
+def render_pnl_statement(st, settings) -> None:
+    @st.fragment(run_every=10)
+    def render_pnl_statement_content() -> None:
+        st.markdown('<div class="eyebrow">Trade record</div>', unsafe_allow_html=True)
+        st.title("P&L statement")
+        st.caption("Every open position (live) and every closed trade (realized), in one statement.")
+
+        repository = get_dashboard_repository(st)
+        open_records = repository.load_positions()
+        closed_records = repository.load_trades()
+        if not open_records and not closed_records:
+            st.markdown('<div class="empty">No trades yet.</div>', unsafe_allow_html=True)
+            return
+
+        access_token = runtime_access_token(st, settings)
+        quotes: dict = {}
+        if open_records and broker_credentials_configured(settings) and access_token:
+            try:
+                client = connect_kite(settings, access_token)
+                keys = [record.symbol if ":" in record.symbol else f"NSE:{record.symbol}" for record in open_records]
+                quotes = client.client.ltp(keys)
+            except Exception as error:
+                st.warning(f"Live quotes unavailable right now: {error}")
+
+        def _pnl_pct(pnl: float, entry_price: float, quantity: int) -> float:
+            invested = entry_price * quantity
+            return (pnl / invested * 100) if invested else 0.0
+
+        # Built once (independent of the Show filter below) so the totals summarized at the
+        # top of the page always reflect every position/trade, not just the ones the radio
+        # currently displays -- switching the filter to "Open" or "Closed" shouldn't make the
+        # portfolio's total P&L appear to change.
+        open_rows = []
+        for record in open_records:
+            key = record.symbol if ":" in record.symbol else f"NSE:{record.symbol}"
+            quote = quotes.get(key) or {}
+            ltp = float(quote.get("last_price", 0) or 0) or record.entry_price
+            direction = 1 if record.side == "BUY" else -1
+            pnl = (ltp - record.entry_price) * record.quantity * direction
+            open_rows.append(
+                {
+                    "Stock Name": record.symbol,
+                    "Current Position": "OPEN",
+                    "Entry Price": record.entry_price,
+                    "Exit Price": None,
+                    "LTP": ltp,
+                    "P&L": pnl,
+                    "P&L %": _pnl_pct(pnl, record.entry_price, record.quantity),
+                    "SL Current Price": record.stop_loss,
+                    "Used Strategy Name": record.strategy_name or "-",
+                    "Entered": record.entry_time,
+                    "Exited": None,
+                    "Activity time": record.entry_time,
+                    "_correlation_id": f"{record.symbol}:{record.entry_time.isoformat()}",
+                }
+            )
+        closed_rows = []
+        for trade in closed_records:
+            closed_rows.append(
+                {
+                    "Stock Name": trade.symbol,
+                    "Current Position": "CLOSED",
+                    "Entry Price": trade.entry_price,
+                    "Exit Price": trade.exit_price,
+                    "LTP": None,
+                    "P&L": trade.pnl,
+                    "P&L %": _pnl_pct(trade.pnl, trade.entry_price, trade.quantity),
+                    "SL Current Price": None,
+                    "Used Strategy Name": trade.strategy_name or "-",
+                    "Entered": trade.entry_time,
+                    "Exited": trade.exit_time,
+                    "Activity time": trade.exit_time,
+                    "_correlation_id": f"{trade.symbol}:{trade.entry_time.isoformat()}",
+                }
+            )
+
+        realized_pnl = sum(trade.pnl for trade in closed_records)
+        unrealized_pnl = sum(row["P&L"] for row in open_rows)
+        total_invested = sum(record.entry_price * record.quantity for record in open_records) + sum(
+            trade.entry_price * trade.quantity for trade in closed_records
+        )
+        total_pnl = realized_pnl + unrealized_pnl
+        total_pnl_pct = (total_pnl / total_invested * 100) if total_invested else 0.0
+
+        def _ist_date(value):
+            timestamp = pd.Timestamp(value)
+            if timestamp.tzinfo is not None:
+                timestamp = timestamp.tz_convert("Asia/Kolkata")
+            return timestamp.date()
+
+        today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+        today_closed_records = [trade for trade in closed_records if _ist_date(trade.exit_time) == today]
+        # Today's realized leg is trades exited today; unrealized is folded in as-is (any open
+        # position's P&L is inherently "as of today" regardless of which day it was entered).
+        today_realized_pnl = sum(trade.pnl for trade in today_closed_records)
+        today_pnl = today_realized_pnl + unrealized_pnl
+        today_invested = sum(record.entry_price * record.quantity for record in open_records) + sum(
+            trade.entry_price * trade.quantity for trade in today_closed_records
+        )
+        today_pnl_pct = (today_pnl / today_invested * 100) if today_invested else 0.0
+
+        summary_columns = st.columns(5)
+        # The delta arg on st.metric renders as an extra pill line below the value, which would
+        # make only this one card taller than the others -- folding the % into the value string
+        # instead keeps every card the same single-line height.
+        summary_columns[0].metric("Total P&L", f"₹{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)")
+        summary_columns[1].metric(
+            "Today P&L",
+            f"₹{today_pnl:,.2f} ({today_pnl_pct:+.2f}%)",
+            help="Realized P&L from trades exited today, plus unrealized P&L on every still-open position.",
+        )
+        summary_columns[2].metric("Total Realized P&L", f"₹{realized_pnl:,.2f}")
+        summary_columns[3].metric("Total Unrealized P&L", f"₹{unrealized_pnl:,.2f}")
+        summary_columns[4].metric("Positions", f"{len(open_records)} open · {len(closed_records)} closed")
+
+        show_label_column, show_radio_column = st.columns([1, 11], vertical_alignment="center")
+        show_label_column.markdown("**Show**")
+        status_filter = show_radio_column.radio(
+            "Show",
+            ["All", "Open", "Closed"],
+            horizontal=True,
+            key="pnl_statement_filter",
+            label_visibility="collapsed",
+        )
+
+        rows = []
+        if status_filter in ("All", "Open"):
+            rows.extend(open_rows)
+        if status_filter in ("All", "Closed"):
+            rows.extend(closed_rows)
+
+        if not rows:
+            st.markdown('<div class="empty">No trades match this filter.</div>', unsafe_allow_html=True)
+            return
+
+        def _normalize_activity_time(value):
+            if value is None:
+                return pd.Timestamp.min
+            timestamp = pd.Timestamp(value)
+            if timestamp.tzinfo is not None:
+                timestamp = timestamp.tz_convert("Asia/Kolkata").tz_localize(None)
+            return timestamp
+
+        frame = pd.DataFrame(rows)
+        frame["Activity time"] = frame["Activity time"].apply(_normalize_activity_time)
+        frame = frame.sort_values("Activity time", ascending=False).drop(columns="Activity time").reset_index(drop=True)
+        # Row selection instead of a per-row link/button: a link column would force a full
+        # browser navigation (see the Live monitor page's own "Stop updates" column history --
+        # that's exactly what caused it to flicker and drop back to the wrong dashboard page).
+        # Selecting a row re-runs only this fragment.
+        event = st.dataframe(
+            frame,
+            width="stretch",
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="pnl_statement_table",
+            column_config={
+                "Entry Price": st.column_config.NumberColumn(format="₹%.2f"),
+                "Exit Price": st.column_config.NumberColumn(format="₹%.2f"),
+                "LTP": st.column_config.NumberColumn(format="₹%.2f"),
+                "P&L": st.column_config.NumberColumn(format="₹%.2f"),
+                "P&L %": st.column_config.NumberColumn(format="%.2f%%"),
+                "SL Current Price": st.column_config.NumberColumn(format="₹%.2f"),
+                "Entered": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
+                "Exited": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
+                "_correlation_id": None,
+            },
+        )
+        st.caption("Select a row to see that trade's full activity below: entry, every SL-M update (and whether it succeeded), and why it closed.")
+
+        selected_rows = event.selection.rows if event and event.selection else []
+        if selected_rows:
+            selected = frame.iloc[selected_rows[0]]
+            decisions = repository.load_decisions(correlation_id=selected["_correlation_id"], limit=200)
+            decisions.sort(key=lambda decision: decision.timestamp.isoformat())
+            with st.expander(f"Trade activity: {selected['Stock Name']} ({len(decisions)})", expanded=True):
+                if not decisions:
+                    st.markdown(
+                        '<div class="empty">No recorded activity for this trade yet -- it may predate the activity log, '
+                        "or its entry wasn't made through the standalone trailing-stop agent.</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption(
+                        "Details shows each stop trail's actual ATR calculation (e.g. \"ATR14 ₹15.35 × mult 1.50 = ₹23.03; "
+                        "Last ₹2162.43 − ₹23.03 = ₹2139.40\") for anything trailed since this calculation-detail logging "
+                        "was added -- a small, uneven move (a handful of paise) is normal: it's whatever ATR14 × the "
+                        "multiplier came out to on that candle, not a rounded step. Older rows only have a plain "
+                        "\"moved from X to Y\" line, since the calculation itself wasn't being saved yet when they happened."
+                    )
+                    # Every row for a closed trade carries the same final `outcome` (it's
+                    # backfilled onto the whole correlation_id chain once the exit is known, so
+                    # a future LLM pass can see what each earlier decision led to) -- repeating
+                    # that identical number on all 20+ intermediate stop-trail rows reads as
+                    # noise here, so it's only shown once, on the row that actually closed the
+                    # trade. "Details" is where each stop trail's own math lives instead.
+                    activity_rows = [
+                        {
+                            "Time": decision.timestamp,
+                            "Event": decision.event_type,
+                            "Result": decision.decision,
+                            "Details": decision.rationale,
+                            "Final P&L": (
+                                f"₹{decision.outcome['pnl']:,.2f}"
+                                if decision.event_type in {"exit"} and decision.outcome and "pnl" in decision.outcome
+                                else "-"
+                            ),
+                        }
+                        for decision in decisions
+                    ]
+                    st.dataframe(
+                        pd.DataFrame(activity_rows),
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "Time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss", width="small"),
+                            "Event": st.column_config.TextColumn(width="small"),
+                            "Result": st.column_config.TextColumn(width="small"),
+                            "Details": st.column_config.TextColumn(width="large"),
+                            "Final P&L": st.column_config.TextColumn(width="small"),
+                        },
+                    )
+
+    render_pnl_statement_content()
+
+
+def render_trailing_agent_auto_start_toggle(st, repository, user_id: str) -> bool:
+    current_value = repository.get_auto_start_trailing_agent(user_id)
+    enabled = st.checkbox(
+        "Automatically start the trailing-stop agent whenever I log in",
+        value=current_value,
+        key="auto_start_trailing_agent_toggle",
+        help=(
+            "The standalone trailing-stop agent (scripts/run_trailing_stop_agent.py) will be launched "
+            "as a detached background process each time a fresh access token becomes available here -- "
+            "no manual .env editing needed. It keeps running even if this dashboard is closed."
+        ),
+    )
+    if enabled != current_value:
+        repository.set_auto_start_trailing_agent(user_id, enabled)
+    return enabled
+
+
 def render_kite_authentication(st, settings) -> None:
     st.markdown('<div class="eyebrow">Broker connection</div>', unsafe_allow_html=True)
     st.title("Kite authentication")
     if notice := st.session_state.pop("kite_auth_notice", ""):
         st.success(notice, icon=":material/check_circle:")
-    runtime_token = runtime_access_token(st, settings)
-    st.subheader("Connect Zerodha Kite")
-    if broker_credentials_configured(settings):
-        login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={quote(settings.kite_api_key)}"
-        st.link_button("Open Kite login", login_url, icon=":material/login:")
-        access_token_input = st.text_input(
-            "Kite access token",
-            type="password",
-            key="kite_access_token_input",
-            help="Paste an access token you already generated, or use the request-token exchange below.",
+    if st.session_state.pop("kite_session_expired_notice", False):
+        st.warning(
+            "Your Kite session expired -- Zerodha invalidates access tokens daily with no refresh, "
+            "so a fresh sign-in is required. Please log in again below.",
+            icon=":material/schedule:",
         )
-        if access_token_input.strip():
-            runtime_token = access_token_input.strip()
-            st.session_state.kite_access_token = runtime_token
-        request_token_from_url = st.query_params.get("request_token", "")
-        request_token = st.text_input(
-            "Kite request token",
-            value=request_token_from_url,
-            type="password",
-            help="After Kite login, the request_token appears in the redirected URL.",
-        )
-        if st.button("Generate access token", type="primary", width="stretch"):
+
+    if not broker_credentials_configured(settings):
+        st.info("Add KITE_API_KEY and KITE_API_SECRET to .env before starting Kite login.", icon=":material/key:")
+        return
+
+    runtime_token = verified_kite_access_token(st, settings)
+    repository = get_dashboard_repository(st)
+    user_id = dashboard_user_id(settings)
+    auto_start_enabled = render_trailing_agent_auto_start_toggle(st, repository, user_id)
+
+    if runtime_token:
+        st.success("Kite authenticated. Workspace unlocked.", icon=":material/check_circle:")
+        agent_running = agent_heartbeat_is_fresh(repository)
+        agent_heartbeat = repository.load_agent_heartbeat("trailing_stop_agent")
+        status_column, action_column = st.columns([3, 1])
+        with status_column:
+            if agent_running:
+                st.caption("Trailing-stop agent is active. See the Live monitor page for details.")
+            elif agent_heartbeat and agent_heartbeat.last_error:
+                st.error(f"Trailing-stop agent failed to start: {agent_heartbeat.last_error[:300]}", icon=":material/error:")
+            else:
+                st.caption("Trailing-stop agent is not currently running.")
+        with action_column:
+            if agent_running:
+                if st.button("Stop agent", icon=":material/stop:", width="stretch"):
+                    stopped = stop_trailing_stop_agent(repository)
+                    st.session_state.kite_auth_notice = (
+                        "Trailing-stop agent stopped. Open positions will not be protected or trailed until it's started again."
+                        if stopped
+                        else "No running trailing-stop agent process was found to stop; its status has been cleared."
+                    )
+                    st.rerun()
+            else:
+                if st.button("Start agent now", icon=":material/play_arrow:", width="stretch"):
+                    launch_trailing_stop_agent(
+                        settings.kite_api_key,
+                        settings.kite_api_secret.get_secret_value(),
+                        runtime_token,
+                        repository,
+                        extra_env=trailing_agent_env_from_settings(settings),
+                    )
+                    st.rerun()
+        if st.button("Log out", icon=":material/logout:"):
+            log_out_of_kite(st, repository, user_id)
+            st.rerun()
+        return
+
+    request_token_from_url = st.query_params.get("request_token", "")
+    if request_token_from_url:
+        st.session_state.kite_request_token = request_token_from_url
+        st.session_state.pop("kite_logged_out", None)
+        st.query_params.clear()
+    stored_request_token = st.session_state.get("kite_request_token", "")
+
+    # Kite hands back a one-time request_token via the redirect (or a manual paste below); as
+    # soon as one shows up, exchange it for an access token immediately instead of making the
+    # user click a second "Generate access token" button -- one action (sign in) is all this
+    # should take. `kite_request_token_attempted` stops a failed/expired token from being
+    # retried on every rerun of this page.
+    if stored_request_token and stored_request_token != st.session_state.get("kite_request_token_attempted", ""):
+        st.session_state.kite_request_token_attempted = stored_request_token
+        with st.spinner("Connecting to Kite..."):
             try:
                 access_token = exchange_request_token(
                     settings.kite_api_key,
                     settings.kite_api_secret.get_secret_value(),
-                    request_token,
+                    stored_request_token,
                 )
             except AuthenticationError as error:
-                st.error(str(error), icon=":material/error:")
+                st.session_state.kite_auth_error = str(error)
+                st.session_state.pop("kite_request_token", None)
             else:
                 st.session_state.kite_access_token = access_token.value
-                st.session_state.kite_auth_notice = "Access token generated. Workspace navigation is now enabled."
-                st.query_params.clear()
+                repository.save_kite_access_token(user_id, access_token.value)
+                st.session_state.kite_auth_notice = "Kite connected. Workspace navigation is now enabled."
+                st.session_state.pop("kite_auth_error", None)
+                st.session_state.pop("kite_request_token", None)
+                st.session_state.pop("kite_request_token_attempted", None)
+                st.session_state.pop("kite_logged_out", None)
+                if auto_start_enabled:
+                    maybe_autostart_trailing_agent(
+                        repository,
+                        settings.kite_api_key,
+                        settings.kite_api_secret.get_secret_value(),
+                        access_token.value,
+                        extra_env=trailing_agent_env_from_settings(settings),
+                    )
                 st.rerun()
-        if runtime_token:
-            st.success("Kite authenticated. Workspace navigation is enabled.", icon=":material/check_circle:")
-        else:
-            st.info("Complete Kite login and provide a daily access token to unlock the workspace.", icon=":material/lock:")
-    else:
-        st.info("Add KITE_API_KEY and KITE_API_SECRET to .env before starting Kite login.", icon=":material/key:")
+
+    with st.container(border=True):
+        st.markdown(
+            '<div class="auth-step-head">'
+            '<div class="auth-step-number">1</div>'
+            '<div class="auth-step-title">Connect to Kite</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={quote(settings.kite_api_key)}"
+        col_button, col_status = st.columns([1, 2], vertical_alignment="center")
+        with col_button:
+            st.link_button("Sign in with Kite", login_url, type="primary", icon=":material/login:")
+        with col_status:
+            if error := st.session_state.pop("kite_auth_error", ""):
+                st.error(error, icon=":material/error:")
+            else:
+                st.caption("Sign in to Zerodha Kite -- you'll be connected automatically when it redirects back here.")
+
+    with st.expander("Paste tokens manually (optional)"):
+        access_token_input = st.text_input(
+            "Kite access token",
+            type="password",
+            key="kite_access_token_input",
+            help="Paste an access token you already generated, skipping the steps above.",
+        )
+        if access_token_input.strip():
+            st.session_state.kite_access_token = access_token_input.strip()
+            repository.save_kite_access_token(user_id, access_token_input.strip())
+            st.session_state.pop("kite_logged_out", None)
+            if auto_start_enabled:
+                maybe_autostart_trailing_agent(
+                    repository,
+                    settings.kite_api_key,
+                    settings.kite_api_secret.get_secret_value(),
+                    access_token_input.strip(),
+                    extra_env=trailing_agent_env_from_settings(settings),
+                )
+        manual_request_token = st.text_input(
+            "Kite request token",
+            type="password",
+            help="If the Kite redirect landed in a different tab, paste its request_token here.",
+        )
+        if manual_request_token.strip():
+            st.session_state.kite_request_token = manual_request_token.strip()
+            st.session_state.pop("kite_logged_out", None)
 
 
 def dashboard_user_id(settings) -> str:
@@ -2290,74 +3193,137 @@ def render_high_conviction_signal_table(st, repository: Repository, user_id: str
     )
 
 
-def backup_and_clear_signal_state(st, settings) -> tuple[bytes, dict[str, int]]:
-    stop_dashboard_signal_engine(st)
-
-    repository = get_dashboard_repository(st)
-    user_id = dashboard_user_id(settings)
-    backup, counts = repository.backup_and_clear_signal_state(user_id)
-    return json.dumps(backup, indent=2, default=str).encode("utf-8"), counts
-
-
-def create_swing_auto_trader(client, mode, trailing_multiplier: float, strategy_name: str):
+def create_swing_auto_trader(client, mode, trailing_multiplier: float, strategy_name: str, repository=None):
     try:
-        return SwingAutoTrader(client, mode, trailing_multiplier, strategy_name)
+        return SwingAutoTrader(client, mode, trailing_multiplier, strategy_name, repository=repository)
     except TypeError as error:
-        if "positional arguments" not in str(error) or "SwingAutoTrader.__init__" not in str(error):
+        message = str(error)
+        stale_signature = "SwingAutoTrader.__init__" in message and (
+            "positional arguments" in message or "unexpected keyword argument" in message
+        )
+        if not stale_signature:
             raise
         # Streamlit can retain the imported class while source files hot-reload.
         import importlib
         import app.execution.swing_auto_trader as swing_auto_trader_module
 
         refreshed_module = importlib.reload(swing_auto_trader_module)
-        return refreshed_module.SwingAutoTrader(client, mode, trailing_multiplier, strategy_name)
+        return refreshed_module.SwingAutoTrader(client, mode, trailing_multiplier, strategy_name, repository=repository)
+
+
+SWING_EVENT_KINDS = {
+    "submitted": "swing_entry_submitted",
+    "entry_pending": "swing_entry_pending",
+    "flattened_after_protective_stop_failure": "swing_entry_flattened",
+    "critical_unprotected": "swing_entry_critical_unprotected",
+    "rejected": "swing_entry_rejected",
+    "skipped": "swing_entry_skipped",
+}
+
+INTRADAY_ACTIVITY_EVENT_KINDS = {
+    "entry_submitted",
+    "entry_rejected",
+    "entry_skipped",
+    "exit_submitted",
+    "exit_rejected",
+    "broker_exit_detected",
+    "signal_skipped",
+    "signal_held",
+    "breakeven_activated",
+    "breakeven_rejected",
+    "critical_unprotected",
+}
+
+
+def swing_activity_record(outcome: SwingOrderResult, mode: str) -> ActivityRecord:
+    return ActivityRecord(
+        event_kind=SWING_EVENT_KINDS.get(outcome.status, f"swing_entry_{outcome.status}"),
+        symbol=outcome.symbol,
+        timestamp=datetime.now(),
+        mode=mode,
+        order_id=outcome.order_id,
+        side="BUY",
+        quantity=outcome.quantity or None,
+        reason=outcome.reason,
+    )
 
 
 def render_swing_auto_trading(st, settings) -> None:
-    @st.fragment(run_every=60)
+    # Swing signals come from completed daily candles, which only change once a trading day --
+    # unlike the intraday pages, there's nothing to gain from a periodically-rerunning fragment
+    # here, so this renders once per page visit/interaction (see should_scan below for the
+    # once-a-day scan gate).
     def render_swing_content() -> None:
-        st.markdown('<div class="eyebrow">Daily trend execution</div>', unsafe_allow_html=True)
-        st.title("Swing auto trading")
+        title_column, status_column = st.columns([5, 2], vertical_alignment="bottom")
+        with title_column:
+            st.title("Swing auto trading")
+        status_popover_slot = status_column.empty()
         st.caption("Scans completed daily candles for a fresh EMA 9 cross above EMA 200 and manages a CNC position with a Zerodha-side trailing SL-M order.")
+        # A fixed slot right under the title, instead of a fresh st.progress() created wherever
+        # the scan loop happens to sit in the page -- keeps the live scan progress next to the
+        # status badge above, rather than appearing lower down amid the strategy controls.
+        scan_progress_slot = st.empty()
         repository = get_dashboard_repository(st)
         user_id = dashboard_user_id(settings)
         selected_symbols = selected_watchlist_symbols(repository, user_id)
         selected_watchlists = repository.load_watchlists(user_id, selected_only=True)
-        selected_strategy_label = st.selectbox(
-            "Swing strategy",
-            list(SWING_STRATEGIES),
-            key="swing_strategy",
-        )
-        selected_strategy_name = SWING_STRATEGIES[selected_strategy_label]
+        amount_limit = float(settings.swing_capital_limit)
+        quantity_limit = int(settings.swing_quantity_limit)
+        trailing_multiplier = float(settings.swing_trailing_atr_multiplier)
+        max_open_swing_positions = int(settings.swing_max_open_positions)
 
-        amount_column, quantity_column, trail_column = st.columns(3)
-        amount_limit = amount_column.number_input(
-            "Maximum capital per position",
-            min_value=1.0,
-            max_value=10_000_000.0,
-            value=100_000.0,
-            step=1_000.0,
-            format="%.2f",
-            key="swing_amount_limit",
+        enabled = bool(st.session_state.get("swing_auto_enabled", False))
+        kill_switch_active = bool(st.session_state.get("swing_kill_switch", False))
+        live_confirmed = st.checkbox(
+            "I understand this can place real CNC orders and modify Zerodha-side stop orders.",
+            key="swing_live_confirmation",
+            disabled=settings.trading_mode != TradingMode.LIVE,
         )
-        quantity_limit = quantity_column.number_input(
-            "Maximum quantity per position",
-            min_value=1,
-            max_value=1_000_000,
-            value=100,
-            step=1,
-            key="swing_quantity_limit",
-        )
-        trailing_multiplier = trail_column.number_input(
-            "Trailing stop ATR multiplier",
-            min_value=0.5,
-            max_value=10.0,
-            value=2.0,
-            step=0.25,
-            key="swing_trailing_atr_multiplier",
-        )
+        label_column, strategy_column, toggle_column, scan_column = st.columns([0.14, 0.36, 0.25, 0.25])
+        with label_column:
+            st.markdown('<div style="padding-top:0.55rem; font-weight:600;">Strategy</div>', unsafe_allow_html=True)
+        with strategy_column:
+            selected_strategy_label = st.selectbox(
+                "Strategy",
+                list(SWING_STRATEGIES),
+                key="swing_strategy",
+                label_visibility="collapsed",
+            )
+        selected_strategy_name = SWING_STRATEGIES[selected_strategy_label]
         warmup_period = 200 if selected_strategy_name == "EMA 9/200 swing" else SwingTrendBreakoutStrategy().warmup_period
-        st.caption(f"Universe: {len(selected_symbols)} stocks from {len(selected_watchlists)} selected watchlists · Timeframe: daily · Warm-up: {warmup_period} completed candles")
+        with toggle_column:
+            if enabled:
+                if st.button(
+                    "Trading Live End",
+                    icon=":material/power_settings_new:",
+                    type="secondary",
+                    width="stretch",
+                    help="Kill switch: immediately stop automatic scans and new swing orders. Existing broker-side protective stops remain active.",
+                ):
+                    st.session_state.swing_auto_enabled = False
+                    st.session_state.swing_kill_switch = True
+                    st.session_state.swing_scan_result = None
+                    st.rerun()
+            else:
+                if st.button(
+                    "Trading Live Start",
+                    type="primary",
+                    icon=":material/play_arrow:",
+                    width="stretch",
+                    disabled=settings.trading_mode != TradingMode.LIVE or not live_confirmed,
+                    help="Start swing auto trading",
+                ):
+                    st.session_state.swing_auto_enabled = True
+                    st.session_state.swing_kill_switch = False
+                    st.session_state.swing_last_scan_day = None
+                    st.rerun()
+        with scan_column:
+            manual_scan = st.button("Scan", icon=":material/search:", width="stretch", help="Run scan now")
+        st.caption(
+            f"₹{amount_limit:,.0f} cap · qty {quantity_limit} · ATR×{trailing_multiplier:.2f} · max {max_open_swing_positions} open "
+            "(edit on Risk & settings page)  \n"
+            f"Universe: {len(selected_symbols)} stocks from {len(selected_watchlists)} selected watchlists · Timeframe: daily · Warm-up: {warmup_period} completed candles"
+        )
         if not selected_symbols:
             st.info("Select at least one watchlist on the Watchlists page before scanning.", icon=":material/list_alt:")
             return
@@ -2378,7 +3344,7 @@ def render_swing_auto_trading(st, settings) -> None:
             st.session_state.swing_strategy_name = selected_strategy_name
             st.session_state.swing_scan_result = None
         if trader is None:
-            trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name)
+            trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name, repository=repository)
             st.session_state.swing_auto_trader = trader
         elif getattr(trader, "strategy_name", "EMA 9/200 swing") != selected_strategy_name:
             if hasattr(trader, "set_strategy"):
@@ -2389,7 +3355,7 @@ def render_swing_auto_trading(st, settings) -> None:
                 legacy_signal_keys = getattr(trader, "submitted_signal_keys", set())
                 legacy_open_symbols = getattr(trader, "broker_open_symbols", set())
                 legacy_pending_entries = getattr(trader, "pending_entries", {})
-                trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name)
+                trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name, repository=repository)
                 trader.active_positions.update(legacy_positions)
                 trader.submitted_signal_keys.update(legacy_signal_keys)
                 trader.broker_open_symbols.update(legacy_open_symbols)
@@ -2407,102 +3373,248 @@ def render_swing_auto_trading(st, settings) -> None:
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
             st.error(f"Instrument tick-size metadata unavailable; live entries will be blocked until it can be verified: {error}")
 
-        live_confirmed = st.checkbox(
-            "I understand this can place real CNC orders and modify Zerodha-side stop orders.",
-            key="swing_live_confirmation",
-            disabled=settings.trading_mode != TradingMode.LIVE,
-        )
-        if settings.trading_mode == TradingMode.LIVE:
-            st.warning("LIVE mode is active. Starting the scanner can place real CNC BUY orders and SL-M protective orders in Zerodha.", icon=":material/warning:")
-        else:
+        if settings.trading_mode != TradingMode.LIVE:
             st.info("PAPER mode is active. Swing auto execution is disabled; switch to LIVE mode only after validating the scanner.", icon=":material/science:")
-
-        enabled = bool(st.session_state.get("swing_auto_enabled", False))
-        kill_switch_active = bool(st.session_state.get("swing_kill_switch", False))
-        start_column, stop_column, scan_column = st.columns([2, 1, 1])
-        with start_column:
-            if st.button(
-                "Start swing auto trading",
-                type="primary",
-                icon=":material/play_arrow:",
-                width="stretch",
-                disabled=enabled or settings.trading_mode != TradingMode.LIVE or not live_confirmed,
-            ):
-                st.session_state.swing_auto_enabled = True
-                st.session_state.swing_kill_switch = False
-                st.session_state.swing_last_scan_day = None
-                st.rerun()
-        with stop_column:
-            if st.button(
-                "KILL SWITCH",
-                icon=":material/power_settings_new:",
-                type="secondary",
-                width="stretch",
-                disabled=not enabled,
-                help="Immediately stop automatic scans and new swing orders. Existing broker-side protective stops remain active.",
-            ):
-                st.session_state.swing_auto_enabled = False
-                st.session_state.swing_kill_switch = True
-                st.session_state.swing_scan_result = None
-                st.rerun()
-        with scan_column:
-            manual_scan = st.button("Run scan now", icon=":material/search:", width="stretch")
-
-        status_label = "running" if enabled else "stopped"
-        st.markdown(
-            f"<div class='engine-panel'><strong>● Swing scanner {status_label}</strong><br><span style='color:#53645a'>{selected_strategy_label} · Completed daily candles · Max capital ₹{amount_limit:,.0f} per position · Max quantity {int(quantity_limit)} shares</span></div>",
-            unsafe_allow_html=True,
-        )
 
         try:
             trader.sync_broker_positions()
         except Exception as error:
             st.warning(f"Broker position sync paused: {error}")
 
-        trailing_events = []
-        for symbol, position in list(trader.active_positions.items()):
-            try:
-                candles = load_swing_daily_candles_cached(client.client, access_token, position.instrument_token, scan_day)
-                position_strategy = getattr(position, "strategy_name", "EMA 9/200 swing")
-                if position_strategy == "SWING_TREND_BREAKOUT":
-                    outcome = trader.manage_position(symbol, candles)
-                    if outcome is not None:
-                        trailing_events.append(f"{symbol}: {outcome.reason}")
-                else:
-                    new_stop = trader.trail_position(symbol, candles)
-                    if new_stop is not None:
-                        trailing_events.append(f"{symbol}: stop moved to ₹{new_stop:,.2f}")
-            except Exception as error:
-                st.warning(f"Trailing stop update failed for {symbol}: {error}")
-        if trailing_events:
-            st.success(" · ".join(trailing_events), icon=":material/trending_up:")
+        # Trailing-stop math and broker-side SL-M modification are owned exclusively by the
+        # standalone scripts/run_trailing_stop_agent.py process; this view only reads the stop
+        # it last persisted, so it stays accurate even when the dashboard isn't open.
+        swing_stops = {
+            record.symbol: record.stop_loss
+            for record in repository.load_positions()
+            if record.position_type == "SWING"
+        }
+        if swing_stops:
+            st.caption(
+                "Current stop (maintained by the trailing stop agent): "
+                + " · ".join(f"{symbol} ₹{stop:,.2f}" for symbol, stop in swing_stops.items())
+            )
 
+        open_swing_positions = len(trader.active_positions)
+        position_limit_reached = open_swing_positions >= int(max_open_swing_positions)
         auto_enabled = bool(st.session_state.get("swing_auto_enabled", False)) and not bool(st.session_state.get("swing_kill_switch", False))
-        should_scan = manual_scan or auto_enabled
+        # Today's daily candle doesn't change again once it's formed, so an automatic scan only
+        # needs to run once per trading day -- after it completes and submits any qualifying
+        # orders, auto mode stops scanning until the next day. The "Scan" button can still force
+        # a rescan at any time regardless of whether today's auto scan already ran.
+        already_scanned_today = st.session_state.get("swing_last_scan_day") == scan_day
+        should_scan = (manual_scan or (auto_enabled and not already_scanned_today)) and not position_limit_reached
+        if manual_scan and position_limit_reached:
+            st.warning(
+                f"Scan skipped: {open_swing_positions}/{int(max_open_swing_positions)} swing positions are already open. "
+                "Close a position or raise the limit above to resume scanning."
+            )
         if should_scan:
-            with st.spinner(f"Loading daily history and scanning {selected_strategy_label}..."):
-                result = trader.scan(
-                    selected_symbols,
-                    lambda instrument_token: load_swing_daily_candles_cached(client.client, access_token, instrument_token, scan_day),
+            # Written immediately, before the scan below -- the badge further down this
+            # function only gets computed and rendered *after* the (blocking) scan completes,
+            # so without this the status area looked blank for the whole scan instead of
+            # showing anything was happening.
+            with status_popover_slot.popover("🔵 Scanning...", width="stretch"):
+                st.caption(f"Scanning {selected_strategy_label}...")
+            # Candle fetches run in parallel (bounded by SCAN_MAX_WORKERS, out of respect for
+            # Kite's historical-data rate limit) and a qualifying candidate is submitted the
+            # moment it's found, instead of after every selected stock has been scanned --
+            # sequentially scanning hundreds of stocks before placing the first order could
+            # mean the breakout has already moved by the time the order goes in.
+            total_symbols = len(selected_symbols)
+            progress_bar = scan_progress_slot.progress(0.0, text=f"Scanning {selected_strategy_label}: 0/{total_symbols} complete")
+            live_log: list[str] = []
+            log_box = st.empty()
+
+            def log_line(message: str) -> None:
+                live_log.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
+                log_box.code("\n".join(live_log[-300:]), language=None)
+
+            def fetch_symbol_candles(instrument_token: int) -> pd.DataFrame:
+                return load_swing_daily_candles_cached(client.client, access_token, instrument_token, scan_day)
+
+            submit_live = auto_enabled and settings.trading_mode == TradingMode.LIVE and live_confirmed
+            candidates: list = []
+            pending_candidates: list = []
+            scan_errors: list[str] = []
+            insufficient_history: list[str] = []
+            no_signal: list[tuple[str, str]] = []
+            submit_outcomes: list[SwingOrderResult] = []
+            completed = 0
+            scan_exception: Exception | None = None
+
+            worker_count = min(SCAN_MAX_WORKERS, total_symbols) if total_symbols else 1
+            try:
+                with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="swing-scan") as executor:
+                    futures = {
+                        executor.submit(fetch_symbol_candles, instrument_token): (symbol, instrument_token)
+                        for symbol, instrument_token in selected_symbols.items()
+                    }
+                    for future in as_completed(futures):
+                        symbol, instrument_token = futures[future]
+                        completed += 1
+                        progress_bar.progress(completed / total_symbols if total_symbols else 1.0, text=f"Scanning {selected_strategy_label}: {completed}/{total_symbols} complete")
+                        try:
+                            candles = future.result()
+                        except Exception as error:
+                            scan_errors.append(f"{symbol}: {error}")
+                            continue
+                        evaluation = trader.evaluate_symbol(symbol, instrument_token, lambda _token, _candles=candles: _candles)
+                        if evaluation.error is not None:
+                            scan_errors.append(f"{symbol}: {evaluation.error}")
+                            continue
+                        if evaluation.insufficient_history:
+                            insufficient_history.append(symbol)
+                            continue
+                        for reason in evaluation.no_signal_reasons:
+                            no_signal.append((symbol, reason))
+                        if evaluation.pending_candidate is not None:
+                            pending_candidates.append(evaluation.pending_candidate)
+                        if evaluation.candidate is None:
+                            continue
+                        candidates.append(evaluation.candidate)
+                        log_line(f"{symbol}: candidate found (cross {evaluation.candidate.signal.timestamp:%d %b %Y})")
+                        if not submit_live:
+                            continue
+                        open_now = len(trader.active_positions)
+                        if open_now >= int(max_open_swing_positions):
+                            log_line(f"{symbol}: not submitted -- {open_now}/{int(max_open_swing_positions)} swing positions already open")
+                            continue
+                        try:
+                            outcome = trader.submit_candidate(evaluation.candidate, float(amount_limit), int(quantity_limit))
+                        except Exception as error:
+                            outcome = SwingOrderResult(symbol, "rejected", f"submit_candidate raised an unexpected error: {error}")
+                        submit_outcomes.append(outcome)
+                        repository.save_activity(swing_activity_record(outcome, settings.trading_mode.value))
+                        log_line(f"{symbol}: {outcome.status} -- {outcome.reason}")
+            except Exception as error:
+                scan_exception = error
+            progress_bar.empty()
+            st.session_state.swing_last_scan_at = datetime.now()
+            if scan_exception is not None:
+                st.session_state.swing_last_error = str(scan_exception)
+                st.error(f"Swing scan could not be completed: {scan_exception}")
+                result = None
+            else:
+                st.session_state.swing_last_error = None
+                candidates.sort(key=lambda item: item.signal.timestamp, reverse=True)
+                result = SwingScanResult(
+                    tuple(candidates),
+                    tuple(scan_errors),
+                    total_symbols,
+                    tuple(insufficient_history),
+                    tuple(pending_candidates),
+                    trader.strategy_name,
+                    tuple(no_signal),
                 )
-            st.session_state.swing_scan_result = result
-            st.session_state.swing_last_scan_day = scan_day
-            if auto_enabled and settings.trading_mode == TradingMode.LIVE and live_confirmed:
-                available_slots = max(0, int(settings.max_open_positions) - len(trader.active_positions))
-                for candidate in result.candidates[:available_slots]:
-                    outcome = trader.submit_candidate(candidate, float(amount_limit), int(quantity_limit))
-                    if outcome.status == "submitted":
-                        st.success(f"{outcome.symbol}: {outcome.reason} · quantity {outcome.quantity}", icon=":material/check_circle:")
-                    elif outcome.status == "submitted_unprotected":
-                        st.error(f"{outcome.symbol}: {outcome.reason}")
-                    elif outcome.status == "entry_pending":
-                        st.info(f"{outcome.symbol}: {outcome.reason}")
-                    elif outcome.status == "flattened_after_protective_stop_failure":
-                        st.error(f"{outcome.symbol}: {outcome.reason}")
-                    elif outcome.status == "critical_unprotected":
-                        st.error(f"CRITICAL {outcome.symbol}: {outcome.reason}")
-                    elif outcome.status == "rejected":
-                        st.error(f"{outcome.symbol}: {outcome.reason}")
+                st.session_state.swing_scan_result = result
+                st.session_state.swing_last_scan_day = scan_day
+            for outcome in submit_outcomes:
+                if outcome.status == "submitted":
+                    st.success(f"{outcome.symbol}: {outcome.reason} · quantity {outcome.quantity}", icon=":material/check_circle:")
+                elif outcome.status == "submitted_unprotected":
+                    st.error(f"{outcome.symbol}: {outcome.reason}")
+                elif outcome.status == "entry_pending":
+                    st.info(f"{outcome.symbol}: {outcome.reason}")
+                elif outcome.status == "flattened_after_protective_stop_failure":
+                    st.error(f"{outcome.symbol}: {outcome.reason}")
+                elif outcome.status == "critical_unprotected":
+                    st.error(f"CRITICAL {outcome.symbol}: {outcome.reason}")
+                elif outcome.status == "rejected":
+                    st.error(f"{outcome.symbol}: {outcome.reason}")
+            if result is not None:
+                entered = sum(1 for outcome in submit_outcomes if outcome.status == "submitted")
+                rejected = sum(
+                    1
+                    for outcome in submit_outcomes
+                    if outcome.status in {"rejected", "critical_unprotected", "flattened_after_protective_stop_failure"}
+                )
+                cycle_summary = (
+                    f"{datetime.now().strftime('%I:%M:%S %p')} — scanned {result.scanned} · "
+                    f"{len(result.candidates)} candidates · {entered} entered · {rejected} rejected · {len(result.errors)} errors"
+                )
+                cycle_history = st.session_state.get("swing_cycle_log", [])
+                st.session_state.swing_cycle_log = (cycle_history + [cycle_summary])[-12:]
+
+        swing_last_error = st.session_state.get("swing_last_error")
+        last_scan_at = st.session_state.get("swing_last_scan_at")
+        last_scan_label = last_scan_at.strftime("%I:%M:%S %p") if last_scan_at else "No scan yet"
+        already_scanned_today = st.session_state.get("swing_last_scan_day") == scan_day
+        if position_limit_reached:
+            swing_engine_state = "limit_reached"
+        elif kill_switch_active or not enabled:
+            swing_engine_state = "stopped"
+        elif swing_last_error:
+            swing_engine_state = "error"
+        elif already_scanned_today:
+            # Today's daily candle is fixed once formed, so the auto scan already ran and
+            # submitted anything qualifying for today -- there is nothing left for it to do
+            # until tomorrow's candle closes. Keep showing "armed / LIVE" here would read as
+            # if a scan were still in progress or about to happen again today, which is the
+            # same confusion intraday avoids by dropping out of "armed" the moment its cycle
+            # halts on a filled position or a risk-limit hit instead of staying "LIVE" forever.
+            swing_engine_state = "scanned_today"
+        else:
+            swing_engine_state = "running"
+        state_copy = {
+            "running": (
+                "Swing scanner armed",
+                f"{selected_strategy_label} · monitoring {len(selected_symbols)} stocks · "
+                "scans once when this page is next opened today · "
+                f"{open_swing_positions}/{int(max_open_swing_positions)} positions open · last scan {last_scan_label}",
+            ),
+            "scanned_today": (
+                "Swing scan complete for today",
+                f"{selected_strategy_label} · today's daily scan already ran at {last_scan_label} · "
+                f"{open_swing_positions}/{int(max_open_swing_positions)} positions open · "
+                "next scan when tomorrow's candle closes (use Scan to force a rescan now)",
+            ),
+            "stopped": (
+                "Swing scanner stopped",
+                f"{selected_strategy_label} · {open_swing_positions}/{int(max_open_swing_positions)} positions open · last scan {last_scan_label}",
+            ),
+            "error": ("Swing scanner needs attention", escape((swing_last_error or "The latest scan cycle reported an error")[:240])),
+            "limit_reached": (
+                "Swing scanner paused — position limit reached",
+                f"{open_swing_positions}/{int(max_open_swing_positions)} swing positions open · close a position to resume scanning",
+            ),
+        }[swing_engine_state]
+        swing_badge = {
+            "running": "LIVE",
+            "scanned_today": "DONE FOR TODAY",
+            "stopped": "STOPPED",
+            "limit_reached": "LIMIT REACHED",
+            "error": "NEEDS ATTENTION",
+        }[swing_engine_state]
+        # Same compact badge + click-for-detail treatment as the Live monitor and Intratrading
+        # pages -- a full-width banner here cost the same vertical space for the same reason.
+        status_icon, status_label = {
+            "running": ("🟢", "Scanner armed"),
+            "scanned_today": ("🔵", "Done for today"),
+            "stopped": ("⚪", "Scanner stopped"),
+            "limit_reached": ("🟡", "Limit reached"),
+            "error": ("🔴", "Needs attention"),
+        }[swing_engine_state]
+        with status_popover_slot.popover(f"{status_icon} {status_label}", width="stretch"):
+            render_scan_activity_banner(
+                st,
+                "stalled" if swing_engine_state in {"limit_reached", "stopped", "scanned_today"} else swing_engine_state,
+                *state_copy,
+                badge=swing_badge,
+            )
+        swing_cycle_log = st.session_state.get("swing_cycle_log", [])
+        if swing_cycle_log:
+            with st.expander("Recent scan cycles", expanded=False):
+                st.caption("  \n".join(reversed(swing_cycle_log[-5:])))
+        swing_activity = load_activity()[2]
+        swing_activity = swing_activity[swing_activity["event_kind"].astype(str).str.startswith("swing_")]
+        if not swing_activity.empty:
+            with st.expander(f"Recent swing activity ({len(swing_activity)})", expanded=False):
+                st.dataframe(
+                    swing_activity[["timestamp", "symbol", "event_kind", "reason"]].head(20),
+                    width="stretch",
+                    hide_index=True,
+                )
 
         result = st.session_state.get("swing_scan_result")
         result_strategy_name = getattr(result, "strategy_name", "EMA 9/200 swing") if result is not None else None
@@ -2643,12 +3755,6 @@ def render_swing_auto_trading(st, settings) -> None:
                 )
             if result.errors:
                 st.warning(" · ".join(result.errors[:5]))
-            insufficient_history = getattr(result, "insufficient_history", ())
-            if insufficient_history:
-                st.info(
-                    f"Skipped {len(insufficient_history)} stock(s) without {warmup_period} completed daily candles: "
-                    + ", ".join(insufficient_history[:10])
-                )
 
         if trader.active_positions:
             st.subheader("Open swing positions")
@@ -2683,9 +3789,190 @@ def render_swing_auto_trading(st, settings) -> None:
     render_swing_content()
 
 
-def render_historical_day_scan(st, settings) -> None:
-    st.markdown('<div class="eyebrow">Historical daily research</div>', unsafe_allow_html=True)
-    st.title("Historical day scan")
+def render_backtesting(st, settings) -> None:
+    st.title("Backtesting")
+    st.caption("Replay Kite historical candles against the same research strategies used by Scanner & signals, Intratrading, and Swing auto trading.")
+    st.warning("Backtest results are historical simulations, not guarantees of future performance. This page never submits orders or changes live positions.", icon=":material/science:")
+
+    access_token = runtime_access_token(st, settings)
+    if not broker_credentials_configured(settings) or not access_token:
+        st.info("Authenticate with Kite before running a backtest.", icon=":material/key:")
+        return
+
+    repository = get_dashboard_repository(st)
+    selected_symbols = selected_watchlist_symbols(repository, dashboard_user_id(settings))
+    if not selected_symbols:
+        st.info("Select at least one watchlist on the Watchlists page before running a backtest.", icon=":material/list_alt:")
+        return
+
+    scope = st.radio("Run scope", ["One symbol", "Selected watchlists"], horizontal=True, key="backtest_scope")
+    if scope == "One symbol":
+        symbol = st.selectbox("Symbol", list(selected_symbols), key="backtest_symbol")
+        run_symbols = {symbol: selected_symbols[symbol]}
+    else:
+        run_symbols = selected_symbols
+        st.caption(f"{len(run_symbols)} unique instruments from the selected watchlists")
+
+    strategy_label = st.selectbox("Strategy", BACKTEST_STRATEGY_LABELS, key="backtest_strategy")
+    daily_default = strategy_label in {"EMA 9/200 swing", BACKTEST_SWING_TREND_LABEL}
+    timeframe = st.selectbox(
+        "Timeframe",
+        ["Daily", "5-minute"],
+        index=0 if daily_default else 1,
+        key="backtest_timeframe",
+    )
+    interval = "day" if timeframe == "Daily" else "5minute"
+
+    date_column, capital_column, sizing_column = st.columns(3)
+    with date_column:
+        default_start = date.today() - timedelta(days=90 if interval == "5minute" else 730)
+        selected_dates = st.date_input(
+            "Historical date range",
+            value=(default_start, date.today()),
+            key="backtest_dates",
+        )
+    with capital_column:
+        initial_capital = st.number_input("Initial capital", min_value=1.0, value=100_000.0, step=10_000.0, key="backtest_initial_capital")
+    with sizing_column:
+        sizing_mode = st.selectbox("Sizing", ["Fixed quantity", "Capital per position"], key="backtest_sizing_mode")
+    quantity_column, position_column, fee_column, slippage_column = st.columns(4)
+    with quantity_column:
+        fixed_quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key="backtest_quantity")
+    with position_column:
+        capital_per_position = st.number_input("Capital per position", min_value=1.0, value=10_000.0, step=1_000.0, key="backtest_capital_position")
+    with fee_column:
+        fee_rate = st.number_input("Fee rate", min_value=0.0, value=0.0003, step=0.0001, format="%.4f", key="backtest_fee_rate")
+    with slippage_column:
+        slippage_rate = st.number_input("Slippage rate", min_value=0.0, value=0.0005, step=0.0001, format="%.4f", key="backtest_slippage_rate")
+
+    if not isinstance(selected_dates, (tuple, list)) or len(selected_dates) != 2:
+        st.info("Select both a start and end date.")
+        return
+    start_date, end_date = selected_dates
+    if start_date > end_date:
+        st.error("The historical start date must be on or before the end date.")
+        return
+
+    try:
+        strategy = build_backtest_strategy(strategy_label, interval)
+    except ValueError as error:
+        st.error(str(error))
+        return
+
+    st.caption(f"Kite interval: {interval} · warm-up: {getattr(strategy, 'warmup_period', 'stateful')} completed candles · one position per symbol")
+    if strategy_label == BACKTEST_PROGRESSIVE_LABEL:
+        st.info("Progressive replay enters only on STRONG alignment. LIGHT events are lifecycle context; EMA9 <= EMA200 invalidates an open cycle.", icon=":material/timeline:")
+
+    if st.button("Run backtest", type="primary", icon=":material/play_arrow:", width="stretch"):
+        try:
+            client = connect_kite(settings, access_token)
+            market_data = MarketData(client.client)
+            loader = KiteHistoricalDataLoader(market_data)
+            st.session_state.backtest_loader = loader
+            start_timestamp = datetime.combine(start_date, datetime_time.min)
+            end_timestamp = datetime.combine(end_date, datetime_time.max)
+            progress = st.progress(0.0, text=f"Fetching 0/{len(run_symbols)} symbols")
+            all_trades = []
+            errors: list[str] = []
+            symbol_metrics: dict[str, dict] = {}
+            for completed, (run_symbol, instrument_token) in enumerate(run_symbols.items(), start=1):
+                try:
+                    candles = loader.load(int(instrument_token), start_timestamp, end_timestamp, interval)
+                    if candles.empty:
+                        raise ValueError("Kite returned no historical candles for the selected range")
+                    if sizing_mode == "Fixed quantity":
+                        run_quantity = int(fixed_quantity)
+                    else:
+                        run_quantity = max(1, int(float(capital_per_position) // float(candles["close"].iloc[0])))
+                    symbol_trades = run_strategy_backtest(
+                        run_symbol,
+                        candles,
+                        strategy,
+                        quantity=run_quantity,
+                        fee_rate=float(fee_rate),
+                        slippage_rate=float(slippage_rate),
+                    )
+                    all_trades.extend(symbol_trades)
+                    symbol_metrics[run_symbol] = calculate_metrics(symbol_trades)
+                except Exception as error:
+                    errors.append(f"{run_symbol}: {error}")
+                progress.progress(completed / len(run_symbols), text=f"Processed {completed}/{len(run_symbols)} symbols")
+            progress.empty()
+            all_trades.sort(key=lambda trade: (pd.Timestamp(trade.exit_time), trade.symbol))
+            st.session_state.backtest_result = {
+                "trades": all_trades,
+                "metrics": calculate_metrics(all_trades),
+                "symbol_metrics": symbol_metrics,
+                "errors": errors,
+                "parameters": {
+                    "strategy": strategy_label,
+                    "interval": interval,
+                    "start": start_date.isoformat(),
+                    "end": end_date.isoformat(),
+                    "initial_capital": float(initial_capital),
+                    "fee_rate": float(fee_rate),
+                    "slippage_rate": float(slippage_rate),
+                },
+            }
+        except (OSError, RuntimeError, ValueError) as error:
+            st.error(f"Backtest could not start: {error}")
+
+    result = st.session_state.get("backtest_result")
+    if not result:
+        st.caption("Run a Kite-backed historical replay to see results here.")
+        return
+    metrics = result["metrics"]
+    metric_columns = st.columns(5)
+    metric_columns[0].metric("Trades", int(metrics["trades"]))
+    metric_columns[1].metric("Net P&L", f"₹{metrics['net_pnl']:,.2f}")
+    metric_columns[2].metric("Win rate", f"{metrics['win_rate']:.1%}")
+    metric_columns[3].metric("Profit factor", "∞" if metrics["profit_factor"] == float("inf") else f"{metrics['profit_factor']:.2f}")
+    metric_columns[4].metric("Max drawdown", f"₹{metrics['max_drawdown']:,.2f}")
+    st.caption(" · ".join(f"{key}: {value}" for key, value in result["parameters"].items()))
+
+    if result["errors"]:
+        st.warning("Some symbols could not be backtested: " + " · ".join(result["errors"][:10]))
+    if result["symbol_metrics"]:
+        symbol_table = pd.DataFrame.from_dict(result["symbol_metrics"], orient="index").reset_index(names="Symbol")
+        st.subheader("Per-symbol results")
+        st.dataframe(symbol_table, width="stretch", hide_index=True)
+
+    trades = result["trades"]
+    if not trades:
+        st.info("No trades were generated for the selected strategy and historical range.")
+        return
+    trade_table = pd.DataFrame(
+        [
+            {
+                "Symbol": trade.symbol,
+                "Entry time": trade.entry_time,
+                "Exit time": trade.exit_time,
+                "Side": trade.side.value,
+                "Quantity": trade.quantity,
+                "Entry": trade.entry_price,
+                "Exit": trade.exit_price,
+                "P&L": trade.pnl,
+                "Exit reason": trade.exit_reason,
+                "Target 1 hit": trade.target_1_hit,
+            }
+            for trade in trades
+        ]
+    )
+    equity = trade_table["P&L"].cumsum() + float(result["parameters"]["initial_capital"])
+    st.subheader("Equity curve")
+    st.line_chart(pd.DataFrame({"Equity": equity.to_numpy()}))
+    st.subheader("Trades")
+    st.dataframe(trade_table, width="stretch", hide_index=True)
+    st.download_button(
+        "Download trades",
+        data=trade_table.to_csv(index=False).encode("utf-8"),
+        file_name="kite-backtest-trades.csv",
+        mime="text/csv",
+        icon=":material/download:",
+    )
+
+
+def render_historical_day_scan_section(st, settings) -> None:
     st.caption("Choose a watchlist, strategy, and completed date to evaluate every stock using only daily candles available through that date.")
     repository = get_dashboard_repository(st)
     user_id = dashboard_user_id(settings)
@@ -2854,6 +4141,19 @@ def render_historical_day_scan(st, settings) -> None:
             st.warning("Some stocks could not be evaluated: " + " · ".join(result.errors[:10]))
 
 
+def render_scan_activity_banner(st, state: str, title: str, detail: str, badge: str | None = None) -> None:
+    animation_markup = '<div class="scan-activity-beam"><span></span><span></span><span></span><span></span></div>' if state == "running" else ""
+    badge_text = badge if badge is not None else state.upper()
+    html = (
+        f'<div class="scan-activity {state}" role="status" aria-live="polite">'
+        f'<div class="scan-activity-mark"><span class="scan-activity-dot"></span></div>'
+        f'<div class="scan-activity-copy"><strong>{title}</strong><span>{detail}</span>{animation_markup}</div>'
+        f'<div class="scan-activity-live">{badge_text}</div>'
+        "</div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def render_signal_feed(st, settings) -> None:
     @st.fragment(run_every=5)
     def render_live_signal_feed() -> None:
@@ -2934,21 +4234,7 @@ def render_signal_feed_content(st, settings) -> None:
             "stopping": ("Stopping scan engine", "The current stock evaluation will finish, then the worker will exit"),
             "error": ("Scan engine needs attention", escape(status.last_error[:240] if status else "The latest scan cycle reported an error")),
         }[engine_state]
-        animation_markup = '<div class="scan-activity-beam"><span></span><span></span><span></span><span></span></div>' if engine_state == "running" else ""
-        st.markdown(
-            f"""
-            <div class="scan-activity {engine_state}" role="status" aria-live="polite">
-                <div class="scan-activity-mark"><span class="scan-activity-dot"></span></div>
-                <div class="scan-activity-copy">
-                    <strong>{state_copy[0]}</strong>
-                    <span>{state_copy[1]}</span>
-                    {animation_markup}
-                </div>
-                <div class="scan-activity-live">{engine_state.upper()}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        render_scan_activity_banner(st, engine_state, *state_copy)
     st.markdown(
         f"<div class='engine-panel'><strong style='color:{status_color}'>● Signal engine {status_label.lower()}</strong><br><span style='color:#53645a'>Strategy {selected_live_strategy} · Monitoring {len(selected)} unique stocks from {len(selected_watchlists)} selected watchlist{'s' if len(selected_watchlists) != 1 else ''} · Timeframe {settings.signal_timeframe} · Last scan {last_scan}</span></div>",
         unsafe_allow_html=True,
@@ -2983,6 +4269,9 @@ def render_signal_feed_content(st, settings) -> None:
         st.info("Connect Kite before starting the scan engine.", icon=":material/key:")
     if status and status.last_error:
         st.warning(f"The last engine cycle reported: {status.last_error}")
+
+    with st.expander("Historical day scan", icon=":material/history:"):
+        render_historical_day_scan_section(st, settings)
 
     if selected_live_strategy == PRE_SPIKE_LIVE_LABEL:
         render_pre_spike_signal_table(st, repository, user_id)
@@ -3126,6 +4415,7 @@ def render_automatic_feed(st, settings) -> None:
         record_dashboard_events(st, events)
         st.success(f"Processed {len(events)} persisted signal(s) through the execution gates.")
     except Exception as error:
+        logger.exception("Manual submission of persisted signals failed")
         st.error(f"Signals could not be submitted: {error}")
 
 
@@ -3141,8 +4431,9 @@ def render_risk_settings(st, settings) -> None:
         st.warning("Open positions are being monitored with their existing settings. New settings apply after those positions are closed.", icon=":material/info:")
 
     with st.form("risk_settings_form"):
-        st.subheader("Trading policy")
-        mode_column, capital_column, deployment_column = st.columns(3)
+        st.subheader("Global")
+        st.caption("Shared account-level settings that apply to both Intratrading and Swing auto trading.")
+        mode_column, capital_column, deployment_column, min_move_column = st.columns(4)
         trading_mode = mode_column.selectbox(
             "Trading mode",
             list(TradingMode),
@@ -3164,23 +4455,32 @@ def render_risk_settings(st, settings) -> None:
             step=1.0,
             format="%.1f",
         )
-
-        risk_column, loss_column, positions_column, trades_column = st.columns(4)
-        risk_per_trade = risk_column.number_input(
-            "Risk per trade (%)",
-            min_value=0.01,
-            max_value=100.0,
-            value=float(settings.risk_per_trade * 100),
+        min_stop_improvement_pct = min_move_column.number_input(
+            "Minimum SL-M move to update (%)",
+            min_value=0.0,
+            max_value=5.0,
+            value=float(settings.min_stop_improvement_pct),
             step=0.05,
             format="%.2f",
+            help=(
+                "The trailing-stop agent skips sending a broker-side SL-M update unless the new stop improves on "
+                "the current one by at least this percentage of the last traded price. Zerodha caps modifications "
+                "at 25 per order; this cuts down on paisa-level noise updates that burn through that cap for no "
+                "real protection benefit. 0 disables the filter (every improvement is sent, as before)."
+            ),
         )
-        max_daily_loss = loss_column.number_input(
-            "Maximum daily loss (%)",
-            min_value=0.01,
-            max_value=100.0,
-            value=float(settings.max_daily_loss * 100),
-            step=0.05,
+
+        st.subheader("Intratrading")
+        st.caption("Risk limits, trading window, and trailing stop used by the Intratrading (intraday) engine.")
+        intraday_capital_column, positions_column, atr_column, trades_column = st.columns(4)
+        intraday_capital_limit = intraday_capital_column.number_input(
+            "Maximum capital per position",
+            min_value=1.0,
+            max_value=10_000_000.0,
+            value=float(settings.intraday_capital_limit),
+            step=1_000.0,
             format="%.2f",
+            key="risk_settings_intraday_capital",
         )
         max_open_positions = positions_column.number_input(
             "Maximum open positions",
@@ -3189,22 +4489,7 @@ def render_risk_settings(st, settings) -> None:
             value=int(settings.max_open_positions),
             step=1,
         )
-        max_trades_per_day = trades_column.number_input(
-            "Maximum trades per day",
-            min_value=1,
-            max_value=1_000,
-            value=int(settings.max_trades_per_day),
-            step=1,
-        )
-
-        st.subheader("Market timing")
-        market_column, entry_start_column, entry_end_column, force_exit_column = st.columns(4)
-        market_open = market_column.time_input("Market open", value=settings.market_open)
-        entry_start = entry_start_column.time_input("Entry window start", value=settings.entry_start)
-        entry_end = entry_end_column.time_input("Entry window end", value=settings.entry_end)
-        force_exit = force_exit_column.time_input("Force exit", value=settings.force_exit)
-
-        trailing_atr_multiplier = st.number_input(
+        trailing_atr_multiplier = atr_column.number_input(
             "Trailing stop ATR multiplier",
             min_value=0.1,
             max_value=10.0,
@@ -3212,6 +4497,69 @@ def render_risk_settings(st, settings) -> None:
             step=0.1,
             format="%.1f",
         )
+        max_trades_per_day = trades_column.number_input(
+            "Maximum trades per day",
+            min_value=1,
+            max_value=1_000,
+            value=int(settings.max_trades_per_day),
+            step=1,
+        )
+        intraday_leverage_multiplier = st.number_input(
+            "Fallback intraday leverage (x)",
+            min_value=1.0,
+            max_value=50.0,
+            value=float(settings.intraday_leverage_multiplier),
+            step=0.5,
+            format="%.1f",
+            help=(
+                "LIVE entries first ask Zerodha's margin calculator for the real leverage it's "
+                "granting the specific stock right now; this number is only used as a fallback "
+                "in PAPER mode or if that live lookup fails. Leave at 1x unless you've confirmed "
+                "the margin your account actually gets."
+            ),
+        )
+
+        market_column, entry_start_column, entry_end_column, force_exit_column = st.columns(4)
+        market_open = market_column.time_input("Market open", value=settings.market_open)
+        entry_start = entry_start_column.time_input("Entry window start", value=settings.entry_start)
+        entry_end = entry_end_column.time_input("Entry window end", value=settings.entry_end)
+        force_exit = force_exit_column.time_input("Force exit", value=settings.force_exit)
+
+        st.subheader("Swing auto trading")
+        st.caption("Position sizing and safety limits used by the Swing auto trading page's scanner.")
+        swing_capital_column, swing_quantity_column, swing_atr_column, swing_limit_column = st.columns(4)
+        swing_capital_limit = swing_capital_column.number_input(
+            "Maximum capital per position",
+            min_value=1.0,
+            max_value=10_000_000.0,
+            value=float(settings.swing_capital_limit),
+            step=1_000.0,
+            format="%.2f",
+        )
+        swing_quantity_limit = swing_quantity_column.number_input(
+            "Maximum quantity per position",
+            min_value=1,
+            max_value=1_000_000,
+            value=int(settings.swing_quantity_limit),
+            step=1,
+        )
+        swing_trailing_atr_multiplier = swing_atr_column.number_input(
+            "Trailing stop ATR multiplier",
+            min_value=0.5,
+            max_value=10.0,
+            value=float(settings.swing_trailing_atr_multiplier),
+            step=0.25,
+            key="risk_settings_swing_atr",
+        )
+        swing_max_open_positions = swing_limit_column.number_input(
+            "Maximum open swing positions",
+            min_value=1,
+            max_value=1_000,
+            value=int(settings.swing_max_open_positions),
+            step=1,
+            help="Once this many swing positions are open, the Swing auto trading page pauses scanning automatically until one closes.",
+        )
+
         save_settings = st.form_submit_button("Save risk & settings", type="primary", width="stretch", icon=":material/save:")
 
     if not save_settings:
@@ -3220,8 +4568,6 @@ def render_risk_settings(st, settings) -> None:
     overrides = {
         "trading_mode": trading_mode,
         "initial_capital": float(initial_capital),
-        "risk_per_trade": float(risk_per_trade) / 100,
-        "max_daily_loss": float(max_daily_loss) / 100,
         "max_open_positions": int(max_open_positions),
         "max_trades_per_day": int(max_trades_per_day),
         "max_capital_deployment": float(max_capital_deployment) / 100,
@@ -3230,6 +4576,13 @@ def render_risk_settings(st, settings) -> None:
         "entry_end": entry_end,
         "force_exit": force_exit,
         "trailing_atr_multiplier": float(trailing_atr_multiplier),
+        "min_stop_improvement_pct": float(min_stop_improvement_pct),
+        "swing_capital_limit": float(swing_capital_limit),
+        "swing_quantity_limit": int(swing_quantity_limit),
+        "swing_trailing_atr_multiplier": float(swing_trailing_atr_multiplier),
+        "swing_max_open_positions": int(swing_max_open_positions),
+        "intraday_capital_limit": float(intraday_capital_limit),
+        "intraday_leverage_multiplier": float(intraday_leverage_multiplier),
     }
     try:
         updated_settings = apply_frontend_settings(settings, overrides)
@@ -3251,18 +4604,64 @@ def render_risk_settings(st, settings) -> None:
 
 
 def render_automatic_trading(st, settings) -> None:
-    st.markdown('<div class="eyebrow">Controlled execution</div>', unsafe_allow_html=True)
-    st.title("Automatic trading")
+    title_column, status_column = st.columns([5, 2], vertical_alignment="bottom")
+    with title_column:
+        st.title("Intratrading")
+    status_popover_slot = status_column.empty()
     st.caption("Automatic entries use the selected strategy, score threshold, risk gates, and activity ledger as the manual signal page.")
+    # A fixed slot right under the title, instead of a fresh st.progress() created wherever the
+    # scan loop happens to sit in the page -- keeps the live scan progress next to the status
+    # badge above, rather than appearing lower down amid the strategy/filter controls.
+    scan_progress_slot = st.empty()
     repository = get_dashboard_repository(st)
     strategy_options = load_dashboard_strategy_options(repository, include_pre_spike=True, include_previous_day_high=True)
     strategy_labels = list(strategy_options)
-    selected_strategy = st.selectbox(
-        "Strategy",
-        strategy_labels,
-        index=strategy_labels.index(PRE_SPIKE_LIVE_LABEL),
-        key="automatic_strategy",
+    automatic_enabled = bool(st.session_state.get("automatic_enabled", False))
+    intraday_capital_limit = float(settings.intraday_capital_limit)
+    intraday_max_open_positions = int(settings.max_open_positions)
+    intraday_trailing_atr_multiplier = float(settings.trailing_atr_multiplier)
+    live_confirmed = st.checkbox(
+        "I understand this can place real MARKET orders and modify Zerodha-side stop orders.",
+        key="automatic_live_confirmation",
+        disabled=settings.trading_mode != TradingMode.LIVE,
     )
+
+    label_column, strategy_column, toggle_column, scan_column = st.columns([0.14, 0.36, 0.25, 0.25])
+    with label_column:
+        st.markdown('<div style="padding-top:0.55rem; font-weight:600;">Strategy</div>', unsafe_allow_html=True)
+    with strategy_column:
+        selected_strategy = st.selectbox(
+            "Strategy",
+            strategy_labels,
+            index=strategy_labels.index(HIGH_CONVICTION_LIVE_LABEL),
+            key="automatic_strategy",
+            label_visibility="collapsed",
+        )
+    with toggle_column:
+        if automatic_enabled:
+            if st.button(
+                "Trading Live End",
+                icon=":material/power_settings_new:",
+                type="secondary",
+                width="stretch",
+                help="Stop automatic entries immediately.",
+            ):
+                st.session_state.automatic_enabled = False
+                st.rerun()
+        else:
+            if st.button(
+                "Trading Live Start",
+                icon=":material/play_arrow:",
+                type="primary",
+                width="stretch",
+                disabled=settings.trading_mode != TradingMode.LIVE or not live_confirmed,
+                help="Start automatic entries",
+            ):
+                st.session_state.automatic_enabled = True
+                st.rerun()
+    with scan_column:
+        manual_scan_clicked = st.button("Scan only", icon=":material/search:", width="stretch", help="Run a one-off scan without submitting entries")
+
     pre_spike_config = render_pre_spike_config(st, "automatic_pre_spike") if selected_strategy == PRE_SPIKE_LIVE_LABEL else None
     try:
         strategy = build_dashboard_strategy(repository, selected_strategy, pre_spike_config)
@@ -3271,81 +4670,41 @@ def render_automatic_trading(st, settings) -> None:
         return
     uses_market_filters = isinstance(strategy, VwapEmaBreakoutStrategy)
     uses_market_confirmation = isinstance(strategy, HighConvictionLongStrategy)
-    universe_source = st.segmented_control(
-        "Stock universe source",
-        ["Selected watchlists", "Existing index", "Manual CSV upload"],
-        default="Existing index",
-        key="automatic_universe_source",
+
+    selected_symbols = selected_watchlist_symbols(repository, dashboard_user_id(settings))
+    st.caption(
+        f"₹{intraday_capital_limit:,.0f} cap · ATR×{intraday_trailing_atr_multiplier:.2f} · max {intraday_max_open_positions} open "
+        "(edit on Risk & settings page)"
     )
-    selected_index = st.selectbox("Existing stock universe", SUPPORTED_INDEXES, index=SUPPORTED_INDEXES.index("NIFTY 500"), key="automatic_index") if universe_source == "Existing index" else universe_source
-    manual_universe_file = st.file_uploader(
-        "Upload stock universe CSV",
-        type="csv",
-        key="automatic_manual_universe",
-        help="Required column: symbol or tradingsymbol. Optional column: sector or industry.",
-    ) if universe_source == "Manual CSV upload" else None
-    quantity_column, limit_column = st.columns(2)
-    order_quantity = quantity_column.number_input(
-        "Quantity per order",
-        min_value=1,
-        max_value=100_000,
-        value=1,
-        step=1,
-        key="automatic_order_quantity",
-        help="The requested quantity is still checked against the configured risk and exposure limits.",
-    )
-    max_entries = limit_column.number_input("Maximum entries per run", min_value=1, max_value=5, value=1, step=1, key="automatic_max_entries")
-    automatic_enabled = bool(st.session_state.get("automatic_enabled", False))
-    status_text = "Auto trade is running. New qualifying BUY signals will be submitted automatically." if automatic_enabled else "Auto trade is stopped. Use Start auto trade to submit qualifying BUY signals."
-    st.caption(status_text)
-    if settings.trading_mode == TradingMode.LIVE:
-        st.warning("LIVE mode is active. Enabling automatic entries can place real MARKET orders.", icon=":material/warning:")
-    else:
+    if not selected_symbols:
+        st.info("Select at least one watchlist on the Watchlists page before scanning.", icon=":material/list_alt:")
+        return
+    if settings.trading_mode != TradingMode.LIVE:
         st.info("PAPER mode is active. Orders stay inside the local paper execution boundary.", icon=":material/science:")
     access_token = runtime_access_token(st, settings)
     if not broker_credentials_configured(settings) or not access_token:
-        st.info(f"Authenticate with Kite to run automatic trading on the existing {selected_index} selection.", icon=":material/lock:")
+        st.info("Authenticate with Kite to run Intratrading on your selected watchlists.", icon=":material/lock:")
         return
     try:
         client = connect_kite(settings, access_token)
-        if universe_source == "Manual CSV upload" and manual_universe_file is None:
-            st.info("Upload a CSV containing the stock symbols to continue.", icon=":material/upload_file:")
-            return
-        if universe_source == "Selected watchlists":
-            selected_symbols = selected_watchlist_symbols(repository, dashboard_user_id(settings))
-            if not selected_symbols:
-                st.info("Select at least one watchlist before scanning.", icon=":material/list_alt:")
-                return
-            current_instruments = load_watchlist_instruments(settings, access_token)
-            resolved_symbols, skipped_symbols = reconcile_selected_watchlist_symbols(selected_symbols, current_instruments)
-            if skipped_symbols:
-                st.warning(
-                    "Skipped unavailable or non-equity watchlist instruments: "
-                    + ", ".join(skipped_symbols)
-                    + ". Refresh the watchlist before enabling automatic trading."
-                )
-            if not resolved_symbols:
-                st.info("No selected watchlist instruments are currently tradable on Kite.", icon=":material/block:")
-                return
-            token_to_symbol = {token: symbol for symbol, token in resolved_symbols.items()}
-            selected_sector = "All sectors"
-        else:
-            index_universe = (
-                load_nifty_index_universe_from_api(client.client, selected_index)
-                if universe_source == "Existing index"
-                else load_manual_stock_universe(manual_universe_file, client.client)
+        current_instruments = load_watchlist_instruments(settings, access_token)
+        resolved_symbols, skipped_symbols = reconcile_selected_watchlist_symbols(selected_symbols, current_instruments)
+        if skipped_symbols:
+            st.warning(
+                "Skipped unavailable or non-equity watchlist instruments: "
+                + ", ".join(skipped_symbols)
+                + ". Refresh the watchlist before enabling Intratrading."
             )
-            index_universe, selected_sector = select_sector_universe(st, index_universe, "automatic_sector")
-            token_to_symbol = dict(zip(index_universe["instrument_token"].astype(int), index_universe["symbol"], strict=True))
+        if not resolved_symbols:
+            st.info("No selected watchlist instruments are currently tradable on Kite.", icon=":material/block:")
+            return
+        token_to_symbol = {token: symbol for symbol, token in resolved_symbols.items()}
+        selected_sector = "All sectors"
     except (OSError, RuntimeError, ValueError) as error:
-        st.error(f"{selected_index} selection could not be loaded: {error}")
+        st.error(f"Watchlist stock universe could not be loaded: {error}")
         return
 
-    universe_label = (
-        "Selected watchlists"
-        if universe_source == "Selected watchlists"
-        else selected_index if universe_source == "Existing index" else f"Manual CSV: {manual_universe_file.name}"
-    )
+    universe_label = "Selected watchlists"
     automatic_scan_context = (
         selected_strategy,
         repr(getattr(strategy, "config", None)),
@@ -3353,7 +4712,7 @@ def render_automatic_trading(st, settings) -> None:
         selected_sector,
         tuple(sorted(token_to_symbol.items())),
     )
-    st.write(f"Selected stocks: {len(token_to_symbol)} · Sector: {selected_sector} · Strategy: {selected_strategy}")
+    st.caption(f"Selected stocks: {len(token_to_symbol)} · Sector: {selected_sector} · Strategy: {selected_strategy}")
     if isinstance(strategy, PreSpikeMomentumStrategy):
         st.caption(
             f"Completed 5-minute candles · 60-day lookback · score >= {strategy.config.minimum_score} · "
@@ -3369,15 +4728,87 @@ def render_automatic_trading(st, settings) -> None:
             f"fresh crossover only, minimum gap {strategy.min_gap_percent:.1f}%, stop {strategy.stop_atr:.1f} x ATR{strategy.atr_period}."
         )
 
+    def record_automatic_cycle(summary: str) -> None:
+        cycle_history = st.session_state.get("automatic_cycle_log", [])
+        st.session_state.automatic_cycle_log = (cycle_history + [summary])[-12:]
+
     def run_automatic_cycle(execute_entries: bool) -> None:
+        """Scan the universe with candle fetches running in parallel (bounded by
+        SCAN_MAX_WORKERS, out of respect for Kite's historical-data rate limit), and submit an
+        order for each qualifying BUY the moment it's found -- not after all 1000+ stocks have
+        been scanned. A sequential scan-then-submit-top-5 pipeline meant a signal found early
+        could sit for minutes before an order went in, by which point the move may have already
+        run. The trade-off: entries are no longer limited to the best 5 signals by score: every
+        qualifying signal is submitted, in the order its fetch happens to complete, until
+        position/capital/daily-trade limits naturally stop further entries. The buy/sell frames
+        in the final result are still ranked to the top 5 for the on-screen summary table, but
+        that ranking no longer gates what gets submitted.
+        """
+        # Written directly (not via the render_automatic_status fragment below) so it's actually
+        # visible the instant a scan starts -- a fragment's own output doesn't reliably flush
+        # into a container created outside it while this function then blocks for the whole
+        # scan, which is why the badge previously looked blank until the cycle finished.
+        with status_popover_slot.popover("🔵 Scanning...", width="stretch"):
+            st.caption(f"Scanning {selected_strategy}...")
         token_by_symbol = {symbol: token for token, symbol in token_to_symbol.items()}
         run_started_at = datetime.now()
-        progress = ScanProgress(st, "Automatic scan running")
+        status_caption = st.empty()
         st.session_state.automatic_last_run_at = run_started_at
         st.session_state.automatic_next_run_at = run_started_at + timedelta(seconds=300)
+        st.session_state.automatic_last_error = None
+        live_log: list[str] = []
+        log_box = st.empty()
+
+        def log_line(message: str) -> None:
+            live_log.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
+            log_box.code("\n".join(live_log[-300:]), language=None)
+
         try:
+            # Check the position cap first, before any regime lookup, progress bar, or scan
+            # log gets created -- if the cap is already hit, no entry could ever be accepted
+            # this cycle regardless of what the scan finds, so scanning 600+ stocks (and the
+            # API calls that costs) is pure waste. Halting here also means only the top status
+            # banner (driven by automatic_last_error) reports the halt, instead of the same
+            # message repeating across the log box, a stuck 0%-complete progress bar, and a
+            # separate error box. automatic_last_error isn't sticky -- it's reset at the top of
+            # every cycle, so the very next scheduled run re-checks automatically and clears
+            # itself the moment a position closes or the limit is raised, with no manual
+            # restart needed.
+            pipeline = get_dashboard_pipeline(st, settings, access_token, token_to_symbol, strategy) if execute_entries else None
+            if pipeline is not None and pipeline.managed_positions:
+                # The Intraday page no longer shows a live position table (removed on request),
+                # but this pipeline's own in-memory managed_positions is still what the position
+                # count and capital-deployment limits below are checked against. Without this
+                # sync, a position closed at the broker (SL-M fill) keeps counting as "open"
+                # here even though the standalone trailing-stop agent already reconciled it out
+                # of the database -- silently blocking new entries with "maximum open positions
+                # reached" even when real headroom exists. See the Live monitor page for the
+                # authoritative, always-reconciled position list.
+                try:
+                    pipeline.sync_broker_positions()
+                except Exception:
+                    logger.exception("Silent broker position sync failed before the automatic scan; position/capital limits may use stale counts this cycle")
+            if execute_entries and pipeline is not None:
+                open_position_count = len(pipeline.managed_positions)
+                if open_position_count >= settings.max_open_positions:
+                    message = (
+                        f"maximum open positions already reached ({open_position_count}/{settings.max_open_positions}); "
+                        "scan halted for this cycle -- close a position or raise the limit on the Risk & settings page"
+                    )
+                    st.session_state.automatic_last_error = message
+                    record_automatic_cycle(f"{datetime.now().strftime('%I:%M:%S %p')} — scan halted: {message}")
+                    return
+                if not pipeline.limits.can_trade():
+                    message = (
+                        f"daily trade limit already reached ({pipeline.limits.trades}/{settings.max_trades_per_day} trades today); "
+                        "scan halted for this cycle -- raise the limit on the Risk & settings page if you want to trade more today"
+                    )
+                    st.session_state.automatic_last_error = message
+                    record_automatic_cycle(f"{datetime.now().strftime('%I:%M:%S %p')} — scan halted: {message}")
+                    return
+
             if uses_market_filters or uses_market_confirmation:
-                progress.update("Loading NIFTY 50 market regime")
+                status_caption.caption("Loading NIFTY 50 market regime...")
                 regime = load_live_nifty_regime(client.client)
             else:
                 regime = None
@@ -3390,18 +4821,132 @@ def render_automatic_trading(st, settings) -> None:
                 candles = load_live_candles_from_client(client.client, token_by_symbol[symbol], "15minute", 20)
                 return TimeframeConfirmation.from_candles(candles)
 
-            timeframe_label = "5-minute and 15-minute candles" if uses_market_filters else "5-minute candles"
-            progress.update(f"Evaluating {len(token_to_symbol)} stocks on {timeframe_label}")
-            result = StrategySignalScanner(
-                buy_limit=5,
-                sell_limit=5,
-                minimum_score=int(getattr(strategy, "minimum_score", 80)),
-            ).scan(
-                list(token_to_symbol.values()),
-                strategy,
-                load_symbol_candles,
-                market_regime=regime,
-                confirmation_loader=load_confirmation if uses_market_filters else None,
+            def fetch_symbol_data(symbol: str) -> tuple[pd.DataFrame, TimeframeConfirmation | None]:
+                candles = load_symbol_candles(symbol)
+                confirmation = load_confirmation(symbol) if uses_market_filters else None
+                return candles, confirmation
+
+            status_caption.empty()
+            symbols = list(token_to_symbol.values())
+            total_symbols = len(symbols)
+            progress_bar = scan_progress_slot.progress(0.0, text=f"Scanning {selected_strategy}: 0/{total_symbols} complete")
+
+            scanner = StrategySignalScanner(buy_limit=5, sell_limit=5, minimum_score=int(getattr(strategy, "minimum_score", 80)))
+            entry_window_open = settings.entry_start <= datetime.now().time() <= settings.entry_end
+            if execute_entries and not entry_window_open:
+                log_line("Entry window is closed -- signals will be scanned but not submitted this cycle.")
+
+            buys: list[dict] = []
+            sells: list[dict] = []
+            scan_errors: list[str] = []
+            insufficient_history: list[str] = []
+            no_signal: list[tuple[str, str]] = []
+            events = []
+            capital_skipped = 0
+            completed = 0
+
+            worker_count = min(SCAN_MAX_WORKERS, total_symbols) if total_symbols else 1
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="intraday-scan") as executor:
+                futures = {executor.submit(fetch_symbol_data, symbol): symbol for symbol in symbols}
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    completed += 1
+                    progress_bar.progress(completed / total_symbols if total_symbols else 1.0, text=f"Scanning {selected_strategy}: {completed}/{total_symbols} complete")
+                    # A trade taken earlier in this very cycle can push the daily limit to its
+                    # cap mid-scan (the pre-scan check above only catches it if it was already
+                    # hit before this cycle started) -- once that happens, every remaining
+                    # candle fetch that already completed would just be evaluated and rejected
+                    # one by one, so stop consuming results the moment it's detected instead of
+                    # spamming the same "daily trade limit reached" rejection per symbol.
+                    if execute_entries and not pipeline.limits.can_trade():
+                        log_line(f"Daily trade limit reached ({pipeline.limits.trades}/{settings.max_trades_per_day}) -- stopping this scan early.")
+                        break
+                    try:
+                        candles, confirmation = future.result()
+                    except Exception as error:
+                        scan_errors.append(f"{symbol}: {error}")
+                        continue
+                    evaluation = scanner.evaluate_symbol(
+                        symbol,
+                        token_by_symbol.get(symbol),
+                        strategy,
+                        lambda _symbol, _candles=candles: _candles,
+                        regime,
+                        (lambda _symbol, _confirmation=confirmation: _confirmation) if uses_market_filters else None,
+                    )
+                    if evaluation.outcome == "error":
+                        scan_errors.append(f"{symbol}: {evaluation.detail}")
+                        continue
+                    if evaluation.outcome == "insufficient_history":
+                        insufficient_history.append(symbol)
+                        continue
+                    if evaluation.outcome == "no_signal":
+                        no_signal.append((symbol, evaluation.detail))
+                        continue
+                    if evaluation.outcome == "sell":
+                        sells.append(evaluation.row)
+                        continue
+                    row = evaluation.row
+                    buys.append(row)
+                    signal_time = pd.Timestamp(row["timestamp"])
+                    now = pd.Timestamp.now(tz=signal_time.tz) if signal_time.tz is not None else pd.Timestamp.now()
+                    fresh = pd.notna(signal_time) and -60 <= (now - signal_time).total_seconds() <= 600
+                    valid_stop = row["current_price"] > 0 and row["stop_loss"] > 0 and row["stop_loss"] < row["entry_price"]
+                    log_line(f"{symbol}: signal found (score {row['score']}, entry ₹{row['entry_price']:.2f})")
+                    if not execute_entries:
+                        continue
+                    if not fresh:
+                        log_line(f"{symbol}: not submitted -- signal candle is stale")
+                        continue
+                    if not valid_stop:
+                        log_line(f"{symbol}: not submitted -- invalid price/stop combination")
+                        continue
+                    if not entry_window_open:
+                        log_line(f"{symbol}: not submitted -- entry window closed")
+                        continue
+                    entry_price = float(row["entry_price"])
+                    # intraday_capital_limit is the cash/margin budget per position; leverage
+                    # (looked up live from Zerodha's margin calculator when possible -- see
+                    # TradingPipeline.resolve_intraday_leverage) stretches that into more shares.
+                    leverage = pipeline.resolve_intraday_leverage(symbol, entry_price)
+                    quantity = int((intraday_capital_limit * leverage) // entry_price) if entry_price > 0 else 0
+                    if quantity < 1:
+                        capital_skipped += 1
+                        log_line(f"{symbol}: not submitted -- capital limit smaller than one share at ₹{entry_price:.2f}")
+                        continue
+                    event = pipeline.submit_strategy_entry(
+                        Signal(
+                            symbol=symbol,
+                            action=SignalAction(str(row["side"])),
+                            timestamp=pd.Timestamp(row["timestamp"]).to_pydatetime(),
+                            price=entry_price,
+                            stop_loss=float(row["stop_loss"]),
+                            reason=str(row["signal_reasons"]),
+                            score=int(row["score"]),
+                            entry_price=entry_price,
+                            target_1=float(row["target_1"]) if pd.notna(row["target_1"]) else None,
+                            target_2=float(row["target_2"]) if pd.notna(row["target_2"]) else None,
+                            metadata={
+                                "move_stop_to_breakeven_after_target_1": isinstance(strategy, HighConvictionLongStrategy),
+                            },
+                        ),
+                        quantity=quantity,
+                    )
+                    events.append(event)
+                    record_dashboard_events(st, [event])
+                    if event.kind == "entry_submitted":
+                        log_line(f"{symbol}: ENTRY SUBMITTED qty={quantity} @ ₹{entry_price:.2f}")
+                    else:
+                        log_line(f"{symbol}: {event.kind} -- {event.reason}")
+            progress_bar.empty()
+
+            result = SignalScanResult(
+                buy=StrategySignalScanner._rank(buys, scanner.buy_limit),
+                sell=StrategySignalScanner._rank(sells, scanner.sell_limit),
+                errors=tuple(scan_errors),
+                scanned=total_symbols,
+                insufficient_history=tuple(insufficient_history),
+                no_signal=tuple(no_signal),
             )
             st.session_state.automatic_signal_result = result
             st.session_state.automatic_signal_context = automatic_scan_context
@@ -3418,52 +4963,17 @@ def render_automatic_trading(st, settings) -> None:
                     settings,
                 )
             if not execute_entries:
-                progress.complete(f"Scan complete: {len(result.buy)} BUY, {len(result.sell)} SELL signals")
+                record_automatic_cycle(
+                    f"{datetime.now().strftime('%I:%M:%S %p')} — scanned {result.scanned} · "
+                    f"{len(buys)} buy · {len(sells)} sell signals (scan only)"
+                )
                 return
-            if not settings.entry_start <= datetime.now().time() <= settings.entry_end:
-                progress.complete("Scan complete; entry window is closed")
+            if not entry_window_open:
                 st.info("Automatic entries are paused outside the configured entry window.")
+                record_automatic_cycle(
+                    f"{datetime.now().strftime('%I:%M:%S %p')} — scanned {result.scanned} · entry window closed, no submissions"
+                )
                 return
-            progress.update("Applying freshness, risk, and position limits")
-            pipeline = get_dashboard_pipeline(st, settings, access_token, token_to_symbol, strategy)
-            candidates = result.buy
-            if not candidates.empty:
-                signal_times = pd.to_datetime(candidates["timestamp"], errors="coerce")
-                now = pd.Timestamp.now(tz=signal_times.dt.tz) if signal_times.dt.tz is not None else pd.Timestamp.now()
-                fresh = signal_times.notna() & ((now - signal_times).dt.total_seconds().between(-60, 600))
-                candidates = candidates.loc[fresh]
-            candidates = candidates.loc[
-                (candidates["current_price"] > 0)
-                & (candidates["stop_loss"] > 0)
-                & (
-                    ((candidates["side"] == SignalAction.BUY.value) & (candidates["stop_loss"] < candidates["entry_price"]))
-                    | ((candidates["side"] == SignalAction.SELL.value) & (candidates["stop_loss"] > candidates["entry_price"]))
-                )
-            ]
-            candidates = candidates.sort_values(["score", "expected_value"], ascending=[False, False], na_position="last").head(int(max_entries))
-            progress.update(f"Submitting up to {len(candidates)} qualifying automatic entries")
-            events = [
-                pipeline.submit_strategy_entry(
-                    Signal(
-                        symbol=str(row["symbol"]),
-                        action=SignalAction(str(row["side"])),
-                        timestamp=pd.Timestamp(row["timestamp"]).to_pydatetime(),
-                        price=float(row["entry_price"]),
-                        stop_loss=float(row["stop_loss"]),
-                        reason=str(row["signal_reasons"]),
-                        score=int(row["score"]),
-                        entry_price=float(row["entry_price"]),
-                        target_1=float(row["target_1"]) if pd.notna(row["target_1"]) else None,
-                        target_2=float(row["target_2"]) if pd.notna(row["target_2"]) else None,
-                        metadata={
-                            "move_stop_to_breakeven_after_target_1": isinstance(strategy, HighConvictionLongStrategy),
-                        },
-                    ),
-                    quantity=int(order_quantity),
-                )
-                for _, row in candidates.iterrows()
-            ]
-            record_dashboard_events(st, events)
             submitted = [event for event in events if event.kind == "entry_submitted"]
             rejected = [event for event in events if event.kind == "entry_rejected"]
             skipped = [event for event in events if event.kind == "entry_skipped"]
@@ -3471,36 +4981,118 @@ def render_automatic_trading(st, settings) -> None:
                 st.success(f"Submitted {len(submitted)} automatic entr{'y' if len(submitted) == 1 else 'ies'}.")
             if rejected:
                 st.error("\n".join(f"{event.symbol}: {event.reason}" for event in rejected))
+            if capital_skipped:
+                st.warning(f"{capital_skipped} signal(s) skipped: maximum capital per position is smaller than one share at the current price.")
             if skipped and not submitted and not rejected:
                 st.caption("All qualifying signals were already submitted or have open positions.")
-            if not events:
+            if not events and not capital_skipped:
                 st.info("No strong signals qualified for automatic entry.")
-            progress.complete(f"Automatic run complete: {len(submitted)} submitted, {len(rejected)} rejected")
+            record_automatic_cycle(
+                f"{datetime.now().strftime('%I:%M:%S %p')} — scanned {result.scanned} · "
+                f"{len(buys)} qualifying · {len(submitted)} entered · {len(rejected)} rejected · {len(result.errors)} errors"
+            )
         except Exception as error:
-            progress.error("Automatic scan could not be completed")
+            logger.exception("Automatic scan/entry cycle failed")
+            status_caption.empty()
+            st.session_state.automatic_last_error = str(error)
             st.error(f"Automatic scan could not be completed: {error}")
 
-    start_column, stop_column, scan_column = st.columns([2, 1, 1])
-    with start_column:
-        if st.button("Start auto trade", type="primary", width="stretch", icon=":material/play_arrow:", disabled=automatic_enabled):
-            st.session_state.automatic_enabled = True
-            st.rerun()
-    with stop_column:
-        if st.button("Stop auto trade", width="stretch", icon=":material/stop:", disabled=not automatic_enabled):
-            st.session_state.automatic_enabled = False
-            st.rerun()
-    with scan_column:
-        if st.button("Scan only", width="stretch", icon=":material/search:"):
-            run_automatic_cycle(False)
+    @st.fragment(run_every="300s")
+    def render_automatic_status() -> None:
+        live_automatic_enabled = bool(st.session_state.get("automatic_enabled", False))
+        automatic_last_error = st.session_state.get("automatic_last_error")
+        automatic_last_run_at = st.session_state.get("automatic_last_run_at")
+        automatic_next_run_at = st.session_state.get("automatic_next_run_at")
+        last_run_label = automatic_last_run_at.strftime("%I:%M:%S %p") if automatic_last_run_at else "No run yet"
+        next_run_label = automatic_next_run_at.strftime("%I:%M:%S %p") if automatic_next_run_at else "pending first run"
+        stalled = bool(live_automatic_enabled and automatic_next_run_at is not None and datetime.now() > automatic_next_run_at + timedelta(seconds=120))
+        if not live_automatic_enabled:
+            automatic_engine_state = "stopped"
+        elif automatic_last_error:
+            automatic_engine_state = "error"
+        elif stalled:
+            automatic_engine_state = "stalled"
+        else:
+            automatic_engine_state = "running"
+        state_copy = {
+            "running": (
+                "Auto trade armed",
+                f"{selected_strategy} · monitoring {len(token_to_symbol)} stocks from {universe_label} · next scan around {next_run_label} · last run {last_run_label}",
+            ),
+            "stopped": (
+                "Auto trade stopped",
+                f"{selected_strategy} · {universe_label} · {len(token_to_symbol)} stocks · last run {last_run_label}",
+            ),
+            "stalled": (
+                "Scheduler heartbeat is stale",
+                "Auto trade is enabled but has not completed a cycle recently",
+            ),
+            "error": (
+                "Intratrading needs attention",
+                escape((automatic_last_error or "The latest automatic cycle reported an error")[:240]),
+            ),
+        }[automatic_engine_state]
+        automatic_badge = {
+            "running": "LIVE",
+            "stopped": "STOPPED",
+            "stalled": "STALLED",
+            "error": "NEEDS ATTENTION",
+        }[automatic_engine_state]
+        # A full-width banner here cost the same vertical space as the Live monitor page's own
+        # agent-status banner did, for the same reason: worth knowing, not worth pushing every
+        # strategy/filter control down the page on every single render. See render_live_monitor
+        # for the same compact badge + click-for-detail treatment.
+        status_icon, status_label = {
+            "running": ("🟢", "Auto trade armed"),
+            "stopped": ("⚪", "Auto trade stopped"),
+            "stalled": ("🟡", "Heartbeat stale"),
+            "error": ("🔴", "Needs attention"),
+        }[automatic_engine_state]
+        with status_popover_slot.popover(f"{status_icon} {status_label}", width="stretch"):
+            render_scan_activity_banner(
+                st,
+                "stalled" if automatic_engine_state in {"stalled", "stopped"} else automatic_engine_state,
+                *state_copy,
+                badge=automatic_badge,
+            )
+
+    render_automatic_status()
+
+    if manual_scan_clicked:
+        run_automatic_cycle(False)
 
     @st.fragment(run_every="300s")
     def automatic_scheduler_fragment():
         if st.session_state.get("automatic_enabled", False):
+            # render_automatic_status() above is a *separate* fragment on its own independent
+            # 300s timer -- it has no way to know this cycle just changed automatic_last_error
+            # (e.g. a halt because the position cap is already reached) until its own timer next
+            # fires, which can lag this one by minutes. That's exactly how the top banner could
+            # keep showing "Auto trade armed / LIVE" while this fragment's own halted-scan
+            # message sits right below it, contradicting it. Forcing a full rerun the moment the
+            # error state actually changes keeps them in sync without rerunning on every tick.
+            error_before = st.session_state.get("automatic_last_error")
             run_automatic_cycle(True)
+            if st.session_state.get("automatic_last_error") != error_before:
+                st.rerun()
         else:
             st.caption("Scheduler is idle until auto trade is started.")
 
     automatic_scheduler_fragment()
+
+    automatic_cycle_log = st.session_state.get("automatic_cycle_log", [])
+    if automatic_cycle_log:
+        with st.expander("Recent scan cycles", expanded=False):
+            st.caption("  \n".join(reversed(automatic_cycle_log[-5:])))
+    automatic_activity = load_activity()[2]
+    automatic_activity = automatic_activity[automatic_activity["event_kind"].isin(INTRADAY_ACTIVITY_EVENT_KINDS)]
+    if not automatic_activity.empty:
+        with st.expander(f"Recent Intratrading activity ({len(automatic_activity)})", expanded=False):
+            st.dataframe(
+                automatic_activity[["timestamp", "symbol", "event_kind", "reason"]].head(20),
+                width="stretch",
+                hide_index=True,
+            )
 
     result = st.session_state.get("automatic_signal_result")
     if result is not None and st.session_state.get("automatic_signal_context") != automatic_scan_context:
@@ -3591,16 +5183,6 @@ def render_automatic_trading(st, settings) -> None:
     if result.errors:
         with st.expander(f"Skipped selected stocks ({len(result.errors)})"):
             st.write("\n".join(result.errors))
-    st.subheader("Automatic position monitor")
-    st.caption("Stops are checked against live quotes every 5 seconds. The exit is submitted as a market order when a stop is reached.")
-
-    @st.fragment(run_every="5s")
-    def automatic_monitor_fragment():
-        render_position_monitor(st, settings, access_token)
-
-    automatic_monitor_fragment()
-
-
 def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, activity: pd.DataFrame) -> None:
     today = date.today().isoformat()
     if not activity.empty:
@@ -3636,12 +5218,38 @@ def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, ac
     first.metric("Closed trades", closed_count)
     if closed_count:
         wins = int((closed_activity["pnl"] > 0).sum()) if not activity.empty else int((trades["pnl"] > 0).sum())
-        second.metric("Win rate", f"{wins / closed_count:.1%}")
+        overall_win_rate = wins / closed_count
+        second.metric("Win rate", f"{overall_win_rate:.1%}")
     else:
+        overall_win_rate = 0.0
         second.metric("Win rate", "0.0%")
-    third.metric("Risk budget", f"{settings.risk_per_trade:.2%} / trade")
+    third.metric("Capital deployment cap", f"{settings.max_capital_deployment:.0%}")
     fourth.metric("Ledger events", int(len(activity)) if not activity.empty else int(len(orders) + len(trades)))
-    render_control_center(st, settings, activity, day_pnl)
+
+    card_col, table_col = st.columns([1, 3])
+    card_col.metric("Overall success ratio", f"{overall_win_rate:.1%}", f"{closed_count} closed trades")
+    with table_col:
+        st.markdown("**Strategy vs success ratio**")
+        strategy_trades = trades.copy() if not trades.empty else pd.DataFrame(columns=["strategy_name", "pnl"])
+        if strategy_trades.empty:
+            st.markdown('<div class="empty">No closed trades with strategy tracking yet.</div>', unsafe_allow_html=True)
+        else:
+            strategy_trades["strategy_name"] = strategy_trades["strategy_name"].fillna("").replace("", "Unlabeled")
+            strategy_trades["pnl"] = pd.to_numeric(strategy_trades["pnl"], errors="coerce").fillna(0.0)
+            by_strategy = strategy_trades.groupby("strategy_name").agg(
+                Trades=("pnl", "size"),
+                Wins=("pnl", lambda values: int((values > 0).sum())),
+                Net_PnL=("pnl", "sum"),
+            ).reset_index()
+            by_strategy["Success ratio"] = (by_strategy["Wins"] / by_strategy["Trades"]).map(lambda value: f"{value:.1%}")
+            by_strategy = by_strategy.rename(columns={"strategy_name": "Strategy"}).sort_values("Net_PnL", ascending=False)
+            st.dataframe(
+                by_strategy[["Strategy", "Trades", "Wins", "Success ratio", "Net_PnL"]],
+                width="stretch",
+                hide_index=True,
+                column_config={"Net_PnL": st.column_config.NumberColumn("Net P&L", format="₹%.2f")},
+            )
+    render_control_center(st, settings, activity)
     st.subheader("Equity path")
     equity_source = activity[activity["event_kind"].isin(["exit_submitted", "broker_exit_detected"])] if not activity.empty else trades
     if equity_source.empty:
@@ -3708,13 +5316,13 @@ def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, ac
 
 
 def main() -> None:
-    st.set_page_config(page_title="Intraday desk", page_icon=":material/candlestick_chart:", layout="wide")
+    st.set_page_config(page_title="Garuda Trading", page_icon=":material/candlestick_chart:", layout="wide")
     inject_styles(st)
     base_settings = get_settings()
     settings = get_frontend_settings(st, base_settings)
     orders, trades, activity = load_activity()
 
-    authenticated = broker_credentials_configured(settings) and bool(runtime_access_token(st, settings))
+    authenticated = broker_credentials_configured(settings) and bool(verified_kite_access_token(st, settings))
     pages = WORKSPACE_PAGES if authenticated else ["Kite authentication"]
     st.session_state.setdefault("active_page", "Kite authentication")
     if st.session_state.active_page not in pages:
@@ -3723,50 +5331,59 @@ def main() -> None:
         st.session_state.workspace_navigation = st.session_state.active_page
 
     with st.sidebar:
-        st.markdown('<div class="eyebrow">NSE / BSE trading desk</div>', unsafe_allow_html=True)
-        st.title("Intraday desk")
+        st.session_state.setdefault("sidebar_compact", False)
+        compact = st.session_state.sidebar_compact
+        if compact:
+            st.markdown(
+                '<style>[data-testid="stSidebar"] { width: 96px !important; min-width: 96px !important; }</style>',
+                unsafe_allow_html=True,
+            )
+        toggle_column, title_column = st.columns([1, 5]) if not compact else (st.container(), None)
+        with toggle_column:
+            if st.button(
+                " ",
+                key="sidebar_logo_toggle",
+                help="Expand sidebar" if compact else "Collapse to icons",
+            ):
+                st.session_state.sidebar_compact = not compact
+                st.rerun()
+        if not compact:
+            with title_column:
+                st.markdown('<div class="sidebar-brand-title">Garuda Trading</div>', unsafe_allow_html=True)
         page = st.radio(
             "Workspace",
             pages,
             index=None,
             key="workspace_navigation",
             width="stretch",
+            label_visibility="collapsed",
+            format_func=(
+                (lambda name: f":material/{SIDEBAR_PAGE_ICONS.get(name, 'circle')}:")
+                if compact
+                else (lambda name: f":material/{SIDEBAR_PAGE_ICONS.get(name, 'circle')}: {name}")
+            ),
         )
+        previous_page = st.session_state.get("previous_workspace_page")
         st.session_state.active_page = page
         st.session_state.previous_workspace_page = page
-        if not authenticated:
-            st.caption("Complete Kite authentication to unlock the workspace.")
-        st.divider()
-        st.caption(f"Session date  {date.today().isoformat()}")
-        st.caption(f"Broker mode  {settings.trading_mode.value}")
-        if authenticated:
-            if st.button("Refresh data", width="stretch", icon=":material/refresh:"):
-                st.rerun()
-            if st.button("Backup and clear signals", width="stretch", icon=":material/archive:"):
-                try:
-                    backup_data, cleared_counts = backup_and_clear_signal_state(st, settings)
-                    st.session_state.signal_backup_data = backup_data
-                    st.session_state.signal_backup_name = f"signal-backup-{datetime.now(ZoneInfo('Asia/Kolkata')):%Y%m%d-%H%M%S}-IST.json"
-                    st.session_state.signal_backup_counts = cleared_counts
-                    st.success("Signal results and notifications cleared.")
-                except Exception as error:
-                    st.error(f"Signal backup could not be created: {error}")
-            if st.session_state.get("signal_backup_data"):
-                counts = st.session_state.get("signal_backup_counts", {})
-                st.caption(
-                    "Cleared "
-                    f"{counts.get('signals', 0)} signals, "
-                    f"{counts.get('ema_progressive_cycles', 0)} progressive cycles, and "
-                    f"{counts.get('notifications', 0)} notifications."
-                )
-                st.download_button(
-                    "Download latest signal backup",
-                    data=st.session_state.signal_backup_data,
-                    file_name=st.session_state.get("signal_backup_name", "signal-backup.json"),
-                    mime="application/json",
-                    width="stretch",
-                    icon=":material/download:",
-                )
+        if page != previous_page:
+            # Auto trading must never keep running silently once its control page is left --
+            # arming it again always requires an explicit, freshly-confirmed Start click.
+            # (Unattended execution belongs to the standalone trailing-stop agent process, not
+            # to session state that outlives a glance at another dashboard page.)
+            if previous_page == "Swing auto trading":
+                st.session_state.swing_auto_enabled = False
+                st.session_state.swing_kill_switch = False
+                st.session_state.swing_live_confirmation = False
+            if previous_page == "Intratrading":
+                st.session_state.automatic_enabled = False
+        if not compact and not authenticated:
+            st.caption("Complete both Kite authentication steps to unlock the workspace.")
+        if not compact:
+            st.divider()
+            st.caption(f"Session date  {date.today().isoformat()}")
+            st.caption(f"Broker mode  {settings.trading_mode.value}")
+        if authenticated and not compact:
             st.divider()
             if st.session_state.get("emergency_halt"):
                 st.caption("New entries halted")
@@ -3798,15 +5415,19 @@ def main() -> None:
             render_kite_authentication(st, settings)
         elif page == "Overview":
             render_overview(st, settings, orders, trades, activity)
+        elif page == "Live monitor":
+            render_live_monitor(st, settings)
+        elif page == "P&L statement":
+            render_pnl_statement(st, settings)
         elif page == "Watchlists":
             render_watchlists(st, settings)
         elif page == "Scanner & signals":
             render_signal_feed(st, settings)
+        elif page == "Backtesting":
+            render_backtesting(st, settings)
         elif page == "Swing auto trading":
             render_swing_auto_trading(st, settings)
-        elif page == "Historical day scan":
-            render_historical_day_scan(st, settings)
-        elif page == "Automatic trading":
+        elif page == "Intratrading":
             render_automatic_trading(st, settings)
         elif page == "Risk & settings":
             render_risk_settings(st, settings)

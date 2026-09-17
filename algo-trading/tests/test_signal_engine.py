@@ -249,6 +249,46 @@ def test_engine_supports_previous_day_high_generate_signal_strategy(tmp_path):
     database.close()
 
 
+def test_generated_signal_is_recorded_to_the_unified_decision_log(tmp_path):
+    """Every generated signal -- not just ones later traded -- must land in decision_log so a
+    future LLM pass has the scanner's full rationale (score, reasons, targets) to train or
+    forecast from, independent of whether the signal ever became a position."""
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    repository.save_watchlist(WatchlistRecord("alice", "Morning", {"AAA": 1}))
+    candles = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-05 09:15", periods=5, freq="5min").tolist()
+            + pd.date_range("2026-01-06 09:15", periods=2, freq="5min").tolist(),
+            "open": [100.0, 101.0, 102.0, 104.0, 105.0, 106.0, 107.0],
+            "high": [103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0],
+            "low": [99.0, 100.0, 101.0, 103.0, 104.0, 105.0, 106.0],
+            "close": [101.0, 102.0, 104.0, 105.0, 106.0, 106.5, 108.0],
+            "volume": [1000.0] * 7,
+        }
+    )
+    engine = AlwaysOnSignalEngine(
+        EngineSettings(),
+        repository,
+        lambda token, interval, days: candles,
+        strategy=PreviousDayHighBreakoutStrategy(),
+        enable_progressive_strategy=False,
+        user_id="alice",
+    )
+
+    assert engine.run_once(datetime(2026, 1, 6, 9, 30)) == 1
+
+    [decision] = repository.load_decisions(event_type="signal_generated")
+    assert decision.symbol == "AAA"
+    assert decision.strategy_name == "previous_day_high_breakout"
+    assert decision.decision == "BUY"
+    assert decision.rationale
+    assert decision.outputs["stop_loss"] == 107.0
+    assert decision.correlation_id.startswith("AAA:signal:")
+    database.close()
+
+
 def test_crossover_strategy_returns_no_signal_when_rules_do_not_match():
     frame = crossover_frame()
     frame.loc[19, "close"] = 99.0

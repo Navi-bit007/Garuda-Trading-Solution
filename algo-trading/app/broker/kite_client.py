@@ -5,11 +5,21 @@ from typing import Any
 from app.broker.authentication import AccessToken, require_credentials
 
 
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 30
+
+
 class KiteClient:
-    def __init__(self, api_key: str, api_secret: str, access_token: AccessToken | None = None):
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        access_token: AccessToken | None = None,
+        timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.access_token = access_token
+        self.timeout = timeout
         self._client: Any = None
 
     def connect(self, access_token: AccessToken) -> None:
@@ -18,7 +28,7 @@ class KiteClient:
             from kiteconnect import KiteConnect
         except ImportError as exc:
             raise RuntimeError("Install kiteconnect before using the live broker adapter") from exc
-        self._client = KiteConnect(api_key=self.api_key)
+        self._client = KiteConnect(api_key=self.api_key, timeout=self.timeout)
         self._client.set_access_token(access_token.value)
         self.access_token = access_token
 

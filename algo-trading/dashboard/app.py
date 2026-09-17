@@ -1536,14 +1536,8 @@ def render_live_monitor(st, settings) -> None:
     @st.fragment(run_every=10)
     def render_live_monitor_content() -> None:
         st.markdown('<div class="eyebrow">Unified position tracker</div>', unsafe_allow_html=True)
-        st.title("Live monitor")
-        st.caption(
-            "Every open LIVE-mode intraday and swing position, read straight from the database the "
-            "standalone trailing-stop agent maintains -- cross-checked against Zerodha's own "
-            "live positions so drift between the two is visible immediately. PAPER-mode positions are "
-            "simulated locally and are not shown here or managed by the trailing-stop agent."
-        )
         repository = get_dashboard_repository(st)
+        access_token = runtime_access_token(st, settings)
 
         heartbeat = repository.load_agent_heartbeat("trailing_stop_agent")
         heartbeat_age = (datetime.now() - heartbeat.heartbeat_at).total_seconds() if heartbeat else None
@@ -1555,29 +1549,46 @@ def render_live_monitor(st, settings) -> None:
             agent_state = "stalled"
         else:
             agent_state = "running"
-        if agent_state in {"running", "stalled", "error"}:
-            state_copy = {
-                "running": ("Trailing-stop agent active", f"Last heartbeat {heartbeat_age:.0f}s ago -- protective stops are being kept current"),
-                "stalled": ("Trailing-stop agent heartbeat is stale", f"No heartbeat in {heartbeat_age:.0f}s -- positions may not be protected; check the standalone agent process"),
-                "error": ("Trailing-stop agent needs attention", escape((heartbeat.last_error if heartbeat else "")[:240] or "The latest agent cycle reported an error")),
-            }[agent_state]
-            render_scan_activity_banner(st, agent_state, *state_copy)
-        else:
-            warning_column, action_column = st.columns([3, 1])
-            with warning_column:
-                st.warning("Trailing-stop agent has no heartbeat yet -- start it to protect open positions.")
-            with action_column:
-                access_token = runtime_access_token(st, settings)
-                start_disabled = not broker_credentials_configured(settings) or not access_token
-                if st.button("Start agent now", icon=":material/play_arrow:", disabled=start_disabled, width="stretch"):
-                    launch_trailing_stop_agent(
-                        settings.kite_api_key,
-                        settings.kite_api_secret.get_secret_value(),
-                        access_token,
-                        repository,
-                        extra_env=trailing_agent_env_from_settings(settings),
-                    )
-                    st.rerun()
+        # A full-width banner here (the same visual treatment other pages use for their own scan
+        # status) pushed every position table below the fold on a small monitor -- the agent's
+        # status matters, but not enough to cost that much vertical space on every single render.
+        # A small badge next to the title keeps that detail one click away instead of always on.
+        status_badge_copy = {
+            "running": ("🟢", "Agent active"),
+            "stalled": ("🟡", "Heartbeat stale"),
+            "error": ("🔴", "Needs attention"),
+            "stopped": ("⚪", "Agent stopped"),
+        }[agent_state]
+        title_column, status_column = st.columns([5, 2], vertical_alignment="bottom")
+        with title_column:
+            st.title("Live monitor")
+        with status_column:
+            with st.popover(f"{status_badge_copy[0]} {status_badge_copy[1]}", width="stretch"):
+                if agent_state in {"running", "stalled", "error"}:
+                    state_copy = {
+                        "running": ("Trailing-stop agent active", f"Last heartbeat {heartbeat_age:.0f}s ago -- protective stops are being kept current"),
+                        "stalled": ("Trailing-stop agent heartbeat is stale", f"No heartbeat in {heartbeat_age:.0f}s -- positions may not be protected; check the standalone agent process"),
+                        "error": ("Trailing-stop agent needs attention", escape((heartbeat.last_error if heartbeat else "")[:240] or "The latest agent cycle reported an error")),
+                    }[agent_state]
+                    render_scan_activity_banner(st, agent_state, *state_copy)
+                else:
+                    st.warning("Trailing-stop agent has no heartbeat yet -- start it to protect open positions.")
+                    start_disabled = not broker_credentials_configured(settings) or not access_token
+                    if st.button("Start agent now", icon=":material/play_arrow:", disabled=start_disabled, width="stretch"):
+                        launch_trailing_stop_agent(
+                            settings.kite_api_key,
+                            settings.kite_api_secret.get_secret_value(),
+                            access_token,
+                            repository,
+                            extra_env=trailing_agent_env_from_settings(settings),
+                        )
+                        st.rerun()
+        st.caption(
+            "Every open LIVE-mode intraday and swing position, read straight from the database the "
+            "standalone trailing-stop agent maintains -- cross-checked against Zerodha's own "
+            "live positions so drift between the two is visible immediately. PAPER-mode positions are "
+            "simulated locally and are not shown here or managed by the trailing-stop agent."
+        )
 
         records = [record for record in repository.load_positions() if record.trading_mode == "LIVE"]
         if not records:
@@ -1608,7 +1619,6 @@ def render_live_monitor(st, settings) -> None:
                 if pd.notna(previous_stop):
                     latest_stop_move[event_row["symbol"]] = f"₹{float(previous_stop):,.2f} → ₹{float(event_row['stop_loss']):,.2f}"
 
-        access_token = runtime_access_token(st, settings)
         quotes: dict = {}
         broker_open_tradingsymbols: set[str] | None = None
         atr_values: dict[str, float] = {}
@@ -1782,9 +1792,10 @@ def render_live_monitor(st, settings) -> None:
                     width="stretch",
                     hide_index=True,
                     column_config={
-                        "Time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
-                        "From": st.column_config.NumberColumn(format="₹%.2f"),
-                        "To": st.column_config.NumberColumn(format="₹%.2f"),
+                        "Time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss", width="small"),
+                        "Symbol": st.column_config.TextColumn(width="small"),
+                        "From": st.column_config.NumberColumn(format="₹%.2f", width="small"),
+                        "To": st.column_config.NumberColumn(format="₹%.2f", width="small"),
                         "Calculation details": st.column_config.TextColumn(width="large"),
                     },
                 )
@@ -2026,8 +2037,11 @@ def render_pnl_statement(st, settings) -> None:
                         width="stretch",
                         hide_index=True,
                         column_config={
-                            "Time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
+                            "Time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss", width="small"),
+                            "Event": st.column_config.TextColumn(width="small"),
+                            "Result": st.column_config.TextColumn(width="small"),
                             "Details": st.column_config.TextColumn(width="large"),
+                            "Final P&L": st.column_config.TextColumn(width="small"),
                         },
                     )
 
@@ -3240,8 +3254,15 @@ def render_swing_auto_trading(st, settings) -> None:
     # here, so this renders once per page visit/interaction (see should_scan below for the
     # once-a-day scan gate).
     def render_swing_content() -> None:
-        st.title("Swing auto trading")
+        title_column, status_column = st.columns([5, 2], vertical_alignment="bottom")
+        with title_column:
+            st.title("Swing auto trading")
+        status_popover_slot = status_column.empty()
         st.caption("Scans completed daily candles for a fresh EMA 9 cross above EMA 200 and manages a CNC position with a Zerodha-side trailing SL-M order.")
+        # A fixed slot right under the title, instead of a fresh st.progress() created wherever
+        # the scan loop happens to sit in the page -- keeps the live scan progress next to the
+        # status badge above, rather than appearing lower down amid the strategy controls.
+        scan_progress_slot = st.empty()
         repository = get_dashboard_repository(st)
         user_id = dashboard_user_id(settings)
         selected_symbols = selected_watchlist_symbols(repository, user_id)
@@ -3389,13 +3410,19 @@ def render_swing_auto_trading(st, settings) -> None:
                 "Close a position or raise the limit above to resume scanning."
             )
         if should_scan:
+            # Written immediately, before the scan below -- the badge further down this
+            # function only gets computed and rendered *after* the (blocking) scan completes,
+            # so without this the status area looked blank for the whole scan instead of
+            # showing anything was happening.
+            with status_popover_slot.popover("🔵 Scanning...", width="stretch"):
+                st.caption(f"Scanning {selected_strategy_label}...")
             # Candle fetches run in parallel (bounded by SCAN_MAX_WORKERS, out of respect for
             # Kite's historical-data rate limit) and a qualifying candidate is submitted the
             # moment it's found, instead of after every selected stock has been scanned --
             # sequentially scanning hundreds of stocks before placing the first order could
             # mean the breakout has already moved by the time the order goes in.
             total_symbols = len(selected_symbols)
-            progress_bar = st.progress(0.0, text=f"Scanning {selected_strategy_label}: 0/{total_symbols} complete")
+            progress_bar = scan_progress_slot.progress(0.0, text=f"Scanning {selected_strategy_label}: 0/{total_symbols} complete")
             live_log: list[str] = []
             log_box = st.empty()
 
@@ -3559,12 +3586,22 @@ def render_swing_auto_trading(st, settings) -> None:
             "limit_reached": "LIMIT REACHED",
             "error": "NEEDS ATTENTION",
         }[swing_engine_state]
-        render_scan_activity_banner(
-            st,
-            "stalled" if swing_engine_state in {"limit_reached", "stopped", "scanned_today"} else swing_engine_state,
-            *state_copy,
-            badge=swing_badge,
-        )
+        # Same compact badge + click-for-detail treatment as the Live monitor and Intratrading
+        # pages -- a full-width banner here cost the same vertical space for the same reason.
+        status_icon, status_label = {
+            "running": ("🟢", "Scanner armed"),
+            "scanned_today": ("🔵", "Done for today"),
+            "stopped": ("⚪", "Scanner stopped"),
+            "limit_reached": ("🟡", "Limit reached"),
+            "error": ("🔴", "Needs attention"),
+        }[swing_engine_state]
+        with status_popover_slot.popover(f"{status_icon} {status_label}", width="stretch"):
+            render_scan_activity_banner(
+                st,
+                "stalled" if swing_engine_state in {"limit_reached", "stopped", "scanned_today"} else swing_engine_state,
+                *state_copy,
+                badge=swing_badge,
+            )
         swing_cycle_log = st.session_state.get("swing_cycle_log", [])
         if swing_cycle_log:
             with st.expander("Recent scan cycles", expanded=False):
@@ -4567,8 +4604,15 @@ def render_risk_settings(st, settings) -> None:
 
 
 def render_automatic_trading(st, settings) -> None:
-    st.title("Intratrading")
+    title_column, status_column = st.columns([5, 2], vertical_alignment="bottom")
+    with title_column:
+        st.title("Intratrading")
+    status_popover_slot = status_column.empty()
     st.caption("Automatic entries use the selected strategy, score threshold, risk gates, and activity ledger as the manual signal page.")
+    # A fixed slot right under the title, instead of a fresh st.progress() created wherever the
+    # scan loop happens to sit in the page -- keeps the live scan progress next to the status
+    # badge above, rather than appearing lower down amid the strategy/filter controls.
+    scan_progress_slot = st.empty()
     repository = get_dashboard_repository(st)
     strategy_options = load_dashboard_strategy_options(repository, include_pre_spike=True, include_previous_day_high=True)
     strategy_labels = list(strategy_options)
@@ -4700,6 +4744,12 @@ def render_automatic_trading(st, settings) -> None:
         in the final result are still ranked to the top 5 for the on-screen summary table, but
         that ranking no longer gates what gets submitted.
         """
+        # Written directly (not via the render_automatic_status fragment below) so it's actually
+        # visible the instant a scan starts -- a fragment's own output doesn't reliably flush
+        # into a container created outside it while this function then blocks for the whole
+        # scan, which is why the badge previously looked blank until the cycle finished.
+        with status_popover_slot.popover("🔵 Scanning...", width="stretch"):
+            st.caption(f"Scanning {selected_strategy}...")
         token_by_symbol = {symbol: token for token, symbol in token_to_symbol.items()}
         run_started_at = datetime.now()
         status_caption = st.empty()
@@ -4748,6 +4798,14 @@ def render_automatic_trading(st, settings) -> None:
                     st.session_state.automatic_last_error = message
                     record_automatic_cycle(f"{datetime.now().strftime('%I:%M:%S %p')} — scan halted: {message}")
                     return
+                if not pipeline.limits.can_trade():
+                    message = (
+                        f"daily trade limit already reached ({pipeline.limits.trades}/{settings.max_trades_per_day} trades today); "
+                        "scan halted for this cycle -- raise the limit on the Risk & settings page if you want to trade more today"
+                    )
+                    st.session_state.automatic_last_error = message
+                    record_automatic_cycle(f"{datetime.now().strftime('%I:%M:%S %p')} — scan halted: {message}")
+                    return
 
             if uses_market_filters or uses_market_confirmation:
                 status_caption.caption("Loading NIFTY 50 market regime...")
@@ -4771,7 +4829,7 @@ def render_automatic_trading(st, settings) -> None:
             status_caption.empty()
             symbols = list(token_to_symbol.values())
             total_symbols = len(symbols)
-            progress_bar = st.progress(0.0, text=f"Scanning {selected_strategy}: 0/{total_symbols} complete")
+            progress_bar = scan_progress_slot.progress(0.0, text=f"Scanning {selected_strategy}: 0/{total_symbols} complete")
 
             scanner = StrategySignalScanner(buy_limit=5, sell_limit=5, minimum_score=int(getattr(strategy, "minimum_score", 80)))
             entry_window_open = settings.entry_start <= datetime.now().time() <= settings.entry_end
@@ -4794,6 +4852,15 @@ def render_automatic_trading(st, settings) -> None:
                     symbol = futures[future]
                     completed += 1
                     progress_bar.progress(completed / total_symbols if total_symbols else 1.0, text=f"Scanning {selected_strategy}: {completed}/{total_symbols} complete")
+                    # A trade taken earlier in this very cycle can push the daily limit to its
+                    # cap mid-scan (the pre-scan check above only catches it if it was already
+                    # hit before this cycle started) -- once that happens, every remaining
+                    # candle fetch that already completed would just be evaluated and rejected
+                    # one by one, so stop consuming results the moment it's detected instead of
+                    # spamming the same "daily trade limit reached" rejection per symbol.
+                    if execute_entries and not pipeline.limits.can_trade():
+                        log_line(f"Daily trade limit reached ({pipeline.limits.trades}/{settings.max_trades_per_day}) -- stopping this scan early.")
+                        break
                     try:
                         candles, confirmation = future.result()
                     except Exception as error:
@@ -4971,12 +5038,23 @@ def render_automatic_trading(st, settings) -> None:
             "stalled": "STALLED",
             "error": "NEEDS ATTENTION",
         }[automatic_engine_state]
-        render_scan_activity_banner(
-            st,
-            "stalled" if automatic_engine_state in {"stalled", "stopped"} else automatic_engine_state,
-            *state_copy,
-            badge=automatic_badge,
-        )
+        # A full-width banner here cost the same vertical space as the Live monitor page's own
+        # agent-status banner did, for the same reason: worth knowing, not worth pushing every
+        # strategy/filter control down the page on every single render. See render_live_monitor
+        # for the same compact badge + click-for-detail treatment.
+        status_icon, status_label = {
+            "running": ("🟢", "Auto trade armed"),
+            "stopped": ("⚪", "Auto trade stopped"),
+            "stalled": ("🟡", "Heartbeat stale"),
+            "error": ("🔴", "Needs attention"),
+        }[automatic_engine_state]
+        with status_popover_slot.popover(f"{status_icon} {status_label}", width="stretch"):
+            render_scan_activity_banner(
+                st,
+                "stalled" if automatic_engine_state in {"stalled", "stopped"} else automatic_engine_state,
+                *state_copy,
+                badge=automatic_badge,
+            )
 
     render_automatic_status()
 

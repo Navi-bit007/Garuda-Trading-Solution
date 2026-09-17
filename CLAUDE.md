@@ -19,6 +19,58 @@ Newest first. Each entry: what was asked, what changed, and the files touched.
 
 ---
 
+### 2026-09-17 — Intratrading scan kept evaluating/rejecting every symbol after the daily limit was hit
+**Asked:** Confirmed the daily-trade-limit validation itself was working (every rejection
+correctly showed "daily trade limit reached (5/5 trades today)"), but the scan kept running
+through the rest of the universe anyway, rejecting one symbol at a time.
+**What changed:** Added the same early-halt pattern already used for `max_open_positions`
+(see `run_automatic_cycle`'s docstring) for the daily trade limit too: if the limit is already
+reached before a scan cycle starts, the cycle halts immediately instead of scanning 600+ stocks
+for nothing. Also added a mid-scan check so if the limit is reached partway through the same
+cycle (e.g. the 5th trade lands mid-scan), the result-processing loop stops consuming further
+candle-fetch results instead of evaluating/rejecting every remaining symbol one by one.
+**Files:** `dashboard/app.py` (`run_automatic_cycle`).
+
+---
+
+### 2026-09-17 — Same compact status badge extended to Intratrading and Swing auto trading
+**Asked:** Liked the Live monitor badge/popover approach; wanted it on the Intraday
+(`render_automatic_trading`, page title "Intratrading") and Swing (`render_swing_auto_trading`)
+pages too, and the scan progress bar moved.
+**What changed:** Both pages' full-width `render_scan_activity_banner` status banners are now a
+compact badge next to the page title (🟢/🟡/🔴/⚪/🔵 + short label via `st.popover`, full detail on
+click). Each page's scan progress bar now renders into a fixed `st.empty()` slot reserved right
+under the title (via `scan_progress_slot`), instead of a fresh `st.progress()` created wherever
+the scan loop happened to sit further down the page.
+**Files:** `dashboard/app.py` (`render_automatic_trading`/`render_automatic_status`,
+`render_swing_auto_trading`/`render_swing_content`).
+_Follow-up:_ the badge looked blank for the whole duration of a scan on both pages. Root cause
+differed per page: on Intratrading, the badge is written from inside a `@st.fragment`, which
+doesn't reliably flush into a container created outside it while the same function then blocks
+for the scan; on Swing, the status-computation code textually sits *after* the (blocking) scan
+block, so it simply hadn't executed yet. Fixed by writing a plain, non-fragment "🔵 Scanning..."
+state directly into the badge slot the instant each scan starts (same proven technique the
+already-working progress bar uses).
+
+### 2026-09-17 — Narrower columns so the calculation/details text has room
+**Asked:** In the Live monitor "SL-M stop updates" table and the P&L page's "Trade activity"
+table, give the long text column (Calculation details / Details) max width and shrink the rest.
+**What changed:** Set `width="small"` on Time/Symbol/From/To (Live monitor) and
+Time/Event/Result/Final P&L (P&L page), keeping `width="large"` on the text column. These are
+just defaults -- columns stay user-resizable by dragging in the UI.
+**Files:** `dashboard/app.py` (both `st.dataframe` column_config blocks).
+
+### 2026-09-17 — Live monitor's agent-status banner took too much vertical space
+**Asked:** The full-width "Trailing-stop agent active" banner (with pulse animation) pushed the
+position tables down on every render; wanted something compact next to the page title instead.
+**What changed:** Replaced the always-visible banner with a small badge next to the "Live
+monitor" title (🟢 Agent active / 🟡 Heartbeat stale / 🔴 Needs attention / ⚪ Agent stopped) using
+`st.popover` — the full detail (and the "Start agent now" button when stopped) still renders
+exactly as before, just inside the popover instead of always on the page.
+**Files:** `dashboard/app.py` (`render_live_monitor`).
+
+---
+
 ### 2026-09-17 — Daily trade limit only counted closed trades, not entries taken
 **Asked:** Max trades/day = 5, but a 6th signal (DLINKINDIA) was still sent to the broker with
 3 trades closed + 2 open that day.

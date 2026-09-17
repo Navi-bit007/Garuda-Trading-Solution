@@ -22702,3 +22702,7 @@ kiteconnect.exceptions.NetworkException: Too many requests
 2026-09-17 13:39:57,584 INFO Trailing stop agent started
 2026-09-17 13:39:58,106 INFO broker_exit_detected NSE:CEATLTD side=SELL price=3375.20 pnl=84.50
 2026-09-17 13:51:04,762 INFO NSE:APARINDS reached target 1 (17560.73); stop now floors at breakeven
+2026-09-17 14:22:38,287 INFO Trailing stop agent started
+2026-09-17 14:30:45,553 INFO Trailing stop agent started
+2026-09-17 14:39:27,794 INFO Trailing stop agent started
+2026-09-17 14:45:46,478 INFO broker_exit_detected NSE:APARINDS side=SELL price=17717.00 pnl=341.00

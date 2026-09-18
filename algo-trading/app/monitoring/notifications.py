@@ -36,6 +36,19 @@ class Notifier:
             self.logger.warning("notification delivery failed: %s", error)
 
 
+def notifier_from_settings(settings) -> Notifier:
+    """Build a `Notifier` from a `Settings` instance's `enable_telegram`/`telegram_bot_token`/
+    `telegram_chat_id` fields. Shared by every caller that owns a `Settings` object
+    (`TradingPipeline`, `SwingAutoTrader`, ...) so the `SecretStr`-unwrapping logic lives in one
+    place instead of being duplicated at each construction site."""
+    bot_token = getattr(settings, "telegram_bot_token", "")
+    return Notifier(
+        bool(getattr(settings, "enable_telegram", False)),
+        bot_token.get_secret_value() if hasattr(bot_token, "get_secret_value") else str(bot_token),
+        str(getattr(settings, "telegram_chat_id", "")),
+    )
+
+
 def notification_message(notification: NotificationRecord) -> str:
     return (
         f"{notification.side} signal: {notification.symbol} at {notification.signal_timestamp:%Y-%m-%d %H:%M} "

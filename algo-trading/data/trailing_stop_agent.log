@@ -22714,3 +22714,85 @@ kiteconnect.exceptions.NetworkException: Too many requests
 2026-09-18 09:34:56,842 INFO NSE:ACE reached target 1 (1229.94); stop now floors at breakeven
 2026-09-18 09:43:29,690 INFO broker_exit_detected NSE:ABB side=SELL price=7240.50 pnl=-99.00
 2026-09-18 09:44:15,166 INFO broker_exit_detected NSE:PVRINOX side=SELL price=1296.06 pnl=-38.10
+2026-09-18 12:03:50,769 INFO broker_exit_detected NSE:ACE side=SELL price=1223.60 pnl=159.90
+2026-09-18 12:16:54,547 INFO NSE:BELRISE reached target 1 (234.32); stop now floors at breakeven
+2026-09-18 12:50:04,424 INFO broker_exit_detected NSE:BELRISE side=SELL price=234.30 pnl=114.75
+2026-09-18 12:59:40,447 ERROR Broker position lookup failed during swing reconciliation
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 788, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 534, in _make_request
+    response = conn.getresponse()
+               ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connection.py", line 571, in getresponse
+    httplib_response = super().getresponse()
+                       ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1430, in getresponse
+    response.begin()
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 331, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 300, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\adapters.py", line 696, in send
+    resp = conn.urlopen(
+           ^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 842, in urlopen
+    retries = retries.increment(
+              ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\util\retry.py", line 498, in increment
+    raise reraise(type(error), error, _stacktrace)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\util\util.py", line 38, in reraise
+    raise value.with_traceback(tb)
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 788, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connectionpool.py", line 534, in _make_request
+    response = conn.getresponse()
+               ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\urllib3\connection.py", line 571, in getresponse
+    httplib_response = super().getresponse()
+                       ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 1430, in getresponse
+    response.begin()
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 331, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\http\client.py", line 300, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+urllib3.exceptions.ProtocolError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\SankaranAngamuthu\OneDrive - VistaVu Solutions\_Vistavu Files\Claude\Algo Trading\Garuda-Trading-Solution\algo-trading\app\execution\trailing_stop_agent.py", line 636, in _reconcile_swing_positions
+    broker_positions = self.broker_client.positions().get("net", [])
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 500, in positions
+    return self._get("portfolio.positions")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 916, in _get
+    return self._request(route, "GET", url_args=url_args, params=params, is_json=is_json)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 971, in _request
+    raise e
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\kiteconnect\connect.py", line 959, in _request
+    r = self.reqsession.request(method,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\sessions.py", line 651, in request
+    resp = self.send(prep, **send_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\sessions.py", line 784, in send
+    r = adapter.send(request, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\SankaranAngamuthu\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\adapters.py", line 711, in send
+    raise ConnectionError(err, request=request)
+requests.exceptions.ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+2026-09-18 13:16:48,719 INFO NSE:BHARTIHEXA reached target 1 (1515.80); stop now floors at breakeven

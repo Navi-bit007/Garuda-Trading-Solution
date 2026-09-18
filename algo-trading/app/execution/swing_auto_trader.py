@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_FLOOR
 from math import floor
 from time import monotonic, sleep
-from typing import Callable
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -13,6 +13,7 @@ from app.broker.order_api import OrderAPI, OrderRequest
 from app.config.constants import NSE_TICK_SIZE, Side, TradingMode
 from app.database.models import PositionRecord, TradeRecord
 from app.database.repository import Repository
+from app.monitoring.notifications import Notifier, notifier_from_settings
 from app.strategy.base import NoSignal
 from app.strategy.ema_9_200_swing import Ema9200SwingEvaluation, Ema9200SwingStrategy
 from app.strategy.signal import Signal
@@ -101,6 +102,7 @@ class SwingAutoTrader:
         trailing_atr_multiplier: float = 2.0,
         strategy_name: str = "EMA 9/200 swing",
         repository: Repository | None = None,
+        settings: Any = None,
     ):
         if trailing_atr_multiplier <= 0:
             raise ValueError("trailing ATR multiplier must be positive")
@@ -111,6 +113,7 @@ class SwingAutoTrader:
         self.strategy = Ema9200SwingStrategy()
         self.orders = OrderAPI(mode, client)
         self.repository = repository
+        self.notifier = notifier_from_settings(settings) if settings is not None else Notifier()
         self.tick_sizes: dict[int, float] = {}
         self.active_positions: dict[str, SwingPosition] = {}
         self.submitted_signal_keys: set[str] = set()
@@ -380,7 +383,11 @@ class SwingAutoTrader:
                 exit_price = self._broker_exit_fill_price(position)
                 del self.active_positions[symbol]
                 self._delete_position(symbol)
-                self._record_trade_history(position, position.quantity, exit_price, "broker-side position closed (protective stop or manual exit)")
+                exit_reason = "broker-side position closed (protective stop or manual exit)"
+                self._record_trade_history(position, position.quantity, exit_price, exit_reason)
+                self.notifier.send(
+                    f"swing_exit_broker_detected {symbol} side=SELL price={exit_price} reason={exit_reason}"
+                )
 
     def _broker_exit_fill_price(self, position: SwingPosition) -> float:
         order_id = position.protective_order_id
@@ -458,6 +465,9 @@ class SwingAutoTrader:
             strategy_name=self.strategy_name,
         )
         self._save_position(self.active_positions[candidate.symbol])
+        self.notifier.send(
+            f"swing_entry_submitted {candidate.symbol} side=BUY qty={quantity} price={signal.price} reason=stop_loss={stop_loss}"
+        )
 
     def _save_position(self, position: SwingPosition) -> None:
         if self.repository is None:

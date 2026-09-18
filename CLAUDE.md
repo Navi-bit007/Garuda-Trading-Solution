@@ -19,6 +19,65 @@ Newest first. Each entry: what was asked, what changed, and the files touched.
 
 ---
 
+### 2026-09-18 — Telegram blocked by corporate IT; disabled again after confirming
+**Asked:** Send a live test notification to confirm the Telegram integration end-to-end.
+
+**Found:** `notifier.send(...)` to `api.telegram.org` failed with
+`SSL: CERTIFICATE_VERIFY_FAILED -- self-signed certificate in certificate chain`, while the
+same machine's HTTPS call to `api.kite.trade` succeeded normally. That's the signature of a
+corporate proxy specifically intercepting/blocking Telegram's domain (not a general network or
+code issue) -- confirmed by the user: IT does block Telegram on this network. Did not disable
+TLS certificate verification to force it through, since that would silently defeat a real
+security control.
+
+**What changed:** `.env`: `ENABLE_TELEGRAM` set back to `false` (bot token/chat ID left in
+place, unused while disabled, so they don't need to be re-entered if this is ever tried again
+from an unrestricted network). Dashboard restarted to pick up the change.
+`Notifier.send()` already no-ops immediately when `enabled` is `False`, so no code change was
+needed -- alerts are simply inert now, and the entry/trail/close notify call sites added earlier
+today stay in place for whenever Telegram access is available.
+
+**Files:** `.env`.
+
+---
+
+### 2026-09-18 — Telegram alerts extended to swing trades and manual exits; real credentials wired in
+**Asked:** Whether WhatsApp notifications were possible (answered: yes, but Telegram is free
+and already built in, so pursued that instead), then to configure Telegram (BotFather steps
+explained) and wire up alerts for three events: a new trade taken, SL-M stop moved, and a trade
+closed, using supplied real bot credentials.
+
+**Found:** Two of the three events were already fully wired for intraday
+(`trading_pipeline.py`) and the standalone trailing-stop agent (`trailing_stop_agent.py` +
+`exit_actions.py`) — entry, stop-trailing, and close all already call `Notifier.send(...)`.
+The gaps were narrower than expected: `SwingAutoTrader` had no `Notifier` at all (no alert on a
+swing entry or a broker-detected swing close), and the dashboard's Live Monitor manual "Exit
+position" button called `close_position_at_market(...)` without passing `notifier=`, so manual
+exits never alerted even though the helper already supported it. Also, `ENABLE_TELEGRAM` was
+`false` with empty credentials in `.env`, so even the already-wired paths were silent no-ops.
+
+**What changed:**
+- `.env`: `ENABLE_TELEGRAM=true`, real `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` filled in.
+- Extracted the duplicated `Settings` → `Notifier` construction (the `SecretStr`-unwrapping
+  ternary) into a shared `notifier_from_settings(settings)` helper in
+  `app/monitoring/notifications.py`; `trading_pipeline.py` and `dashboard/app.py`'s
+  `record_signal_notifications` now use it instead of duplicating the logic.
+- `SwingAutoTrader` now takes an optional `settings` constructor param, builds `self.notifier`
+  from it (or a disabled `Notifier()` if omitted), and sends alerts from `_register_position`
+  (`swing_entry_submitted`, on every new swing entry) and `sync_broker_positions`
+  (`swing_exit_broker_detected`, on every broker-detected swing close).
+- `dashboard/app.py`: `create_swing_auto_trader(...)` and both its call sites now pass
+  `settings=settings` through to `SwingAutoTrader`; `render_manual_exit_action` now passes
+  `notifier=notifier_from_settings(settings)` into `close_position_at_market(...)` so manual
+  Live-Monitor exits alert the same way automated/agent exits already do.
+
+**Files:** `.env`, `app/monitoring/notifications.py`, `app/execution/swing_auto_trader.py`,
+`app/execution/trading_pipeline.py`, `dashboard/app.py`, `tests/test_swing_auto_trader.py` (new
+`test_swing_trader_sends_telegram_alerts_on_entry_and_broker_detected_close`). Full suite:
+299 passed.
+
+---
+
 ### 2026-09-17 — Intratrading scan kept evaluating/rejecting every symbol after the daily limit was hit
 **Asked:** Confirmed the daily-trade-limit validation itself was working (every rejection
 correctly showed "daily trade limit reached (5/5 trades today)"), but the scan kept running

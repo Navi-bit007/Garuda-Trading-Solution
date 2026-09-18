@@ -9,8 +9,18 @@ from app.config.constants import TradingMode
 from app.database.database import Database
 from app.database.repository import Repository
 from app.execution.swing_auto_trader import SwingAutoTrader
+from app.monitoring.notifications import Notifier
 from app.strategy.base import NoSignal
 from app.strategy.ema_9_200_swing import Ema9200SwingStrategy
+
+
+class RecordingNotifier(Notifier):
+    def __init__(self):
+        super().__init__(enabled=True)
+        self.sent: list[str] = []
+
+    def send(self, message: str) -> None:
+        self.sent.append(message)
 
 
 def swing_frame(last_close: float = 130.0, rows: int = 201) -> pd.DataFrame:
@@ -324,3 +334,27 @@ def test_swing_trader_persists_position_lifecycle_when_repository_is_supplied(tm
     assert trade.quantity == 7
     database.close()
     assert len(client.requests) == 2
+
+
+def test_swing_trader_sends_telegram_alerts_on_entry_and_broker_detected_close(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    client = StubKiteClient()
+    trader = SwingAutoTrader(client, TradingMode.LIVE, repository=repository)
+    trader.notifier = RecordingNotifier()
+    candidate = trader.scan({"NSE:AAA": 1}, lambda token: swing_frame()).candidates[0]
+
+    order_result = trader.submit_candidate(candidate, amount_limit=1_000, quantity_limit=10)
+    assert order_result.status == "submitted"
+    assert len(trader.notifier.sent) == 1
+    assert "swing_entry_submitted" in trader.notifier.sent[0]
+    assert "NSE:AAA" in trader.notifier.sent[0]
+
+    client.holding_quantities = [0]
+    trader.sync_broker_positions()
+
+    assert len(trader.notifier.sent) == 2
+    assert "swing_exit_broker_detected" in trader.notifier.sent[1]
+    assert "NSE:AAA" in trader.notifier.sent[1]
+    database.close()

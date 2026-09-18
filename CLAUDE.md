@@ -52,6 +52,54 @@ block, so it simply hadn't executed yet. Fixed by writing a plain, non-fragment 
 state directly into the badge slot the instant each scan starts (same proven technique the
 already-working progress bar uses).
 
+### 2026-09-18 — Intratrading badge stuck on "Scanning..." even after a halt
+**Asked:** The "Recent scan cycles" log correctly showed "scan halted: insufficient broker
+margin...", but the status badge next to the title stayed on "🔵 Scanning..." indefinitely.
+**Root cause:** The "Scanning..." badge is written directly (not via the status fragment) so
+it's visible immediately when a scan starts, but nothing corrected it back afterwards -- an
+early-return halt, an exception, or even a normal completion (scan-only mode, entry window
+closed) all left it stuck until the status fragment's own 300s timer happened to fire.
+**Fix:** Added a `halt_scan()` helper that writes the corrected "🔴 Needs attention" badge (with
+the error message) the instant any halt fires, used by all three halt checks plus the cycle's
+exception handler. For normal completions, `render_automatic_status()` is called again right
+after `run_automatic_cycle()` returns (both the manual "Scan only" click and the 300s scheduler),
+which re-renders the badge from the same already-correct state logic instead of leaving it stale.
+**Files:** `dashboard/app.py` (`run_automatic_cycle`, `render_automatic_trading`).
+
+### 2026-09-18 — Check broker margin before scanning, halt and alert if insufficient
+**Asked:** A trade was rejected at the broker for insufficient funds -- can the app check the
+account balance itself and stop the scan / alert the user instead of discovering it one
+rejected order at a time?
+**What changed:** New `OrderAPI.available_margin()` calls Kite's `margins("equity")` endpoint
+and returns the `net` figure (the same "available margin" number the Zerodha UI shows), `None`
+in PAPER mode or on any failure. Both Intratrading (`run_automatic_cycle`) and Swing auto
+trading (`render_swing_content`) now check this once before a scan (not per-symbol) and halt
+immediately with a clear message if the available margin is below the configured
+capital-per-position limit -- surfaced the same way the existing max-open-positions/daily-limit
+halts already are (red "Needs attention" badge, one alert, no wasted per-symbol scanning).
+**Files:** `app/broker/order_api.py` (`available_margin`), `dashboard/app.py`
+(`run_automatic_cycle`, `render_swing_content`), `tests/test_order_api.py` (new).
+
+### 2026-09-18 — Duplicate trade records from two independent reconcilers racing
+**Asked:** Investigating why the daily-trade-limit scan kept running, found NSE:ABB and
+NSE:PVRINOX each recorded as CLOSED *twice* in the P&L page with identical entry/exit price but
+different exit reasons, ~1 second apart. (Separately: also found two independent
+`streamlit run dashboard/app.py` server processes running against the same DB — stopped one.)
+**Root cause:** The standalone trailing-stop agent reconciles *every* LIVE position in the
+shared `positions` table with no ownership boundary; the dashboard's own `TradingPipeline`
+(Intratrading page) and `SwingAutoTrader` (Swing page) *also* independently poll the broker and
+reconcile the same shared table via their own `sync_broker_positions()`. Neither knows about the
+other, so both can detect and record the same broker-side close.
+**Fix:** Both `TradingPipeline.sync_broker_positions()` and `SwingAutoTrader.sync_broker_positions()`
+now re-check whether the position still exists in the DB `positions` table immediately before
+writing a trade/activity record for a detected close. If it's already gone (someone else already
+reconciled it), they only clean up their own in-memory tracking instead of writing a duplicate
+trade record. This is a symptom-level fix, not a structural one — it's directly related to the
+multi-user architecture gap under discussion (no per-user/per-instance ownership of positions);
+a proper fix will fall out of that redesign.
+**Files:** `app/execution/trading_pipeline.py` (`sync_broker_positions`),
+`app/execution/swing_auto_trader.py` (`sync_broker_positions`).
+
 ### 2026-09-17 — Narrower columns so the calculation/details text has room
 **Asked:** In the Live monitor "SL-M stop updates" table and the P&L page's "Trade activity"
 table, give the long text column (Calculation details / Details) max width and shrink the rest.

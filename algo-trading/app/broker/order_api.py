@@ -123,6 +123,24 @@ class OrderAPI:
         margin_per_share = float(response[0]["total"])
         return margin_per_share if margin_per_share > 0 else None
 
+    def available_margin(self) -> float | None:
+        """Ask the broker for the real available equity-segment margin right now, via Kite's
+        margins() endpoint -- so a scan can halt itself (and alert the user) before submitting
+        orders that would just get rejected by the broker for insufficient funds, instead of
+        discovering that one rejected order at a time. `net` is Zerodha's own "what's actually
+        free to trade with" figure (opening balance plus payins minus whatever's already
+        utilised), the same number the Zerodha Kite UI shows as available margin. Returns None
+        if the client can't answer (PAPER mode, no client, or the endpoint call fails) so
+        callers can fall back to their own configured capital assumption.
+        """
+        if self.client is None or not hasattr(self.client, "margins"):
+            return None
+        try:
+            response = self.client.margins("equity")
+            return float(response["net"])
+        except Exception:
+            return None
+
     def register_tick_size(self, symbol: str, tick_size: float) -> None:
         exchange, tradingsymbol = self._split_symbol(symbol, "NSE")
         if tick_size <= 0:

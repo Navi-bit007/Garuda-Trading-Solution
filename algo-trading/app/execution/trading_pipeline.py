@@ -268,6 +268,20 @@ class TradingPipeline:
             if broker_quantity != 0:
                 self._reconcile_entry_price(symbol, managed, broker_position)
                 continue
+            if self.activity_repository is not None and hasattr(self.activity_repository, "load_positions"):
+                # The standalone trailing-stop agent reconciles every LIVE position in the same
+                # shared `positions` table independently of this dashboard session -- if it's
+                # already detected and recorded this exact close (deleting the row), doing so
+                # again here would write a second, duplicate trades/activity row for the same
+                # close (confirmed live: two near-simultaneous rows a second apart, same entry/
+                # exit price, different exit_reason text). Only clean up this session's own
+                # in-memory tracking in that case, so position/capital counts stay accurate
+                # without re-recording history someone else already recorded.
+                still_tracked = any(record.symbol == symbol for record in self.activity_repository.load_positions())
+                if not still_tracked:
+                    self.positions.remove(symbol)
+                    del self.managed_positions[symbol]
+                    continue
             exit_price, exit_order_id, fill_reason = self._broker_exit_fill(managed)
             reason = f"broker-side position closed; {fill_reason}"
             pnl = managed.position.unrealized_pnl(exit_price)

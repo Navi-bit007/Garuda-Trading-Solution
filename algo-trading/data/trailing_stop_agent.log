@@ -22709,3 +22709,8 @@ kiteconnect.exceptions.NetworkException: Too many requests
 2026-09-17 15:29:37,154 INFO Re-armed protective stop for NSE:JUBLPHARMA at 961.80 (order 260917191482438)
 2026-09-17 15:40:08,497 INFO Past today's shutdown time (15:40:00); trailing stop agent is exiting for the day
 2026-09-17 15:40:08,908 INFO Trailing stop agent shut down for the day; exiting process
+2026-09-18 09:28:08,563 INFO Trailing stop agent started
+2026-09-18 09:28:09,459 INFO Re-armed protective stop for NSE:JUBLPHARMA at 961.80 (order 260918190139564)
+2026-09-18 09:34:56,842 INFO NSE:ACE reached target 1 (1229.94); stop now floors at breakeven
+2026-09-18 09:43:29,690 INFO broker_exit_detected NSE:ABB side=SELL price=7240.50 pnl=-99.00
+2026-09-18 09:44:15,166 INFO broker_exit_detected NSE:PVRINOX side=SELL price=1296.06 pnl=-38.10

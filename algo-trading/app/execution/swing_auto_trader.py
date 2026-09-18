@@ -367,6 +367,16 @@ class SwingAutoTrader:
         for symbol in list(self.active_positions):
             if self._tradingsymbol(symbol) not in open_symbols:
                 position = self.active_positions[symbol]
+                # The standalone trailing-stop agent reconciles every LIVE swing position in the
+                # same shared `positions` table independently of this session -- if it already
+                # detected and recorded this exact close (deleting the row), doing so again here
+                # would write a second, duplicate trades/activity row for the same close. Only
+                # drop this session's own in-memory tracking in that case.
+                if self.repository is not None and not any(
+                    record.symbol == symbol for record in self.repository.load_positions()
+                ):
+                    del self.active_positions[symbol]
+                    continue
                 exit_price = self._broker_exit_fill_price(position)
                 del self.active_positions[symbol]
                 self._delete_position(symbol)

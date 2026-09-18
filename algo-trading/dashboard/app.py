@@ -3403,12 +3403,29 @@ def render_swing_auto_trading(st, settings) -> None:
         # orders, auto mode stops scanning until the next day. The "Scan" button can still force
         # a rescan at any time regardless of whether today's auto scan already ran.
         already_scanned_today = st.session_state.get("swing_last_scan_day") == scan_day
-        should_scan = (manual_scan or (auto_enabled and not already_scanned_today)) and not position_limit_reached
+        scan_requested = manual_scan or (auto_enabled and not already_scanned_today)
+        insufficient_margin_message = None
+        if scan_requested and not position_limit_reached:
+            # Checked once, only when a scan is actually about to run (not on every idle page
+            # render) -- a signal passing every other gate can still get rejected by Zerodha
+            # itself for insufficient funds, since none of those gates know the real account
+            # balance. Catching it here stops the scan and surfaces one clear alert instead of
+            # discovering it order-by-order deep into the scan.
+            available_margin = trader.orders.available_margin()
+            if available_margin is not None and available_margin < amount_limit:
+                insufficient_margin_message = (
+                    f"insufficient broker margin (₹{available_margin:,.0f} available, need at least "
+                    f"₹{amount_limit:,.0f} for one position at the configured swing capital limit)"
+                )
+                st.session_state.swing_last_error = insufficient_margin_message
+        should_scan = scan_requested and not position_limit_reached and not insufficient_margin_message
         if manual_scan and position_limit_reached:
             st.warning(
                 f"Scan skipped: {open_swing_positions}/{int(max_open_swing_positions)} swing positions are already open. "
                 "Close a position or raise the limit above to resume scanning."
             )
+        elif manual_scan and insufficient_margin_message:
+            st.warning(f"Scan skipped: {insufficient_margin_message}. Add funds or lower the limit on the Risk & settings page.")
         if should_scan:
             # Written immediately, before the scan below -- the badge further down this
             # function only gets computed and rendered *after* the (blocking) scan completes,
@@ -4750,6 +4767,17 @@ def render_automatic_trading(st, settings) -> None:
         # scan, which is why the badge previously looked blank until the cycle finished.
         with status_popover_slot.popover("🔵 Scanning...", width="stretch"):
             st.caption(f"Scanning {selected_strategy}...")
+
+        def halt_scan(message: str) -> None:
+            # Ends the cycle *and* corrects the badge immediately -- an early return alone left
+            # the "🔵 Scanning..." badge above stuck until the next fragment refresh (up to
+            # 300s), even though the scan had already halted with an error, which is exactly
+            # what looked like a stuck/confusing "still scanning" state.
+            st.session_state.automatic_last_error = message
+            record_automatic_cycle(f"{datetime.now().strftime('%I:%M:%S %p')} — scan halted: {message}")
+            with status_popover_slot.popover("🔴 Needs attention", width="stretch"):
+                st.error(message)
+
         token_by_symbol = {symbol: token for token, symbol in token_to_symbol.items()}
         run_started_at = datetime.now()
         status_caption = st.empty()
@@ -4791,20 +4819,29 @@ def render_automatic_trading(st, settings) -> None:
             if execute_entries and pipeline is not None:
                 open_position_count = len(pipeline.managed_positions)
                 if open_position_count >= settings.max_open_positions:
-                    message = (
+                    halt_scan(
                         f"maximum open positions already reached ({open_position_count}/{settings.max_open_positions}); "
                         "scan halted for this cycle -- close a position or raise the limit on the Risk & settings page"
                     )
-                    st.session_state.automatic_last_error = message
-                    record_automatic_cycle(f"{datetime.now().strftime('%I:%M:%S %p')} — scan halted: {message}")
                     return
                 if not pipeline.limits.can_trade():
-                    message = (
+                    halt_scan(
                         f"daily trade limit already reached ({pipeline.limits.trades}/{settings.max_trades_per_day} trades today); "
                         "scan halted for this cycle -- raise the limit on the Risk & settings page if you want to trade more today"
                     )
-                    st.session_state.automatic_last_error = message
-                    record_automatic_cycle(f"{datetime.now().strftime('%I:%M:%S %p')} — scan halted: {message}")
+                    return
+                # Confirmed live: a signal passing every risk gate above can still get rejected
+                # by Zerodha itself with an insufficient-funds error, since none of those gates
+                # know the real account balance -- only the broker does. Checking it once here
+                # (instead of discovering it one rejected order at a time, deep into a 600+
+                # stock scan) stops the scan immediately and surfaces one clear alert.
+                available_margin = pipeline.orders.available_margin()
+                if available_margin is not None and available_margin < intraday_capital_limit:
+                    halt_scan(
+                        f"insufficient broker margin (₹{available_margin:,.0f} available, need at least "
+                        f"₹{intraday_capital_limit:,.0f} for one position at the configured capital-per-position limit); "
+                        "scan halted for this cycle -- add funds or lower the limit on the Risk & settings page"
+                    )
                     return
 
             if uses_market_filters or uses_market_confirmation:
@@ -4995,7 +5032,8 @@ def render_automatic_trading(st, settings) -> None:
             logger.exception("Automatic scan/entry cycle failed")
             status_caption.empty()
             st.session_state.automatic_last_error = str(error)
-            st.error(f"Automatic scan could not be completed: {error}")
+            with status_popover_slot.popover("🔴 Needs attention", width="stretch"):
+                st.error(f"Automatic scan could not be completed: {error}")
 
     @st.fragment(run_every="300s")
     def render_automatic_status() -> None:
@@ -5060,6 +5098,12 @@ def render_automatic_trading(st, settings) -> None:
 
     if manual_scan_clicked:
         run_automatic_cycle(False)
+        # A halt/exception already corrects the badge immediately (see halt_scan above), but a
+        # *normal* completion (scan-only mode, or the entry window being closed) doesn't -- this
+        # re-render, using the same state logic, is what clears a stale "🔵 Scanning..." badge
+        # for those cases too, right after this same click instead of waiting on the fragment's
+        # own 300s timer.
+        render_automatic_status()
 
     @st.fragment(run_every="300s")
     def automatic_scheduler_fragment():
@@ -5075,6 +5119,8 @@ def render_automatic_trading(st, settings) -> None:
             run_automatic_cycle(True)
             if st.session_state.get("automatic_last_error") != error_before:
                 st.rerun()
+            else:
+                render_automatic_status()
         else:
             st.caption("Scheduler is idle until auto trade is started.")
 

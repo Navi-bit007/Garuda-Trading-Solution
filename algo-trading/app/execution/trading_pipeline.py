@@ -20,7 +20,7 @@ from app.execution.trailing_stop import TrailingStop
 from app.market.candles import TickCandleBuilder, validate_ohlcv
 from app.market.indicators import atr, ema
 from app.market.scanner import Nifty500Scanner
-from app.monitoring.notifications import Notifier
+from app.monitoring.notifications import notifier_from_settings
 from app.risk.daily_limits import DailyLimits
 from app.risk.exposure import Exposure
 from app.risk.risk_manager import RiskManager
@@ -94,11 +94,7 @@ class TradingPipeline:
             raise ValueError("LIVE pipeline requires an authenticated broker client")
         self.settings = settings
         self.activity_repository = activity_repository
-        self.notifier = Notifier(
-            bool(getattr(settings, "enable_telegram", False)),
-            getattr(settings, "telegram_bot_token", "").get_secret_value() if hasattr(getattr(settings, "telegram_bot_token", ""), "get_secret_value") else str(getattr(settings, "telegram_bot_token", "")),
-            str(getattr(settings, "telegram_chat_id", "")),
-        )
+        self.notifier = notifier_from_settings(settings)
         self.strategy = strategy
         self.scanner = Nifty500Scanner(token_to_symbol)
         self.orders = OrderAPI(settings.trading_mode, broker_client)

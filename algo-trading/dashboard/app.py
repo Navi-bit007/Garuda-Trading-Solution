@@ -66,7 +66,7 @@ from app.market.historical_scan import HistoricalScanResult, scan_historical_wat
 from app.market.scanner import Nifty500Scanner
 from app.market.signal_scanner import SignalScanResult, StrategySignalScanner
 from app.market.universe import SUPPORTED_INDEXES, load_nifty_index_universe_from_api
-from app.monitoring.notifications import Notifier, save_signal_notifications
+from app.monitoring.notifications import notifier_from_settings, save_signal_notifications
 from app.monitoring.signal_engine import build_signal_engine
 from app.strategy.crossover import CrossoverStrategy
 from app.risk.position_sizing import calculate_quantity
@@ -1081,11 +1081,7 @@ def record_dashboard_events(st, events) -> None:
 def record_signal_notifications(st, signals: pd.DataFrame, strategy_label: str, universe_label: str, sector: str, settings) -> list[NotificationRecord]:
     if signals.empty:
         return []
-    notifier = Notifier(
-        bool(getattr(settings, "enable_telegram", False)),
-        getattr(settings, "telegram_bot_token", "").get_secret_value() if hasattr(getattr(settings, "telegram_bot_token", ""), "get_secret_value") else str(getattr(settings, "telegram_bot_token", "")),
-        str(getattr(settings, "telegram_chat_id", "")),
-    )
+    notifier = notifier_from_settings(settings)
     new_notifications = save_signal_notifications(
         get_dashboard_repository(st),
         signals,
@@ -1518,6 +1514,7 @@ def render_manual_exit_action(st, settings, repository: Repository, record: Posi
             reason="Manual exit (Live monitor)",
             event_kind="manual_exit",
             decision="MANUAL_EXIT",
+            notifier=notifier_from_settings(settings),
         )
         if not outcome.success:
             st.error(f"Exit order failed for {record.symbol}: {outcome.error}")
@@ -3193,9 +3190,9 @@ def render_high_conviction_signal_table(st, repository: Repository, user_id: str
     )
 
 
-def create_swing_auto_trader(client, mode, trailing_multiplier: float, strategy_name: str, repository=None):
+def create_swing_auto_trader(client, mode, trailing_multiplier: float, strategy_name: str, repository=None, settings=None):
     try:
-        return SwingAutoTrader(client, mode, trailing_multiplier, strategy_name, repository=repository)
+        return SwingAutoTrader(client, mode, trailing_multiplier, strategy_name, repository=repository, settings=settings)
     except TypeError as error:
         message = str(error)
         stale_signature = "SwingAutoTrader.__init__" in message and (
@@ -3208,7 +3205,7 @@ def create_swing_auto_trader(client, mode, trailing_multiplier: float, strategy_
         import app.execution.swing_auto_trader as swing_auto_trader_module
 
         refreshed_module = importlib.reload(swing_auto_trader_module)
-        return refreshed_module.SwingAutoTrader(client, mode, trailing_multiplier, strategy_name, repository=repository)
+        return refreshed_module.SwingAutoTrader(client, mode, trailing_multiplier, strategy_name, repository=repository, settings=settings)
 
 
 SWING_EVENT_KINDS = {
@@ -3344,7 +3341,7 @@ def render_swing_auto_trading(st, settings) -> None:
             st.session_state.swing_strategy_name = selected_strategy_name
             st.session_state.swing_scan_result = None
         if trader is None:
-            trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name, repository=repository)
+            trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name, repository=repository, settings=settings)
             st.session_state.swing_auto_trader = trader
         elif getattr(trader, "strategy_name", "EMA 9/200 swing") != selected_strategy_name:
             if hasattr(trader, "set_strategy"):
@@ -3355,7 +3352,7 @@ def render_swing_auto_trading(st, settings) -> None:
                 legacy_signal_keys = getattr(trader, "submitted_signal_keys", set())
                 legacy_open_symbols = getattr(trader, "broker_open_symbols", set())
                 legacy_pending_entries = getattr(trader, "pending_entries", {})
-                trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name, repository=repository)
+                trader = create_swing_auto_trader(client.client, settings.trading_mode, float(trailing_multiplier), selected_strategy_name, repository=repository, settings=settings)
                 trader.active_positions.update(legacy_positions)
                 trader.submitted_signal_keys.update(legacy_signal_keys)
                 trader.broker_open_symbols.update(legacy_open_symbols)

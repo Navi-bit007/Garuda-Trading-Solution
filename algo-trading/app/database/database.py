@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
+from datetime import date, timedelta
 from threading import RLock
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_BACKUP_RETENTION_DAYS = 14
 
 
 class Database:
@@ -245,6 +251,7 @@ class Database:
             self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_user_signal ON signals(user_id, signal_id)")
             self.connection.execute("CREATE INDEX IF NOT EXISTS ix_pre_spike_events_lookup ON pre_spike_events(user_id, strategy, symbol, timeframe, trading_date, latest_time)")
             self.connection.commit()
+        self.backup_daily()
 
     def _run_migration_with_retry(self, migration, attempts: int = 5) -> None:
         for attempt in range(attempts):
@@ -371,6 +378,40 @@ class Database:
         if "heartbeat_at" not in columns:
             self.connection.execute("ALTER TABLE signal_engine_status ADD COLUMN heartbeat_at TEXT")
             self.connection.execute("UPDATE signal_engine_status SET heartbeat_at = last_run_at WHERE heartbeat_at IS NULL")
+
+    def backup_daily(self, backup_dir: str | None = None, retention_days: int = DEFAULT_BACKUP_RETENTION_DAYS) -> None:
+        """Create a hot backup of the live DB for today, if one doesn't already exist, using
+        sqlite3's online backup API -- safe to run while `self.connection` is open and being
+        written to, unlike a raw file copy which could grab a half-written page. Idempotent per
+        calendar day, so it's safe to call from every process that opens this DB (the dashboard
+        and the standalone trailing-stop agent both call `initialize()` on their own startup)
+        without producing duplicate backups. Prunes backups older than `retention_days` so the
+        backup folder doesn't grow unbounded. Never raises -- a backup failure (e.g. disk full)
+        must not block the trading app itself from starting.
+        """
+        try:
+            backup_root = Path(backup_dir) if backup_dir else Path(self.path).parent / "backups"
+            backup_root.mkdir(parents=True, exist_ok=True)
+            stem = Path(self.path).stem
+            today_backup = backup_root / f"{stem}_{date.today().isoformat()}.sqlite3"
+            if not today_backup.exists():
+                with self.lock:
+                    destination = sqlite3.connect(str(today_backup))
+                    try:
+                        self.connection.backup(destination)
+                    finally:
+                        destination.close()
+            cutoff = date.today() - timedelta(days=retention_days)
+            for backup_file in backup_root.glob(f"{stem}_*.sqlite3"):
+                suffix = backup_file.stem[len(stem) + 1 :]
+                try:
+                    backup_date = date.fromisoformat(suffix)
+                except ValueError:
+                    continue
+                if backup_date < cutoff:
+                    backup_file.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("daily database backup failed", exc_info=True)
 
     def close(self) -> None:
         with self.lock:

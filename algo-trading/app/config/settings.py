@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     enable_telegram: bool = False
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""
+    dashboard_password: SecretStr = SecretStr("")
     user_id: str = "default"
     signal_timeframe: str = "5minute"
     signal_poll_seconds: int = Field(default=300, ge=5)

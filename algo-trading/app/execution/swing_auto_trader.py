@@ -371,18 +371,18 @@ class SwingAutoTrader:
             if self._tradingsymbol(symbol) not in open_symbols:
                 position = self.active_positions[symbol]
                 # The standalone trailing-stop agent reconciles every LIVE swing position in the
-                # same shared `positions` table independently of this session -- if it already
-                # detected and recorded this exact close (deleting the row), doing so again here
-                # would write a second, duplicate trades/activity row for the same close. Only
-                # drop this session's own in-memory tracking in that case.
-                if self.repository is not None and not any(
-                    record.symbol == symbol for record in self.repository.load_positions()
-                ):
-                    del self.active_positions[symbol]
-                    continue
+                # same shared `positions` table independently of this session, and can notice
+                # this exact same broker-side close at nearly the same moment. Atomically
+                # claiming the close (one DELETE ... RETURNING) rather than checking then
+                # deleting separately closes that race outright: only whichever caller's claim
+                # actually removes the row proceeds to write a trade/activity record; the loser
+                # (None) just drops its own in-memory tracking.
+                if self.repository is not None and hasattr(self.repository, "claim_position_close"):
+                    if self.repository.claim_position_close(symbol) is None:
+                        del self.active_positions[symbol]
+                        continue
                 exit_price = self._broker_exit_fill_price(position)
                 del self.active_positions[symbol]
-                self._delete_position(symbol)
                 exit_reason = "broker-side position closed (protective stop or manual exit)"
                 self._record_trade_history(position, position.quantity, exit_price, exit_reason)
                 self.notifier.send(
@@ -489,11 +489,6 @@ class SwingAutoTrader:
                 trading_mode=self.mode.value,
             )
         )
-
-    def _delete_position(self, symbol: str) -> None:
-        if self.repository is None:
-            return
-        self.repository.delete_position(symbol)
 
     def _record_trade_history(self, position: SwingPosition, quantity: int, exit_price: float, exit_reason: str) -> None:
         if self.repository is None:

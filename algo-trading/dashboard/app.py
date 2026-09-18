@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as datetime_time, timedelta
+import hmac
 import json
 from html import escape
 import logging
@@ -36,6 +37,13 @@ if not logging.getLogger().handlers:
 logger = logging.getLogger(__name__)
 
 from app.config.constants import Side, SignalAction, TradingMode
+from app.config.frontend_settings import (
+    EDITABLE_SETTINGS,
+    apply_frontend_settings,
+    deserialize_frontend_settings,
+    serialize_frontend_settings,
+    settings_values,
+)
 from app.broker.authentication import AccessToken, AuthenticationError, exchange_request_token
 from app.broker.kite_client import KiteClient
 from app.broker.market_data import MarketData
@@ -100,68 +108,11 @@ from backtest.metrics import calculate_metrics
 from backtest.runner import run_strategy_backtest
 
 
-EDITABLE_SETTINGS = (
-    "trading_mode",
-    "initial_capital",
-    "max_open_positions",
-    "max_trades_per_day",
-    "max_capital_deployment",
-    "market_open",
-    "entry_start",
-    "entry_end",
-    "force_exit",
-    "trailing_atr_multiplier",
-    "min_stop_improvement_pct",
-    "swing_capital_limit",
-    "swing_quantity_limit",
-    "swing_trailing_atr_multiplier",
-    "swing_max_open_positions",
-    "intraday_capital_limit",
-    "intraday_leverage_multiplier",
-)
-
 SWING_LOOKBACK_DAYS = 600
 # Kite Connect's historical-candle endpoint is rate-limited (documented ~3 req/s); this bounds
 # how many symbols the intraday/swing scanners fetch candles for concurrently. Matches
 # DYNAMIC_MAX_WORKERS' reasoning for the dynamic watchlist scan.
 SCAN_MAX_WORKERS = 4
-
-
-def settings_values(settings) -> dict:
-    return {name: getattr(settings, name) for name in EDITABLE_SETTINGS}
-
-
-def serialize_frontend_settings(values: dict) -> dict:
-    serialized = {}
-    for name, value in values.items():
-        if isinstance(value, TradingMode):
-            serialized[name] = value.value
-        elif isinstance(value, datetime_time):
-            serialized[name] = value.isoformat()
-        else:
-            serialized[name] = value
-    return serialized
-
-
-def deserialize_frontend_settings(values: dict) -> dict:
-    overrides = {}
-    for name, value in values.items():
-        if name not in EDITABLE_SETTINGS:
-            continue
-        if name == "trading_mode":
-            value = TradingMode(value)
-        elif name in {"market_open", "entry_start", "entry_end", "force_exit"}:
-            value = datetime_time.fromisoformat(value)
-        overrides[name] = value
-    return overrides
-
-
-def apply_frontend_settings(base_settings, overrides: dict):
-    if not overrides:
-        return base_settings
-    values = base_settings.model_dump() if hasattr(base_settings, "model_dump") else base_settings.dict()
-    values.update(overrides)
-    return type(base_settings)(**values)
 
 
 def get_frontend_settings(st, base_settings):
@@ -643,6 +594,12 @@ def runtime_access_token(st, settings) -> str:
 
 
 KITE_TOKEN_VALIDATION_CACHE_SECONDS = 60
+# How long to wait between self-heal restart attempts for a stalled trailing-stop agent. Must
+# comfortably exceed how long a freshly launched agent takes to report its first heartbeat --
+# otherwise the Live monitor fragment (which re-runs every 10s) would call
+# maybe_autostart_trailing_agent() again before the previous restart's heartbeat lands, spawning
+# a second duplicate agent process on top of the first.
+TRAILING_AGENT_SELF_HEAL_COOLDOWN_SECONDS = 60
 
 
 def verified_kite_access_token(st, settings) -> str:
@@ -695,6 +652,10 @@ def log_out_of_kite(st, repository=None, user_id: str = "") -> None:
         "kite_auth_notice",
         "dashboard_kite_client",
         "dashboard_pipeline",
+        # Also drop the dashboard's own password-gate unlock -- "Log out" should return to the
+        # very first screen (the password prompt), not just Kite's sign-in step, or the dashboard
+        # would stay reachable (password-wise) for anyone at this browser after a "log out" click.
+        "dashboard_unlocked",
     ):
         st.session_state.pop(key, None)
     st.session_state.kite_logged_out = True
@@ -1546,6 +1507,27 @@ def render_live_monitor(st, settings) -> None:
             agent_state = "stalled"
         else:
             agent_state = "running"
+
+        # Self-heal: a "stalled" heartbeat (one that exists but has gone quiet) means the agent
+        # was running and unexpectedly died -- unlike "stopped" (no heartbeat at all, e.g. after
+        # an explicit Stop click, which clears it) or "error" (still alive and reporting each
+        # cycle). Only restart if the user opted in via the auto-start preference, mirroring the
+        # exact same launch this preference already triggers at login. The cooldown timestamp
+        # stops the 10s fragment re-run from spawning a second process before the first restart's
+        # heartbeat has had time to land.
+        if agent_state == "stalled" and broker_credentials_configured(settings) and access_token:
+            user_id = dashboard_user_id(settings)
+            if repository.get_auto_start_trailing_agent(user_id):
+                last_attempt = st.session_state.get("trailing_agent_self_heal_attempted_at")
+                if last_attempt is None or (datetime.now() - last_attempt).total_seconds() > TRAILING_AGENT_SELF_HEAL_COOLDOWN_SECONDS:
+                    st.session_state.trailing_agent_self_heal_attempted_at = datetime.now()
+                    maybe_autostart_trailing_agent(
+                        repository,
+                        settings.kite_api_key,
+                        settings.kite_api_secret.get_secret_value(),
+                        access_token,
+                        extra_env=trailing_agent_env_from_settings(settings),
+                    )
         # A full-width banner here (the same visual treatment other pages use for their own scan
         # status) pushed every position table below the fold on a small monitor -- the agent's
         # status matters, but not enough to cost that much vertical space on every single render.
@@ -5358,11 +5340,51 @@ def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, ac
                 st.rerun()
 
 
+def render_dashboard_access_gate(st, settings) -> bool:
+    """Gate the entire dashboard behind a single shared password, checked before anything else
+    renders -- including the Kite login page, which would otherwise let anyone on the network
+    reach real trading controls and credentials with no barrier at all.
+
+    Returns True once unlocked (or immediately if no password is configured -- treated as an
+    explicit opt-out, flagged with a visible warning rather than silently doing nothing) and
+    False while the gate should keep blocking the rest of the page.
+    """
+    configured_password = settings.dashboard_password.get_secret_value().strip()
+    if not configured_password:
+        st.warning(
+            "Dashboard access is unprotected -- set DASHBOARD_PASSWORD in .env to require a "
+            "password before this workspace (including Kite credentials and trading controls) "
+            "can be reached.",
+            icon=":material/lock_open:",
+        )
+        return True
+    if st.session_state.get("dashboard_unlocked"):
+        return True
+    st.markdown('<div class="eyebrow">Garuda Trading</div>', unsafe_allow_html=True)
+    st.title("Enter password")
+    with st.form("dashboard_access_gate_form"):
+        entered_password = st.text_input("Password", type="password", key="dashboard_access_password_input")
+        submitted = st.form_submit_button("Unlock", type="primary", icon=":material/lock_open:")
+    if submitted:
+        # Timing-safe comparison -- a plain `==` leaks how many leading characters matched
+        # through response-time differences, an unnecessary risk for a password gate.
+        if hmac.compare_digest(entered_password, configured_password):
+            st.session_state.dashboard_unlocked = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+
 def main() -> None:
     st.set_page_config(page_title="Garuda Trading", page_icon=":material/candlestick_chart:", layout="wide")
     inject_styles(st)
     base_settings = get_settings()
     settings = get_frontend_settings(st, base_settings)
+
+    if not render_dashboard_access_gate(st, settings):
+        return
+
     orders, trades, activity = load_activity()
 
     authenticated = broker_credentials_configured(settings) and bool(verified_kite_access_token(st, settings))

@@ -510,6 +510,14 @@ class TrailingStopAgent:
         exit_price, reason = self._broker_exit_fill(record)
         multiplier = 1 if record.side == "BUY" else -1
         pnl = multiplier * (exit_price - record.entry_price) * record.quantity
+        # Atomically claim this close before recording it -- the dashboard's own TradingPipeline
+        # independently polls the broker and can notice this exact same close at nearly the same
+        # moment. Only the caller whose claim actually removes the `positions` row proceeds to
+        # write a trade/activity record; the loser (None) just drops its own in-memory tracking,
+        # with nothing left to race against.
+        if self.repository.claim_position_close(record.symbol) is None:
+            self.positions.pop(record.symbol, None)
+            return
         self.repository.save_trade(
             TradeRecord(
                 symbol=record.symbol,
@@ -525,7 +533,6 @@ class TrailingStopAgent:
                 exit_reason=reason,
             )
         )
-        self.repository.delete_position(record.symbol)
         self.positions.pop(record.symbol, None)
         exit_side = "SELL" if record.side == "BUY" else "BUY"
         self.repository.save_activity(
@@ -668,6 +675,11 @@ class TrailingStopAgent:
                 continue
             exit_price, exit_reason = self._broker_exit_fill(record)
             pnl = (exit_price - record.entry_price) * record.quantity
+            # Same atomic claim as the intraday path -- SwingAutoTrader's own reconciliation can
+            # independently notice this exact same broker-side close at nearly the same moment.
+            if self.repository.claim_position_close(record.symbol) is None:
+                self.positions.pop(record.symbol, None)
+                continue
             self.repository.save_trade(
                 TradeRecord(
                     symbol=record.symbol,
@@ -683,7 +695,6 @@ class TrailingStopAgent:
                     exit_reason=exit_reason,
                 )
             )
-            self.repository.delete_position(record.symbol)
             self.positions.pop(record.symbol, None)
             self._log_decision(
                 record,

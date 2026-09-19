@@ -783,7 +783,7 @@ def test_swing_ema_position_trails_once_per_completed_daily_candle(tmp_path):
     client.order_history_by_id["PAPER-STOP-000001"] = [{"status": "TRIGGER PENDING"}]
     client.historical_rows[(111, "day")] = daily_candles(rows=30, start_close=100.0, step=1.0)
 
-    now = datetime(2025, 2, 1, 10, 0)
+    now = datetime(2025, 2, 3, 10, 0)
     agent.run_once(now=now)
 
     [saved] = repository.load_positions()
@@ -825,7 +825,7 @@ def test_swing_entry_price_is_corrected_to_match_broker_average_price(tmp_path):
     client.broker_holdings = [{"tradingsymbol": "AAA", "quantity": 10, "average_price": 102.35}]
     client.historical_rows[(111, "day")] = []
 
-    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+    agent.run_once(now=datetime(2025, 2, 3, 9, 20))
 
     [saved] = repository.load_positions()
     assert saved.entry_price == 102.35
@@ -846,7 +846,7 @@ def test_expired_overnight_stop_is_rearmed(tmp_path):
     client.ltp_response = {"NSE:AAA": {"last_price": 105.0}}
     client.historical_rows[(111, "day")] = []
 
-    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+    agent.run_once(now=datetime(2025, 2, 3, 9, 20))
 
     [saved] = repository.load_positions()
     assert saved.protective_order_id != "PAPER-STOP-000001"
@@ -878,7 +878,7 @@ def test_live_overnight_stop_is_left_alone(tmp_path):
     client.todays_orders = [{"order_id": "PAPER-STOP-000001", "status": "TRIGGER PENDING"}]
     client.historical_rows[(111, "day")] = []
 
-    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+    agent.run_once(now=datetime(2025, 2, 3, 9, 20))
 
     [saved] = repository.load_positions()
     assert saved.protective_order_id == "PAPER-STOP-000001"
@@ -903,7 +903,7 @@ def test_rearm_failure_is_surfaced_on_the_heartbeat_instead_of_looking_healthy(t
 
     agent.orders.place_protective_stop = failing_place_protective_stop
 
-    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+    agent.run_once(now=datetime(2025, 2, 3, 9, 20))
 
     heartbeat = repository.load_agent_heartbeat("trailing_stop_agent")
     assert "CDSL" in heartbeat.last_error
@@ -922,7 +922,7 @@ def test_position_closed_at_broker_is_dropped_from_tracking(tmp_path):
     client.broker_holdings = []  # the SL-M already filled and flattened the holding
     client.historical_rows[(111, "day")] = []
 
-    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+    agent.run_once(now=datetime(2025, 2, 3, 9, 20))
 
     assert repository.load_positions() == []
     assert "NSE:AAA" not in agent.positions
@@ -949,7 +949,7 @@ def test_settled_swing_holding_is_not_wrongly_closed(tmp_path):
     client.broker_holdings_list = [{"tradingsymbol": "AAA", "quantity": 0, "t1_quantity": 10}]
     client.historical_rows[(111, "day")] = []
 
-    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+    agent.run_once(now=datetime(2025, 2, 3, 9, 20))
 
     [saved] = repository.load_positions()
     assert saved.symbol == "NSE:AAA"
@@ -976,7 +976,7 @@ def test_settled_swing_holding_still_gets_its_overnight_expired_stop_rearmed(tmp
     client.broker_holdings_list = [{"tradingsymbol": "AAA", "quantity": 10, "t1_quantity": 0}]
     client.historical_rows[(111, "day")] = []
 
-    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+    agent.run_once(now=datetime(2025, 2, 3, 9, 20))
 
     [saved] = repository.load_positions()
     assert saved.protective_order_id != "PAPER-STOP-000001"
@@ -1003,7 +1003,7 @@ def test_swing_holding_lookup_failure_does_not_wrongly_close_a_position(tmp_path
 
     client.holdings = failing_holdings
 
-    agent.run_once(now=datetime(2025, 2, 1, 9, 20))
+    agent.run_once(now=datetime(2025, 2, 3, 9, 20))
 
     [saved] = repository.load_positions()
     assert saved.symbol == "NSE:AAA"
@@ -1070,6 +1070,40 @@ def test_agent_keeps_running_before_the_shutdown_time(tmp_path):
 
     assert agent.shut_down_for_the_day is False
     assert agent._stop_event.is_set() is False
+    database.close()
+
+
+def test_agent_exits_for_the_day_on_a_weekend_without_touching_the_broker(tmp_path):
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    repository.save_position(
+        PositionRecord(
+            symbol="NSE:AAA", side="BUY", quantity=10, entry_price=100.0, stop_loss=90.0,
+            entry_time=datetime(2026, 1, 1, 9, 20), protective_order_id="PAPER-STOP-000001",
+            instrument_token=111, position_type="INTRADAY", atr_multiplier=1.5, trading_mode="LIVE",
+        )
+    )
+    agent = build_agent(repository, client)
+
+    agent.run_once(now=datetime(2026, 9, 19, 10, 0))  # a Saturday
+
+    assert agent.shut_down_for_the_day is True
+    assert agent._stop_event.is_set() is True
+    assert agent.positions == {}  # never even loaded -- no broker calls attempted
+    assert repository.load_agent_heartbeat("trailing_stop_agent") is None
+    database.close()
+
+
+def test_agent_exits_for_the_day_on_a_configured_holiday(tmp_path):
+    database, repository = build_repository(tmp_path)
+    client = StubKiteClient()
+    settings = SimpleNamespace(market_holidays="2026-01-26")
+    agent = build_agent(repository, client, settings=settings)
+
+    agent.run_once(now=datetime(2026, 1, 26, 10, 0))  # a Monday, but a configured holiday
+
+    assert agent.shut_down_for_the_day is True
+    assert agent._stop_event.is_set() is True
     database.close()
 
 

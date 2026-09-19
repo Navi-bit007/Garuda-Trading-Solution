@@ -53,12 +53,15 @@ from app.config.settings import get_settings
 from app.database.database import Database
 from app.database.models import ActivityRecord, DynamicWatchlistRecord, NotificationRecord, PositionRecord, SignalRecord, WatchlistRecord
 from app.database.repository import Repository
+from app.broker.charges_api import ChargesAPI, combine_broker_charges, virtual_order
+from app.execution.charges import DELIVERY_DP_CHARGE_PER_SELL, ChargeBreakdown, estimate_equity_charges
 from app.execution.exit_actions import close_position_at_market
 from app.execution.position_manager import Position, PositionManager
 from app.execution.reconciliation import reconcile
 from app.execution.agent_launcher import agent_heartbeat_is_fresh, launch_trailing_stop_agent, maybe_autostart_trailing_agent, stop_trailing_stop_agent, trailing_agent_env_from_settings
 from app.execution.swing_auto_trader import SwingAutoTrader, SwingOrderResult, SwingScanResult
 from app.market.candles import validate_ohlcv
+from app.market.trading_calendar import is_trading_day, parse_market_holidays
 from app.market.indicators import atr as compute_atr
 from app.market.dynamic_watchlist import (
     DYNAMIC_AUTO_REFRESH_CANDLES,
@@ -126,9 +129,123 @@ def get_frontend_settings(st, base_settings):
     return apply_frontend_settings(base_settings, st.session_state.frontend_settings)
 
 
+def format_signed_currency(value: float) -> str:
+    return f"-₹{abs(value):,.2f}" if value < 0 else f"₹{value:,.2f}"
+
+
+def pnl_percentage(pnl: float, entry_price: float, quantity: int) -> float:
+    invested = entry_price * quantity
+    return (pnl / invested * 100) if invested else 0.0
+
+
+def style_win_loss_columns(frame: pd.DataFrame):
+    """Color a "Win %" column green and a "Loss %" column red whenever either is above 50% --
+    at a glance, whether that hour/day leaned winning or losing. Returns a pandas Styler (which
+    st.dataframe renders directly); column_config's own format string still wins for the %
+    number formatting itself, this only adds the text color.
+    """
+    return frame.style.map(
+        lambda value: "color: #176b4d; font-weight: 700;" if value > 50 else "", subset=["Win %"]
+    ).map(lambda value: "color: #b3261e; font-weight: 700;" if value > 50 else "", subset=["Loss %"])
+
+
+# A closed trade's charges never change (both legs are final), so a broker-verified lookup is
+# cached here for the life of the process, keyed by everything that affects the charges
+# calculation. Open positions are never cached (the sell leg is a moving LTP) -- see
+# apply_broker_charges below.
+_BROKER_CHARGES_CACHE: dict[tuple, ChargeBreakdown] = {}
+
+
+def update_row_charges(row: dict, charges: ChargeBreakdown, source: str) -> None:
+    """The single place that writes a row's charges-derived fields, called both when a row is
+    first built (with the local estimate) and later by apply_broker_charges (with the broker-
+    verified figure, when available) -- so the displayed total, the After tax P&L, and the
+    itemized breakdown the row-selection popover reads never fall out of sync with each other.
+    """
+    net_pnl = row["_pnl"] - charges.total
+    net_pnl_pct = pnl_percentage(net_pnl, row["Entry Price"], row["_quantity"])
+    row["Est. charges"] = charges.total
+    row["After tax P&L"] = f"{format_signed_currency(net_pnl)} ({net_pnl_pct:+.2f}%)"
+    row["_charges_total"] = charges.total
+    row["_net_pnl"] = net_pnl
+    row["_charges_source"] = source
+    row["_brokerage"] = charges.brokerage
+    row["_stt"] = charges.stt
+    row["_transaction_charges"] = charges.transaction_charges
+    row["_sebi_charges"] = charges.sebi_charges
+    row["_stamp_duty"] = charges.stamp_duty
+    row["_dp_charges"] = charges.dp_charges
+    row["_gst"] = charges.gst
+
+
+def apply_broker_charges(rows: list[dict], broker_client) -> None:
+    """Upgrade each row's charges from the local estimate (already computed when the row was
+    built) to Zerodha's own Charges API result, when a broker session is available and the
+    lookup succeeds. Mutates rows in place; anything the lookup doesn't cover -- no session, the
+    API call failing, an unexpected response shape -- simply keeps its local estimate. This is a
+    best-effort accuracy upgrade, never a hard requirement for the page to work.
+    """
+    if broker_client is None or not rows:
+        return
+    charges_api = ChargesAPI(broker_client)
+    payload: list[dict] = []
+    pending: list[tuple[dict, tuple | None]] = []
+    for row in rows:
+        symbol = row["Stock Name"]
+        exchange, tradingsymbol = (symbol.split(":", 1) if ":" in symbol else ("NSE", symbol))
+        product = "MIS" if row["_position_type"] == "INTRADAY" else "CNC"
+        quantity = row["_quantity"]
+        buy_price = row["_buy_value"] / quantity
+        sell_price = row["_sell_value"] / quantity
+        # Only a CLOSED row's inputs are guaranteed never to change again -- an OPEN row's sell
+        # leg is today's LTP, so caching it would either never hit (wasted memory) or, worse,
+        # serve a stale price's charges after the LTP has moved.
+        cache_key = (
+            (exchange, tradingsymbol.upper(), product, quantity, round(buy_price, 4), round(sell_price, 4))
+            if row["Current Position"] == "CLOSED"
+            else None
+        )
+        cached = _BROKER_CHARGES_CACHE.get(cache_key) if cache_key else None
+        if cached is not None:
+            update_row_charges(row, cached, "broker")
+            continue
+        pair_index = len(pending)
+        payload.append(virtual_order(f"buy-{pair_index}", exchange, tradingsymbol, "BUY", product, quantity, buy_price))
+        payload.append(virtual_order(f"sell-{pair_index}", exchange, tradingsymbol, "SELL", product, quantity, sell_price))
+        pending.append((row, cache_key))
+
+    if not pending:
+        return
+    results = charges_api.fetch(payload)
+    if results is None:
+        return  # every pending row keeps the local estimate it already has
+    for pair_index, (row, cache_key) in enumerate(pending):
+        buy_result, sell_result = results[pair_index * 2], results[pair_index * 2 + 1]
+        dp_charges = DELIVERY_DP_CHARGE_PER_SELL if row["_position_type"] != "INTRADAY" and row["_sell_value"] > 0 else 0.0
+        charges = combine_broker_charges(buy_result.get("charges", {}), sell_result.get("charges", {}), dp_charges)
+        if cache_key is not None:
+            _BROKER_CHARGES_CACHE[cache_key] = charges
+        update_row_charges(row, charges, "broker")
+
+
 def broker_credentials_configured(settings) -> bool:
     api_secret = settings.kite_api_secret.get_secret_value()
     return bool(settings.kite_api_key.strip() and api_secret.strip())
+
+
+def describe_agent_start_blocked_reason(settings) -> str | None:
+    """A clear, plain-language reason "Start agent now" won't do anything useful right now, or
+    None if it's fine to start. Without this, clicking Start on a non-trading day or after hours
+    silently launches a process that immediately exits for the day (TrailingStopAgent.run_once
+    has the same checks) -- the button just appears to do nothing, with the real reason sitting
+    only in a log file most people would never think to check.
+    """
+    if not is_trading_day(date.today(), parse_market_holidays(settings.market_holidays)):
+        return "NSE is closed today (weekend or a market holiday) -- the trailing-stop agent only runs on trading days."
+    shutdown_time = getattr(settings, "agent_shutdown_time", datetime_time(15, 40))
+    if datetime.now().time() >= shutdown_time:
+        return f"Trading hours are over for today (agent shuts down at {shutdown_time.strftime('%I:%M %p')}) -- it will be available again on the next trading day."
+    return None
 
 
 def broker_access_token_configured(settings, runtime_access_token: str = "") -> bool:
@@ -447,7 +564,10 @@ def inject_styles(st) -> None:
         :root { --ink: #17211b; --muted: #66736a; --paper: #f4f6ef; --line: #d8dfd3; --mint: #b9e8cf; }
         html, body, .stApp { font-family: "Segoe UI Variable", "Segoe UI", sans-serif; color: var(--ink) !important; }
         .stApp { background: var(--paper); }
-        [data-testid="stMainBlockContainer"] { padding-top: 1.25rem; }
+        /* 1.25rem left the very first element on a page (the "eyebrow" label, now removed)
+           rendering underneath Streamlit's own fixed header bar -- this clears it while still
+           being noticeably tighter than Streamlit's unstyled default spacing. */
+        [data-testid="stMainBlockContainer"] { padding-top: 3rem; }
         [data-testid="stSidebar"] { background: #e6efe5; border-right: 1px solid var(--line); }
         [data-testid="stSidebar"] * { color: var(--ink) !important; opacity: 1 !important; }
         [data-testid="stSidebar"] [data-testid="stRadio"] { width: 100%; }
@@ -494,6 +614,12 @@ def inject_styles(st) -> None:
         .status { display: inline-flex; align-items: center; gap: 8px; border: 1px solid #9bc9ac; background: var(--mint); color: #1d5434; border-radius: 999px; padding: 5px 10px; font-size: .78rem; font-weight: 700; }
         .status-dot { width: 7px; height: 7px; background: #20844b; border-radius: 50%; }
         .empty { border: 1px dashed #b6c4b7; padding: 22px; border-radius: 7px; color: var(--muted); background: rgba(255,255,255,.38); }
+        /* st.caption's default small/muted/gray text was hard to read inside a popover -- this
+           bumps weight and size back up while still reading as secondary info, not a heading. */
+        .info-list { margin: 0 0 12px 20px; padding: 0; }
+        .info-list li { color: var(--ink); font-weight: 600; font-size: .92rem; line-height: 1.65; margin-bottom: 6px; }
+        .info-list li:last-child { margin-bottom: 0; }
+        .trade-limit-box { display: inline-block; border: 1px solid #e0a3a3; background: #fdf2f2; color: #8a2c2c; font-size: .82rem; font-weight: 700; padding: 6px 14px; border-radius: 6px; }
         .watchlist-card { min-height: 220px; }
         .watchlist-card h3 { margin: 0; font-size: 1.15rem; }
         .watchlist-count { color: var(--muted); font-size: .86rem; margin: 4px 0 14px; }
@@ -1493,7 +1619,6 @@ def render_manual_exit_action(st, settings, repository: Repository, record: Posi
 def render_live_monitor(st, settings) -> None:
     @st.fragment(run_every=10)
     def render_live_monitor_content() -> None:
-        st.markdown('<div class="eyebrow">Unified position tracker</div>', unsafe_allow_html=True)
         repository = get_dashboard_repository(st)
         access_token = runtime_access_token(st, settings)
 
@@ -1527,6 +1652,7 @@ def render_live_monitor(st, settings) -> None:
                         settings.kite_api_secret.get_secret_value(),
                         access_token,
                         extra_env=trailing_agent_env_from_settings(settings),
+                        market_holidays=settings.market_holidays,
                     )
         # A full-width banner here (the same visual treatment other pages use for their own scan
         # status) pushed every position table below the fold on a small monitor -- the agent's
@@ -1538,9 +1664,35 @@ def render_live_monitor(st, settings) -> None:
             "error": ("🔴", "Needs attention"),
             "stopped": ("⚪", "Agent stopped"),
         }[agent_state]
-        title_column, status_column = st.columns([5, 2], vertical_alignment="bottom")
+        title_column, info_column, status_column = st.columns([4, 1, 2], vertical_alignment="bottom")
         with title_column:
             st.title("Live monitor")
+        with info_column:
+            with st.popover("ℹ️ Information", width="stretch"):
+                st.markdown(
+                    '<ul class="info-list">'
+                    "<li>Shows every open LIVE-mode intraday and swing position, read straight from the database the "
+                    "standalone trailing-stop agent maintains -- cross-checked against Zerodha's own live positions so "
+                    "drift between the two is visible immediately.</li>"
+                    "<li>PAPER-mode positions are simulated locally and are not shown here or managed by the "
+                    "trailing-stop agent.</li>"
+                    "<li>The box next to each section title shows today's entries against the daily trade cap "
+                    "(intraday only -- swing has no daily entry limit, just an open-position cap) and current open "
+                    "positions against the open-position cap, from Risk & settings.</li>"
+                    "<li>🟢/🔴/⚪ next to the symbol shows whether it matches an open position at the broker.</li>"
+                    "<li>Stop (stop dist%) is the SL-M trigger price, with its distance from the last price in "
+                    "parentheses: |Last − Stop| ÷ Last × 100.</li>"
+                    "<li>ATR (mult.) is the current ATR14 value (average true range, live from the same 15-minute/daily "
+                    "candles) with the trailing-stop agent's multiplier in parentheses -- the candidate stop is "
+                    "(ATR × multiplier) below the last price for a BUY (above it for a SELL), moved only in your favor, "
+                    "never back toward entry.</li>"
+                    "<li>Target 1 is the price that triggers that strategy's target-1 action (move stop to breakeven, "
+                    "or close outright), with a checkmark once it's hit.</li>"
+                    "<li>Hover any column header for its exact definition. Select a row to filter its stop-loss history "
+                    "below.</li>"
+                    "</ul>",
+                    unsafe_allow_html=True,
+                )
         with status_column:
             with st.popover(f"{status_badge_copy[0]} {status_badge_copy[1]}", width="stretch"):
                 if agent_state in {"running", "stalled", "error"}:
@@ -1552,7 +1704,10 @@ def render_live_monitor(st, settings) -> None:
                     render_scan_activity_banner(st, agent_state, *state_copy)
                 else:
                     st.warning("Trailing-stop agent has no heartbeat yet -- start it to protect open positions.")
-                    start_disabled = not broker_credentials_configured(settings) or not access_token
+                    start_blocked_reason = describe_agent_start_blocked_reason(settings)
+                    if start_blocked_reason:
+                        st.caption(start_blocked_reason)
+                    start_disabled = not broker_credentials_configured(settings) or not access_token or bool(start_blocked_reason)
                     if st.button("Start agent now", icon=":material/play_arrow:", disabled=start_disabled, width="stretch"):
                         launch_trailing_stop_agent(
                             settings.kite_api_key,
@@ -1562,12 +1717,6 @@ def render_live_monitor(st, settings) -> None:
                             extra_env=trailing_agent_env_from_settings(settings),
                         )
                         st.rerun()
-        st.caption(
-            "Every open LIVE-mode intraday and swing position, read straight from the database the "
-            "standalone trailing-stop agent maintains -- cross-checked against Zerodha's own "
-            "live positions so drift between the two is visible immediately. PAPER-mode positions are "
-            "simulated locally and are not shown here or managed by the trailing-stop agent."
-        )
 
         records = [record for record in repository.load_positions() if record.trading_mode == "LIVE"]
         if not records:
@@ -1578,7 +1727,8 @@ def render_live_monitor(st, settings) -> None:
         # "stop_trailed" is an ATR/EMA-driven move; "stop_rearmed" is a same-price re-placement
         # after Zerodha's overnight day-order expiry -- both are broker-side changes to the
         # resting SL-M and belong in the same history, or a freshly re-armed order (a new
-        # order id at the broker, confirmed by "Broker status") would show no explanation at all.
+        # order id at the broker, confirmed by the Symbol column's broker-status dot) would show
+        # no explanation at all.
         stop_update_kinds = ["stop_trailed", "stop_rearmed"]
         stop_trail_events = pd.DataFrame(columns=["timestamp", "symbol", "reason", "stop_loss", "previous_stop"])
         if not activity.empty:
@@ -1654,55 +1804,89 @@ def render_live_monitor(st, settings) -> None:
                 pnl_pct = (pnl / invested * 100) if invested else 0.0
                 stop_distance_pct = abs(last_price - record.stop_loss) / last_price * 100 if last_price else 0.0
                 if broker_open_tradingsymbols is None:
-                    broker_status = "Unknown"
+                    broker_dot = "⚪"
                 elif tradingsymbol(record.symbol) in broker_open_tradingsymbols:
-                    broker_status = "Matches broker"
+                    broker_dot = "🟢"
                 else:
-                    broker_status = "Not found at broker"
+                    broker_dot = "🔴"
+                atr_value = atr_values.get(record.symbol)
+                if atr_value is None:
+                    atr_display = "-"
+                elif record.atr_multiplier:
+                    atr_display = f"₹{atr_value:,.2f} (×{record.atr_multiplier:.2g})"
+                else:
+                    atr_display = f"₹{atr_value:,.2f}"
+                target_display = f"₹{record.target_1:,.2f}" + (" ✓" if record.target_1_hit else "") if record.target_1 is not None else "-"
+                stop_update_count = int(stop_trail_counts.get(record.symbol, 0))
+                last_move = latest_stop_move.get(record.symbol)
+                stop_updates_display = f"{stop_update_count} ({last_move})" if stop_update_count and last_move else str(stop_update_count)
                 rows.append(
                     {
-                        "Symbol": record.symbol,
+                        "Symbol": f"{broker_dot} {record.symbol}",
                         "Strategy": record.strategy_name or "-",
                         "Side": record.side,
                         "Qty": record.quantity,
                         "Entry": record.entry_price,
                         "Last": last_price,
-                        "Stop": record.stop_loss,
-                        "Stop distance %": stop_distance_pct,
-                        "ATR": atr_values.get(record.symbol),
-                        "ATR mult.": record.atr_multiplier,
-                        "P&L": pnl,
-                        "P&L %": pnl_pct,
-                        "Target 1": record.target_1,
-                        "Target 1 hit": "Yes" if record.target_1_hit else "No",
-                        "Stop updates": int(stop_trail_counts.get(record.symbol, 0)),
-                        "Last stop move": latest_stop_move.get(record.symbol, "-"),
+                        "Stop (stop dist%)": f"₹{record.stop_loss:,.2f} ({stop_distance_pct:.2f}%)",
+                        "ATR (mult.)": atr_display,
+                        "P&L": f"{format_signed_currency(pnl)} ({pnl_pct:+.2f}%)",
+                        "Target 1": target_display,
+                        "Stop updates": stop_updates_display,
                         "Protective order": record.protective_order_id or "Unavailable",
-                        "Broker status": broker_status,
                         "Entered": record.entry_time,
                     }
                 )
             return rows
 
         column_config = {
+            "Symbol": st.column_config.TextColumn(help="🟢 matches an open position at the broker · 🔴 not found at the broker -- may be closed or drifted · ⚪ broker status unavailable right now."),
             "Entry": st.column_config.NumberColumn(format="₹%.2f"),
             "Last": st.column_config.NumberColumn(format="₹%.2f"),
-            "Stop": st.column_config.NumberColumn(format="₹%.2f", help="The current SL-M trigger price resting at the broker."),
-            "Stop distance %": st.column_config.NumberColumn(format="%.2f%%", help="How far the last traded price is from the stop, as a percentage of the last price: |Last - Stop| / Last x 100."),
-            "ATR": st.column_config.NumberColumn(format="₹%.2f", help="The current ATR14 value in rupees -- the average true range over the last 14 completed candles (15-minute for intraday, daily for swing). Blank if there isn't enough candle history or live broker data yet."),
-            "ATR mult.": st.column_config.NumberColumn(format="%.2f", help="The trailing-stop agent's ATR multiplier for this position. Its candidate stop is Last price minus (ATR14 x this multiplier) for a BUY, calculated on 15-minute candles for intraday and daily candles for swing -- and it only ever moves in your favor, never back toward the entry."),
-            "P&L": st.column_config.NumberColumn(format="₹%.2f"),
-            "P&L %": st.column_config.NumberColumn(format="%.2f%%", help="P&L as a percentage of entry price x quantity: (Last - Entry) / Entry x 100, signed for the trade's side."),
-            "Target 1": st.column_config.NumberColumn(format="₹%.2f", help="The price that triggers the target-1 action (move stop to breakeven, or close the position, depending on strategy). Blank means the strategy didn't set one."),
-            "Stop updates": st.column_config.NumberColumn(
-                help="How many times the trailing-stop agent has moved or re-armed this position's SL-M since entry. Select the row to filter 'Recent stop-loss updates' below to just this symbol."
+            "Stop (stop dist%)": st.column_config.TextColumn(help="The current SL-M trigger price resting at the broker, with how far the last traded price is from it in parentheses: |Last - Stop| / Last x 100."),
+            "ATR (mult.)": st.column_config.TextColumn(help="The current ATR14 value in rupees -- the average true range over the last 14 completed candles (15-minute for intraday, daily for swing) -- with the trailing-stop agent's ATR multiplier in parentheses. Candidate stop = Last price minus (ATR14 x multiplier) for a BUY, and it only ever moves in your favor, never back toward the entry. '-' if there isn't enough candle history or live broker data yet."),
+            "P&L": st.column_config.TextColumn(help="Profit/loss in rupees, with P&L as a percentage of entry price x quantity in parentheses."),
+            "Target 1": st.column_config.TextColumn(help="The price that triggers the target-1 action (move stop to breakeven, or close the position, depending on strategy); a checkmark means it's already been hit. '-' means the strategy didn't set one."),
+            "Stop updates": st.column_config.TextColumn(
+                help="How many times the trailing-stop agent has moved or re-armed this position's SL-M since entry, with the most recent move (old price → new price) in parentheses. Select the row to filter 'Recent stop-loss updates' below to just this symbol."
             ),
-            "Last stop move": st.column_config.TextColumn(help="The most recent trailing-stop move for this position (old price → new price)."),
             "Entered": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
         }
 
+        closed_records = repository.load_trades()
+        today = date.today()
+
+        def render_trade_limit_box(position_type: str) -> None:
+            """A quick "how much of today's allowance is used" readout -- entries today (open
+            or already closed) against the configured daily cap, and current open positions
+            against the configured open-position cap. Intraday has both real limits
+            (max_trades_per_day, max_open_positions); swing only caps open positions
+            (swing_max_open_positions) -- there's no daily swing entry-count limit in this app,
+            so that side just shows the count with no "/max" to divide by.
+            """
+            today_entries = sum(
+                1 for record in records if record.position_type == position_type and record.entry_time.date() == today
+            ) + sum(
+                1 for trade in closed_records if trade.position_type == position_type and trade.entry_time.date() == today
+            )
+            open_count = sum(1 for record in records if record.position_type == position_type)
+            if position_type == "INTRADAY":
+                trade_label = f"Today trade: {today_entries} / {int(settings.max_trades_per_day)}"
+                max_open = int(settings.max_open_positions)
+            else:
+                trade_label = f"Today trade: {today_entries}"
+                max_open = int(settings.swing_max_open_positions)
+            st.markdown(
+                f'<div class="trade-limit-box">{trade_label} &nbsp;·&nbsp; Open position: {open_count} / {max_open}</div>',
+                unsafe_allow_html=True,
+            )
+
         def render_table(title: str, position_type: str, table_key: str) -> str:
-            st.subheader(title)
+            subheader_column, limit_column = st.columns([1, 2], vertical_alignment="center")
+            with subheader_column:
+                st.subheader(title)
+            with limit_column:
+                render_trade_limit_box(position_type)
             rows = build_rows(position_type)
             if not rows:
                 st.markdown('<div class="empty">No open positions.</div>', unsafe_allow_html=True)
@@ -1725,17 +1909,13 @@ def render_live_monitor(st, settings) -> None:
             )
             selected_rows = event.selection.rows if event and event.selection else []
             if selected_rows:
-                return str(frame.iloc[selected_rows[0]]["Symbol"])
+                # "Symbol" displays as "{broker-status dot} {symbol}" -- strip the dot back off
+                # so this matches the plain `record.symbol` values used everywhere downstream
+                # (the stop-history filter, the manual-exit lookup).
+                displayed_symbol = str(frame.iloc[selected_rows[0]]["Symbol"])
+                return displayed_symbol.split(" ", 1)[-1] if " " in displayed_symbol else displayed_symbol
             return ""
 
-        st.caption(
-            "Stop distance % = |Last − Stop| ÷ Last × 100. Stop trailing = (ATR × ATR mult.) below the last price for a "
-            "BUY (above it for a SELL) on 15-minute candles for intraday / daily candles for swing, moved only in your "
-            "favor -- never back toward entry. ATR is the current ATR14 value in rupees, live from the same candles. "
-            "Target 1 is the price that triggers that strategy's target-1 action (move stop to breakeven, or close "
-            "outright); hover any column header for its exact definition. Select a row to filter its stop-loss "
-            "history below."
-        )
         selected_in_intraday = render_table("Intraday positions", "INTRADAY", "live_monitor_intraday_table")
         selected_in_swing = render_table("Swing positions", "SWING", "live_monitor_swing_table")
         selected_stop_symbol = selected_in_intraday or selected_in_swing
@@ -1771,11 +1951,20 @@ def render_live_monitor(st, settings) -> None:
                     width="stretch",
                     hide_index=True,
                     column_config={
+                        # Streamlit's column_config only offers fixed "small"/"medium"/"large"
+                        # presets (or an exact pixel int) -- there's no true "stretch to fill
+                        # remaining space" option. Pinning the short, fixed-format columns to
+                        # "small" and leaving Calculation details with no width at all (rather
+                        # than the old, still-fixed "large") is the closest available approach:
+                        # Streamlit auto-sizes an unconstrained column from its own content, so
+                        # this long free-text column ends up taking up most of the table's width
+                        # instead of being capped at "large"'s fixed size regardless of how much
+                        # room is actually available.
                         "Time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss", width="small"),
                         "Symbol": st.column_config.TextColumn(width="small"),
                         "From": st.column_config.NumberColumn(format="₹%.2f", width="small"),
                         "To": st.column_config.NumberColumn(format="₹%.2f", width="small"),
-                        "Calculation details": st.column_config.TextColumn(width="large"),
+                        "Calculation details": st.column_config.TextColumn(),
                     },
                 )
 
@@ -1803,9 +1992,25 @@ def render_live_monitor(st, settings) -> None:
 def render_pnl_statement(st, settings) -> None:
     @st.fragment(run_every=10)
     def render_pnl_statement_content() -> None:
-        st.markdown('<div class="eyebrow">Trade record</div>', unsafe_allow_html=True)
-        st.title("P&L statement")
-        st.caption("Every open position (live) and every closed trade (realized), in one statement.")
+        title_column, info_column = st.columns([6, 1], vertical_alignment="bottom")
+        with title_column:
+            st.title("P&L statement")
+        with info_column:
+            with st.popover("ℹ️ Information", width="stretch"):
+                st.markdown(
+                    '<ul class="info-list">'
+                    "<li>Shows every open position (live, mark-to-market) and every closed trade (realized), in "
+                    "one statement.</li>"
+                    "<li>Gross P&L is before brokerage/taxes; Est. charges is Zerodha's brokerage + STT + "
+                    "exchange transaction charges + SEBI charges + stamp duty + GST (plus a flat DP charge on "
+                    "swing/delivery sells); After tax P&L is Gross P&L minus Est. charges.</li>"
+                    "<li>Total P&L is always all-time; the Period filter controls every other card, plus which "
+                    "closed trades appear in the table below.</li>"
+                    "<li>Select a row in the table to see that trade's full activity: entry, every SL-M update "
+                    "(and whether it succeeded), and why it closed.</li>"
+                    "</ul>",
+                    unsafe_allow_html=True,
+                )
 
         repository = get_dashboard_repository(st)
         open_records = repository.load_positions()
@@ -1816,22 +2021,35 @@ def render_pnl_statement(st, settings) -> None:
 
         access_token = runtime_access_token(st, settings)
         quotes: dict = {}
-        if open_records and broker_credentials_configured(settings) and access_token:
+        broker_client = None
+        if broker_credentials_configured(settings) and access_token:
             try:
-                client = connect_kite(settings, access_token)
+                broker_client = connect_kite(settings, access_token).client
+            except Exception as error:
+                st.warning(f"Live broker connection unavailable right now: {error}")
+        if open_records and broker_client is not None:
+            try:
                 keys = [record.symbol if ":" in record.symbol else f"NSE:{record.symbol}" for record in open_records]
-                quotes = client.client.ltp(keys)
+                quotes = broker_client.ltp(keys)
             except Exception as error:
                 st.warning(f"Live quotes unavailable right now: {error}")
-
-        def _pnl_pct(pnl: float, entry_price: float, quantity: int) -> float:
-            invested = entry_price * quantity
-            return (pnl / invested * 100) if invested else 0.0
 
         # Built once (independent of the Show filter below) so the totals summarized at the
         # top of the page always reflect every position/trade, not just the ones the radio
         # currently displays -- switching the filter to "Open" or "Closed" shouldn't make the
         # portfolio's total P&L appear to change.
+        def _order_leg_values(side: str, entry_price: float, other_price: float, quantity: int) -> tuple[float, float]:
+            """Map (entry, exit-or-LTP) onto (buy_value, sell_value) for charges purposes.
+
+            A BUY-side position enters with a buy order and exits with a sell order; a SELL-side
+            (short intraday) position is the other way around -- entry is the sell, exit/cover is
+            the buy. Charges like STT and stamp duty depend on which literal order was the buy vs
+            the sell, not on which one was the entry vs the exit.
+            """
+            entry_value = entry_price * quantity
+            other_value = other_price * quantity
+            return (entry_value, other_value) if side == "BUY" else (other_value, entry_value)
+
         open_rows = []
         for record in open_records:
             key = record.symbol if ":" in record.symbol else f"NSE:{record.symbol}"
@@ -1839,45 +2057,69 @@ def render_pnl_statement(st, settings) -> None:
             ltp = float(quote.get("last_price", 0) or 0) or record.entry_price
             direction = 1 if record.side == "BUY" else -1
             pnl = (ltp - record.entry_price) * record.quantity * direction
-            open_rows.append(
-                {
-                    "Stock Name": record.symbol,
-                    "Current Position": "OPEN",
-                    "Entry Price": record.entry_price,
-                    "Exit Price": None,
-                    "LTP": ltp,
-                    "P&L": pnl,
-                    "P&L %": _pnl_pct(pnl, record.entry_price, record.quantity),
-                    "SL Current Price": record.stop_loss,
-                    "Used Strategy Name": record.strategy_name or "-",
-                    "Entered": record.entry_time,
-                    "Exited": None,
-                    "Activity time": record.entry_time,
-                    "_correlation_id": f"{record.symbol}:{record.entry_time.isoformat()}",
-                }
-            )
+            pnl_pct = pnl_percentage(pnl, record.entry_price, record.quantity)
+            buy_value, sell_value = _order_leg_values(record.side, record.entry_price, ltp, record.quantity)
+            row = {
+                "Stock Name": record.symbol,
+                "Current Position": "OPEN",
+                "Entry Price": record.entry_price,
+                "Exit Price": None,
+                "LTP": ltp,
+                "Gross P&L": f"{format_signed_currency(pnl)} ({pnl_pct:+.2f}%)",
+                # Filled in by update_row_charges below -- placeholders keep these columns in
+                # this position (right next to Gross P&L) regardless of which hidden fields
+                # update_row_charges appends afterwards.
+                "Est. charges": None,
+                "After tax P&L": None,
+                "SL Current Price": record.stop_loss,
+                "Used Strategy Name": record.strategy_name or "-",
+                "Entered": record.entry_time,
+                "Exited": None,
+                "Activity time": record.entry_time,
+                "_correlation_id": f"{record.symbol}:{record.entry_time.isoformat()}",
+                "_position_type": record.position_type,
+                "_buy_value": buy_value,
+                "_sell_value": sell_value,
+                "_quantity": record.quantity,
+                "_pnl": pnl,
+            }
+            update_row_charges(row, estimate_equity_charges(record.position_type, buy_value, sell_value), "estimated")
+            open_rows.append(row)
         closed_rows = []
         for trade in closed_records:
-            closed_rows.append(
-                {
-                    "Stock Name": trade.symbol,
-                    "Current Position": "CLOSED",
-                    "Entry Price": trade.entry_price,
-                    "Exit Price": trade.exit_price,
-                    "LTP": None,
-                    "P&L": trade.pnl,
-                    "P&L %": _pnl_pct(trade.pnl, trade.entry_price, trade.quantity),
-                    "SL Current Price": None,
-                    "Used Strategy Name": trade.strategy_name or "-",
-                    "Entered": trade.entry_time,
-                    "Exited": trade.exit_time,
-                    "Activity time": trade.exit_time,
-                    "_correlation_id": f"{trade.symbol}:{trade.entry_time.isoformat()}",
-                }
-            )
+            pnl_pct = pnl_percentage(trade.pnl, trade.entry_price, trade.quantity)
+            buy_value, sell_value = _order_leg_values(trade.side, trade.entry_price, trade.exit_price, trade.quantity)
+            row = {
+                "Stock Name": trade.symbol,
+                "Current Position": "CLOSED",
+                "Entry Price": trade.entry_price,
+                "Exit Price": trade.exit_price,
+                "LTP": None,
+                "Gross P&L": f"{format_signed_currency(trade.pnl)} ({pnl_pct:+.2f}%)",
+                "Est. charges": None,
+                "After tax P&L": None,
+                "SL Current Price": None,
+                "Used Strategy Name": trade.strategy_name or "-",
+                "Entered": trade.entry_time,
+                "Exited": trade.exit_time,
+                "Activity time": trade.exit_time,
+                "_correlation_id": f"{trade.symbol}:{trade.entry_time.isoformat()}",
+                "_position_type": trade.position_type,
+                "_buy_value": buy_value,
+                "_sell_value": sell_value,
+                "_quantity": trade.quantity,
+                "_pnl": trade.pnl,
+            }
+            update_row_charges(row, estimate_equity_charges(trade.position_type, buy_value, sell_value), "estimated")
+            closed_rows.append(row)
+
+        # Best-effort upgrade: replace the local estimate above with Zerodha's own Charges API
+        # result wherever a broker session is available and the lookup succeeds (see
+        # apply_broker_charges) -- everything else keeps the local estimate already set.
+        apply_broker_charges(open_rows + closed_rows, broker_client)
 
         realized_pnl = sum(trade.pnl for trade in closed_records)
-        unrealized_pnl = sum(row["P&L"] for row in open_rows)
+        unrealized_pnl = sum(row["_pnl"] for row in open_rows)
         total_invested = sum(record.entry_price * record.quantity for record in open_records) + sum(
             trade.entry_price * trade.quantity for trade in closed_records
         )
@@ -1891,31 +2133,16 @@ def render_pnl_statement(st, settings) -> None:
             return timestamp.date()
 
         today = pd.Timestamp.now(tz="Asia/Kolkata").date()
-        today_closed_records = [trade for trade in closed_records if _ist_date(trade.exit_time) == today]
-        # Today's realized leg is trades exited today; unrealized is folded in as-is (any open
-        # position's P&L is inherently "as of today" regardless of which day it was entered).
-        today_realized_pnl = sum(trade.pnl for trade in today_closed_records)
-        today_pnl = today_realized_pnl + unrealized_pnl
-        today_invested = sum(record.entry_price * record.quantity for record in open_records) + sum(
-            trade.entry_price * trade.quantity for trade in today_closed_records
-        )
-        today_pnl_pct = (today_pnl / today_invested * 100) if today_invested else 0.0
 
-        summary_columns = st.columns(5)
-        # The delta arg on st.metric renders as an extra pill line below the value, which would
-        # make only this one card taller than the others -- folding the % into the value string
-        # instead keeps every card the same single-line height.
-        summary_columns[0].metric("Total P&L", f"₹{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)")
-        summary_columns[1].metric(
-            "Today P&L",
-            f"₹{today_pnl:,.2f} ({today_pnl_pct:+.2f}%)",
-            help="Realized P&L from trades exited today, plus unrealized P&L on every still-open position.",
+        # Filters rendered before the cards below, since which trades count toward the period
+        # cards (everything but "Total P&L", which is deliberately always all-time) depends on
+        # the Period selection. The Breakdown popover (filled in further down, once the period
+        # figures are computed) shares this row too -- columns are just layout placeholders, so
+        # writing into breakdown_column later in the script still renders it here, saving the
+        # vertical space a separate row would cost.
+        show_label_column, show_radio_column, period_label_column, period_radio_column, breakdown_column = st.columns(
+            [1, 3, 1, 4, 2], vertical_alignment="center"
         )
-        summary_columns[2].metric("Total Realized P&L", f"₹{realized_pnl:,.2f}")
-        summary_columns[3].metric("Total Unrealized P&L", f"₹{unrealized_pnl:,.2f}")
-        summary_columns[4].metric("Positions", f"{len(open_records)} open · {len(closed_records)} closed")
-
-        show_label_column, show_radio_column = st.columns([1, 11], vertical_alignment="center")
         show_label_column.markdown("**Show**")
         status_filter = show_radio_column.radio(
             "Show",
@@ -1924,12 +2151,138 @@ def render_pnl_statement(st, settings) -> None:
             key="pnl_statement_filter",
             label_visibility="collapsed",
         )
+        period_label_column.markdown("**Period**")
+        period_filter = period_radio_column.radio(
+            "Period",
+            ["Today", "This week", "This month", "This year", "All period"],
+            horizontal=True,
+            key="pnl_statement_period_filter",
+            label_visibility="collapsed",
+        )
+
+        if period_filter == "Today":
+            period_start_date = today
+        elif period_filter == "This week":
+            period_start_date = today - timedelta(days=today.weekday())
+        elif period_filter == "This month":
+            period_start_date = today.replace(day=1)
+        elif period_filter == "This year":
+            period_start_date = today.replace(month=1, day=1)
+        else:  # All period
+            period_start_date = None
+
+        # Open positions are always "as of now" regardless of when they were entered, so they're
+        # never period-filtered -- only which CLOSED trades count toward the period cards/table
+        # changes with the Period selection.
+        closed_records_in_period = [
+            trade for trade in closed_records if period_start_date is None or _ist_date(trade.exit_time) >= period_start_date
+        ]
+        correlation_ids_in_period = {f"{trade.symbol}:{trade.entry_time.isoformat()}" for trade in closed_records_in_period}
+        period_closed_rows = [row for row in closed_rows if row["_correlation_id"] in correlation_ids_in_period]
+        period_realized_pnl = sum(trade.pnl for trade in closed_records_in_period)
+        # Realized leg is trades exited within the period; unrealized is folded in as-is (any
+        # open position's P&L is inherently "as of now" regardless of which day it was entered).
+        period_pnl = period_realized_pnl + unrealized_pnl
+        period_invested = sum(record.entry_price * record.quantity for record in open_records) + sum(
+            trade.entry_price * trade.quantity for trade in closed_records_in_period
+        )
+        period_pnl_pct = (period_pnl / period_invested * 100) if period_invested else 0.0
+
+        # Same split as period_pnl above: realized charges are period-scoped (via the already
+        # period-filtered period_closed_rows), unrealized charges are always current -- estimated
+        # from the same live LTP already used for unrealized_pnl, not yet final until the position
+        # actually closes.
+        realized_charges_total = sum(row["_charges_total"] for row in period_closed_rows)
+        unrealized_charges_total = sum(row["_charges_total"] for row in open_rows)
+        period_charges_total = realized_charges_total + unrealized_charges_total
+        period_net_pnl = period_pnl - period_charges_total
+        period_net_pnl_pct = (period_net_pnl / period_invested * 100) if period_invested else 0.0
+
+        # Win rate is judged on after-charges P&L per trade, not raw gross P&L -- a trade that's
+        # gross-profitable but eaten alive by charges isn't really a "win" in any sense that
+        # matters, and every closed row already carries its own _net_pnl (see update_row_charges).
+        closed_count = len(period_closed_rows)
+        wins = sum(1 for row in period_closed_rows if row["_net_pnl"] > 0)
+        losses = closed_count - wins
+        win_rate = (wins / closed_count * 100) if closed_count else 0.0
+        # Win rate says how often; this says how much, on average, after charges -- together they
+        # give a fuller read than either alone (e.g. a low win rate can still be profitable if
+        # wins are much bigger than losses).
+        net_realized_pnl = period_realized_pnl - realized_charges_total
+        avg_pnl_per_trade = (net_realized_pnl / closed_count) if closed_count else 0.0
+
+        # Five equal-width cards instead of the previous seven -- the after-charges figure's
+        # "Breakdown" popover renders into breakdown_column, up in the filter row, instead of a
+        # nested popover here, so it doesn't cost this row any extra height. Total P&L,
+        # Positions, Win rate, and Avg P&L per trade are the other permanent, always-visible cards.
+        hero_column, total_column, positions_column, win_rate_column, avg_trade_column = st.columns(5, vertical_alignment="top")
+        with hero_column:
+            st.metric(
+                f"{period_filter} Net P&L (after charges)",
+                f"₹{period_net_pnl:,.2f} ({period_net_pnl_pct:+.2f}%)",
+                help=f"{period_filter} P&L (realized from trades exited {period_filter.lower()}, plus unrealized "
+                "on every still-open position) minus estimated charges -- the number that should match what "
+                "actually lands in your funds. See the 'Breakdown' popover above (next to the Period filter) "
+                "for how it's built up.",
+            )
+        with total_column:
+            st.metric(
+                "Total P&L",
+                f"₹{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)",
+                help="All-time gross total across every open and closed position, before brokerage/taxes -- the "
+                "one figure the Period filter never changes.",
+            )
+        with positions_column:
+            st.metric(
+                "Positions",
+                f"{len(open_records)} open · {len(closed_records_in_period)} closed",
+                help=f"Open positions are always current; the closed count is trades exited {period_filter.lower()}.",
+            )
+        with win_rate_column:
+            win_rate_value = f"{win_rate:.0f}% ({wins}W/{losses}L)" if closed_count else "No closed trades"
+            st.metric(
+                "Win rate",
+                win_rate_value,
+                help=f"Share of trades exited {period_filter.lower()} that were profitable after charges (not "
+                "just gross P&L) -- open positions aren't counted yet, since they haven't won or lost anything "
+                "until they close.",
+            )
+        with avg_trade_column:
+            avg_trade_value = format_signed_currency(avg_pnl_per_trade) if closed_count else "No closed trades"
+            st.metric(
+                "Avg P&L per trade",
+                avg_trade_value,
+                help=f"Net (after-charges) P&L from trades exited {period_filter.lower()}, divided by how many "
+                "there were -- the typical size of a trade's outcome, to read alongside Win rate (which only "
+                "says how often, not how much).",
+            )
+
+        with breakdown_column:
+            with st.popover("Breakdown", width="stretch"):
+                st.markdown(
+                    '<ul class="info-list">'
+                    f"<li>{period_filter} Gross P&L (before charges): ₹{period_pnl:,.2f} ({period_pnl_pct:+.2f}%)</li>"
+                    f"<li>Realized P&L (trades exited {period_filter.lower()}): ₹{period_realized_pnl:,.2f}</li>"
+                    f"<li>Unrealized P&L (currently open, always current): ₹{unrealized_pnl:,.2f}</li>"
+                    f"<li>Est. charges: ₹{period_charges_total:,.2f}</li>"
+                    f"<li>Net P&L (after charges): ₹{period_net_pnl:,.2f} ({period_net_pnl_pct:+.2f}%)</li>"
+                    "</ul>",
+                    unsafe_allow_html=True,
+                )
+                st.caption(
+                    "Est. charges: Zerodha brokerage + STT + exchange transaction charges + SEBI charges + stamp "
+                    "duty + GST, plus a flat DP charge on swing/delivery sells. Uses Zerodha's own Charges API "
+                    "when a broker session is available (select a row in the table below to see whether that "
+                    "trade's figure is broker-verified or a local estimate); otherwise a local estimate of the "
+                    "published rates (zerodha.com/charges), which may differ from your actual contract note by a "
+                    "few paise/rupees due to per-order rounding."
+                )
 
         rows = []
         if status_filter in ("All", "Open"):
             rows.extend(open_rows)
         if status_filter in ("All", "Closed"):
-            rows.extend(closed_rows)
+            rows.extend(period_closed_rows)
 
         if not rows:
             st.markdown('<div class="empty">No trades match this filter.</div>', unsafe_allow_html=True)
@@ -1960,16 +2313,34 @@ def render_pnl_statement(st, settings) -> None:
             column_config={
                 "Entry Price": st.column_config.NumberColumn(format="₹%.2f"),
                 "Exit Price": st.column_config.NumberColumn(format="₹%.2f"),
-                "LTP": st.column_config.NumberColumn(format="₹%.2f"),
-                "P&L": st.column_config.NumberColumn(format="₹%.2f"),
-                "P&L %": st.column_config.NumberColumn(format="%.2f%%"),
-                "SL Current Price": st.column_config.NumberColumn(format="₹%.2f"),
+                "Gross P&L": st.column_config.TextColumn(help="Profit/loss before brokerage/taxes, with P&L as a percentage of entry price x quantity in parentheses."),
+                "Est. charges": st.column_config.NumberColumn(format="₹%.2f", help="Estimated Zerodha brokerage + STT + transaction charges + SEBI charges + stamp duty + GST (+ DP charges on swing sells). Select the row for the full breakdown."),
+                "After tax P&L": st.column_config.TextColumn(help="Gross P&L minus Est. charges -- the figure that should match what actually lands in your funds -- with the after-charges return percentage in parentheses."),
                 "Entered": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
                 "Exited": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss"),
+                # Hidden rather than removed from the row dicts -- LTP/SL still drive the P&L
+                # math above and are used elsewhere (e.g. Live monitor); this only hides them
+                # from this particular table per the user's request to declutter it.
+                "LTP": None,
+                "SL Current Price": None,
                 "_correlation_id": None,
+                "_position_type": None,
+                "_buy_value": None,
+                "_sell_value": None,
+                "_quantity": None,
+                "_pnl": None,
+                "_charges_total": None,
+                "_net_pnl": None,
+                "_charges_source": None,
+                "_brokerage": None,
+                "_stt": None,
+                "_transaction_charges": None,
+                "_sebi_charges": None,
+                "_stamp_duty": None,
+                "_dp_charges": None,
+                "_gst": None,
             },
         )
-        st.caption("Select a row to see that trade's full activity below: entry, every SL-M update (and whether it succeeded), and why it closed.")
 
         selected_rows = event.selection.rows if event and event.selection else []
         if selected_rows:
@@ -1977,6 +2348,27 @@ def render_pnl_statement(st, settings) -> None:
             decisions = repository.load_decisions(correlation_id=selected["_correlation_id"], limit=200)
             decisions.sort(key=lambda decision: decision.timestamp.isoformat())
             with st.expander(f"Trade activity: {selected['Stock Name']} ({len(decisions)})", expanded=True):
+                source_label = "broker-verified" if selected["_charges_source"] == "broker" else "estimated"
+                status_label = "still open" if selected["Current Position"] == "OPEN" else "final"
+                st.markdown(f"**Est. charges ({source_label}, {status_label}): ₹{selected['_charges_total']:,.2f} → After tax P&L: ₹{selected['_net_pnl']:,.2f}**")
+                with st.popover("Charges breakdown"):
+                    st.markdown(
+                        '<ul class="info-list">'
+                        f"<li>Brokerage: ₹{selected['_brokerage']:,.2f}</li>"
+                        f"<li>STT: ₹{selected['_stt']:,.2f}</li>"
+                        f"<li>Exchange transaction charges: ₹{selected['_transaction_charges']:,.2f}</li>"
+                        f"<li>SEBI charges: ₹{selected['_sebi_charges']:,.2f}</li>"
+                        f"<li>Stamp duty: ₹{selected['_stamp_duty']:,.2f}</li>"
+                        f"<li>DP charges: ₹{selected['_dp_charges']:,.2f}</li>"
+                        f"<li>GST: ₹{selected['_gst']:,.2f}</li>"
+                        f"<li>Total: ₹{selected['_charges_total']:,.2f}</li>"
+                        "</ul>",
+                        unsafe_allow_html=True,
+                    )
+                    if selected["_charges_source"] == "broker":
+                        st.caption("From Zerodha's own Charges API (the same calculator behind your contract note) -- DP charges are still added locally, since that's a settlement-time fee the API doesn't cover.")
+                    else:
+                        st.caption("Estimated from Zerodha's published rates (zerodha.com/charges) -- a live broker session wasn't available for this row, so this is the local estimate, not broker-verified. May differ slightly from your actual contract note due to per-order rounding.")
                 if not decisions:
                     st.markdown(
                         '<div class="empty">No recorded activity for this trade yet -- it may predate the activity log, '
@@ -2016,10 +2408,14 @@ def render_pnl_statement(st, settings) -> None:
                         width="stretch",
                         hide_index=True,
                         column_config={
+                            # No explicit width on "Details" (rather than the old, still-fixed
+                            # "large") so Streamlit auto-sizes it from its own content instead of
+                            # capping it at a preset size regardless of how much room the other,
+                            # genuinely short columns actually leave available.
                             "Time": st.column_config.DatetimeColumn(format="DD MMM YYYY, HH:mm:ss", width="small"),
                             "Event": st.column_config.TextColumn(width="small"),
                             "Result": st.column_config.TextColumn(width="small"),
-                            "Details": st.column_config.TextColumn(width="large"),
+                            "Details": st.column_config.TextColumn(),
                             "Final P&L": st.column_config.TextColumn(width="small"),
                         },
                     )
@@ -2045,7 +2441,6 @@ def render_trailing_agent_auto_start_toggle(st, repository, user_id: str) -> boo
 
 
 def render_kite_authentication(st, settings) -> None:
-    st.markdown('<div class="eyebrow">Broker connection</div>', unsafe_allow_html=True)
     st.title("Kite authentication")
     if notice := st.session_state.pop("kite_auth_notice", ""):
         st.success(notice, icon=":material/check_circle:")
@@ -2069,12 +2464,15 @@ def render_kite_authentication(st, settings) -> None:
         st.success("Kite authenticated. Workspace unlocked.", icon=":material/check_circle:")
         agent_running = agent_heartbeat_is_fresh(repository)
         agent_heartbeat = repository.load_agent_heartbeat("trailing_stop_agent")
+        start_blocked_reason = describe_agent_start_blocked_reason(settings)
         status_column, action_column = st.columns([3, 1])
         with status_column:
             if agent_running:
                 st.caption("Trailing-stop agent is active. See the Live monitor page for details.")
             elif agent_heartbeat and agent_heartbeat.last_error:
                 st.error(f"Trailing-stop agent failed to start: {agent_heartbeat.last_error[:300]}", icon=":material/error:")
+            elif start_blocked_reason:
+                st.caption(start_blocked_reason)
             else:
                 st.caption("Trailing-stop agent is not currently running.")
         with action_column:
@@ -2088,7 +2486,7 @@ def render_kite_authentication(st, settings) -> None:
                     )
                     st.rerun()
             else:
-                if st.button("Start agent now", icon=":material/play_arrow:", width="stretch"):
+                if st.button("Start agent now", icon=":material/play_arrow:", width="stretch", disabled=bool(start_blocked_reason)):
                     launch_trailing_stop_agent(
                         settings.kite_api_key,
                         settings.kite_api_secret.get_secret_value(),
@@ -2141,6 +2539,7 @@ def render_kite_authentication(st, settings) -> None:
                         settings.kite_api_secret.get_secret_value(),
                         access_token.value,
                         extra_env=trailing_agent_env_from_settings(settings),
+                        market_holidays=settings.market_holidays,
                     )
                 st.rerun()
 
@@ -2180,6 +2579,7 @@ def render_kite_authentication(st, settings) -> None:
                     settings.kite_api_secret.get_secret_value(),
                     access_token_input.strip(),
                     extra_env=trailing_agent_env_from_settings(settings),
+                    market_holidays=settings.market_holidays,
                 )
         manual_request_token = st.text_input(
             "Kite request token",
@@ -2509,7 +2909,6 @@ def render_watchlist_stock_view(st, settings, repository: Repository, user_id: s
 
 
 def render_watchlists(st, settings) -> None:
-    st.markdown('<div class="eyebrow">Backend signal scope</div>', unsafe_allow_html=True)
     header, create = st.columns([5, 1])
     with header:
         st.title("Watchlists")
@@ -2972,7 +3371,6 @@ def stop_dashboard_signal_engine(st) -> None:
 
 def render_pre_spike_signal_table(st, repository: Repository, user_id: str) -> None:
     events = repository.load_pre_spike_events(user_id, PreSpikeMomentumStrategy.name, active_only=False, limit=100)
-    st.markdown('<div class="eyebrow">Pre-Spike Momentum</div>', unsafe_allow_html=True)
     st.caption("Completed 5-minute candles only. Signals require price expansion or breakout plus a demand condition.")
     if not events:
         st.caption("No PRE_SPIKE_MOMENTUM events are available for the selected watchlists.")
@@ -3039,7 +3437,6 @@ def render_previous_day_high_signal_table(st, repository: Repository, user_id: s
         for signal in repository.load_signals(user_id, 100)
         if signal.strategy == PreviousDayHighBreakoutStrategy.name
     ]
-    st.markdown('<div class="eyebrow">Previous-day high breakout</div>', unsafe_allow_html=True)
     st.caption("BUY signals trigger when a completed 5-minute candle crosses above the previous trading day's high.")
     if not signals:
         st.caption("No previous-day high breakout signals are available for the selected watchlists.")
@@ -3074,7 +3471,6 @@ def render_previous_day_high_signal_table(st, repository: Repository, user_id: s
 
 def render_ema200_close_signal_table(st, repository: Repository, user_id: str) -> None:
     signals = repository.load_signals(user_id, 100, strategy=Ema200CloseStrategy.name)
-    st.markdown('<div class="eyebrow">EMA 200 close-above signals</div>', unsafe_allow_html=True)
     st.caption("BUY signals trigger on every newly completed candle whose close is above EMA 200.")
     if not signals:
         st.caption("No EMA 200 close-above signals are available for the selected watchlists.")
@@ -3118,7 +3514,6 @@ def render_ema200_close_signal_table(st, repository: Repository, user_id: str) -
 
 def render_high_conviction_signal_table(st, repository: Repository, user_id: str) -> None:
     signals = repository.load_signals(user_id, 100, strategy=HighConvictionLongStrategy.name)
-    st.markdown('<div class="eyebrow">High-conviction long signals</div>', unsafe_allow_html=True)
     st.caption("Signals require a completed 5-minute candle with breakout, volume expansion, trend alignment, VWAP, and bullish candle confirmation.")
     if not signals:
         st.caption("No high-conviction long signals are available for the selected watchlists.")
@@ -3233,11 +3628,22 @@ def render_swing_auto_trading(st, settings) -> None:
     # here, so this renders once per page visit/interaction (see should_scan below for the
     # once-a-day scan gate).
     def render_swing_content() -> None:
-        title_column, status_column = st.columns([5, 2], vertical_alignment="bottom")
+        title_column, info_column, status_column = st.columns([4, 1, 2], vertical_alignment="bottom")
         with title_column:
             st.title("Swing auto trading")
+        with info_column:
+            with st.popover("ℹ️ Information", width="stretch"):
+                st.markdown(
+                    '<ul class="info-list">'
+                    "<li>Scans completed daily candles for a fresh EMA 9 cross above EMA 200 and manages a CNC "
+                    "position with a Zerodha-side trailing SL-M order.</li>"
+                    "<li>Stopping the scanner does not cancel these Zerodha-side protective orders. Manage or "
+                    "close swing positions from Zerodha; daily stop ratchets run while this page session is "
+                    "active.</li>"
+                    "</ul>",
+                    unsafe_allow_html=True,
+                )
         status_popover_slot = status_column.empty()
-        st.caption("Scans completed daily candles for a fresh EMA 9 cross above EMA 200 and manages a CNC position with a Zerodha-side trailing SL-M order.")
         # A fixed slot right under the title, instead of a fresh st.progress() created wherever
         # the scan loop happens to sit in the page -- keeps the live scan progress next to the
         # status badge above, rather than appearing lower down amid the strategy controls.
@@ -3383,8 +3789,12 @@ def render_swing_auto_trading(st, settings) -> None:
         # a rescan at any time regardless of whether today's auto scan already ran.
         already_scanned_today = st.session_state.get("swing_last_scan_day") == scan_day
         scan_requested = manual_scan or (auto_enabled and not already_scanned_today)
+        # NSE isn't in session at all on a weekend or configured holiday -- nothing would be a
+        # real signal on stale/no candle data, and any order would just be rejected by the
+        # broker, so skip scanning entirely rather than discover that mid-scan.
+        is_non_trading_day = scan_requested and not is_trading_day(date.today(), parse_market_holidays(settings.market_holidays))
         insufficient_margin_message = None
-        if scan_requested and not position_limit_reached:
+        if scan_requested and not position_limit_reached and not is_non_trading_day:
             # Checked once, only when a scan is actually about to run (not on every idle page
             # render) -- a signal passing every other gate can still get rejected by Zerodha
             # itself for insufficient funds, since none of those gates know the real account
@@ -3397,12 +3807,14 @@ def render_swing_auto_trading(st, settings) -> None:
                     f"₹{amount_limit:,.0f} for one position at the configured swing capital limit)"
                 )
                 st.session_state.swing_last_error = insufficient_margin_message
-        should_scan = scan_requested and not position_limit_reached and not insufficient_margin_message
+        should_scan = scan_requested and not position_limit_reached and not insufficient_margin_message and not is_non_trading_day
         if manual_scan and position_limit_reached:
             st.warning(
                 f"Scan skipped: {open_swing_positions}/{int(max_open_swing_positions)} swing positions are already open. "
                 "Close a position or raise the limit above to resume scanning."
             )
+        elif manual_scan and is_non_trading_day:
+            st.warning("Scan skipped: NSE is closed today (weekend or holiday).")
         elif manual_scan and insufficient_margin_message:
             st.warning(f"Scan skipped: {insufficient_margin_message}. Add funds or lower the limit on the Risk & settings page.")
         if should_scan:
@@ -3780,7 +4192,6 @@ def render_swing_auto_trading(st, settings) -> None:
                     "Entry candle": st.column_config.DatetimeColumn(format="DD MMM YYYY"),
                 },
             )
-            st.caption("Stopping the scanner does not cancel these Zerodha-side protective orders. Manage or close swing positions from Zerodha; daily stop ratchets run while this page session is active.")
 
     render_swing_content()
 
@@ -4159,7 +4570,6 @@ def render_signal_feed(st, settings) -> None:
 
 
 def render_signal_feed_content(st, settings) -> None:
-    st.markdown('<div class="eyebrow">Backend signal feed</div>', unsafe_allow_html=True)
     st.title("Scanner & signals")
     st.caption("Start the signal engine here. It continuously scans your selected watchlists and saves BUY/SELL signals while this dashboard is running.")
     repository = get_dashboard_repository(st)
@@ -4283,7 +4693,6 @@ def render_signal_feed_content(st, settings) -> None:
         return
 
     progressive_response = repository.load_progressive_signal_response(user_id)
-    st.markdown('<div class="eyebrow">EMA 9 to EMA 200 progressive</div>', unsafe_allow_html=True)
     st.caption("The lifecycle below is evaluated from completed candles for every stock in the passed watchlist.")
     bucket_a = pd.DataFrame(progressive_response["bucket_a"])
     bucket_b = pd.DataFrame(progressive_response["bucket_b"])
@@ -4369,7 +4778,6 @@ def render_signal_feed_content(st, settings) -> None:
 
 
 def render_automatic_feed(st, settings) -> None:
-    st.markdown('<div class="eyebrow">Signal execution</div>', unsafe_allow_html=True)
     st.title("Automatic trading")
     st.caption("The backend generates signals continuously. This page consumes persisted signals and applies the existing execution and risk gates.")
     repository = get_dashboard_repository(st)
@@ -4416,7 +4824,6 @@ def render_automatic_feed(st, settings) -> None:
 
 
 def render_risk_settings(st, settings) -> None:
-    st.markdown('<div class="eyebrow">Risk and execution policy</div>', unsafe_allow_html=True)
     st.title("Risk & settings")
     st.caption("Saved changes persist across dashboard restarts and apply to new entries after validation.")
     if st.session_state.pop("risk_settings_saved", False):
@@ -4600,9 +5007,22 @@ def render_risk_settings(st, settings) -> None:
 
 
 def render_automatic_trading(st, settings) -> None:
-    title_column, status_column = st.columns([5, 2], vertical_alignment="bottom")
+    title_column, info_column, status_column = st.columns([4, 1, 2], vertical_alignment="bottom")
     with title_column:
         st.title("Intratrading")
+    # Filled in progressively as each piece becomes known (capital/risk settings first, then the
+    # selected-stocks/strategy summary, then the scheduler's idle/running state) -- an st.empty()
+    # placeholder can be written to from anywhere later in the script, including from inside the
+    # scheduler fragment further down, the same way status_popover_slot already is.
+    info_popover_slot = info_column.empty()
+
+    def render_info_panel(lines: list[str]) -> None:
+        with info_popover_slot.popover("ℹ️ Information", width="stretch"):
+            st.markdown(
+                '<ul class="info-list">' + "".join(f"<li>{line}</li>" for line in lines) + "</ul>",
+                unsafe_allow_html=True,
+            )
+
     status_popover_slot = status_column.empty()
     st.caption("Automatic entries use the selected strategy, score threshold, risk gates, and activity ledger as the manual signal page.")
     # A fixed slot right under the title, instead of a fresh st.progress() created wherever the
@@ -4668,10 +5088,11 @@ def render_automatic_trading(st, settings) -> None:
     uses_market_confirmation = isinstance(strategy, HighConvictionLongStrategy)
 
     selected_symbols = selected_watchlist_symbols(repository, dashboard_user_id(settings))
-    st.caption(
+    capital_summary = (
         f"₹{intraday_capital_limit:,.0f} cap · ATR×{intraday_trailing_atr_multiplier:.2f} · max {intraday_max_open_positions} open "
         "(edit on Risk & settings page)"
     )
+    render_info_panel([capital_summary])
     if not selected_symbols:
         st.info("Select at least one watchlist on the Watchlists page before scanning.", icon=":material/list_alt:")
         return
@@ -4708,21 +5129,25 @@ def render_automatic_trading(st, settings) -> None:
         selected_sector,
         tuple(sorted(token_to_symbol.items())),
     )
-    st.caption(f"Selected stocks: {len(token_to_symbol)} · Sector: {selected_sector} · Strategy: {selected_strategy}")
+    stocks_summary = f"Selected stocks: {len(token_to_symbol)} · Sector: {selected_sector} · Strategy: {selected_strategy}"
     if isinstance(strategy, PreSpikeMomentumStrategy):
-        st.caption(
+        strategy_rule = (
             f"Completed 5-minute candles · 60-day lookback · score >= {strategy.config.minimum_score} · "
             f"RVOL >= {strategy.config.minimum_rvol:.1f}x · 5-minute move >= {strategy.config.minimum_price_change_pct:.2f}%."
         )
     elif isinstance(strategy, PreviousDayHighBreakoutStrategy):
-        st.caption("BUY when the latest completed 5-minute candle closes above the previous trading day's high.")
+        strategy_rule = "BUY when the latest completed 5-minute candle closes above the previous trading day's high."
     elif isinstance(strategy, HighConvictionLongStrategy):
-        st.caption("Completed 5-minute candle · score >= 85 · previous 20-candle close breakout · RVOL >= 1.5x · 1 ATR stop · targets +1% / +2%.")
+        strategy_rule = "Completed 5-minute candle · score >= 85 · previous 20-candle close breakout · RVOL >= 1.5x · 1 ATR stop · targets +1% / +2%."
     elif not uses_market_filters:
-        st.caption(
+        strategy_rule = (
             f"Candle close rule: Entry EMA {strategy.entry_ema}, Exit EMA {strategy.exit_ema}, "
             f"fresh crossover only, minimum gap {strategy.min_gap_percent:.1f}%, stop {strategy.stop_atr:.1f} x ATR{strategy.atr_period}."
         )
+    else:
+        strategy_rule = None
+    info_lines = [capital_summary, stocks_summary] + ([strategy_rule] if strategy_rule else [])
+    render_info_panel(info_lines)
 
     def record_automatic_cycle(summary: str) -> None:
         cycle_history = st.session_state.get("automatic_cycle_log", [])
@@ -4740,6 +5165,15 @@ def render_automatic_trading(st, settings) -> None:
         in the final result are still ranked to the top 5 for the on-screen summary table, but
         that ranking no longer gates what gets submitted.
         """
+        if not is_trading_day(date.today(), parse_market_holidays(settings.market_holidays)):
+            # NSE isn't in session at all today (weekend or a configured holiday) -- nothing
+            # would be a real signal on stale/no candle data, and any order would just be
+            # rejected by the broker. A calm "Market closed" badge, not the alarming "Needs
+            # attention" halt_scan() uses below, since this is an expected, non-error state.
+            st.session_state.automatic_last_error = None
+            with status_popover_slot.popover("⚪ Market closed", width="stretch"):
+                st.caption("NSE is closed today (weekend or holiday) -- automatic scanning is skipped.")
+            return
         # Written directly (not via the render_automatic_status fragment below) so it's actually
         # visible the instant a scan starts -- a fragment's own output doesn't reliably flush
         # into a container created outside it while this function then blocks for the whole
@@ -5101,7 +5535,7 @@ def render_automatic_trading(st, settings) -> None:
             else:
                 render_automatic_status()
         else:
-            st.caption("Scheduler is idle until auto trade is started.")
+            render_info_panel(info_lines + ["Scheduler is idle until auto trade is started."])
 
     automatic_scheduler_fragment()
 
@@ -5230,32 +5664,58 @@ def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, ac
         rejected_count = 0
         closed_count = int(len(trades))
     mode_label = "LIVE TRADING" if settings.trading_mode == TradingMode.LIVE else "PAPER TRADING"
-    st.markdown('<div class="eyebrow">Session control room</div>', unsafe_allow_html=True)
-    st.title("Intraday desk")
-    st.markdown(f'<span class="status"><span class="status-dot"></span>{mode_label}</span>', unsafe_allow_html=True)
-    st.divider()
-    first, second, third, fourth = st.columns(4)
-    first.metric("Simulated equity", f"₹{settings.initial_capital + net_pnl:,.0f}", f"₹{net_pnl:,.0f} total")
-    second.metric("Today's P&L", f"₹{day_pnl:,.0f}")
-    third.metric("Orders submitted", submitted_count)
-    fourth.metric("Rejected", rejected_count)
-    first, second, third, fourth = st.columns(4)
-    first.metric("Closed trades", closed_count)
-    if closed_count:
-        wins = int((closed_activity["pnl"] > 0).sum()) if not activity.empty else int((trades["pnl"] > 0).sum())
-        overall_win_rate = wins / closed_count
-        second.metric("Win rate", f"{overall_win_rate:.1%}")
+    title_column, status_column = st.columns([5, 2], vertical_alignment="bottom")
+    with title_column:
+        st.title("Intraday desk")
+    with status_column:
+        st.markdown(f'<span class="status"><span class="status-dot"></span>{mode_label}</span>', unsafe_allow_html=True)
+
+    st.subheader("Trading analysis")
+    period_label_column, period_radio_column = st.columns([1, 5], vertical_alignment="center")
+    period_label_column.markdown("**Period**")
+    analysis_period = period_radio_column.radio(
+        "Period",
+        ["Today", "This week", "This month", "This year", "All period"],
+        horizontal=True,
+        key="overview_analysis_period",
+        label_visibility="collapsed",
+    )
+    if analysis_period == "Today":
+        analysis_start = date.today()
+    elif analysis_period == "This week":
+        analysis_start = date.today() - timedelta(days=date.today().weekday())
+    elif analysis_period == "This month":
+        analysis_start = date.today().replace(day=1)
+    elif analysis_period == "This year":
+        analysis_start = date.today().replace(month=1, day=1)
+    else:  # All period
+        analysis_start = None
+
+    trades_in_period = trades.copy()
+    if not trades_in_period.empty:
+        trades_in_period["exit_time"] = pd.to_datetime(trades_in_period["exit_time"], errors="coerce")
+        if analysis_start is not None:
+            trades_in_period = trades_in_period[trades_in_period["exit_time"].dt.date >= analysis_start]
+
+    if not activity.empty:
+        activity_in_period = activity[activity["timestamp"].dt.date >= analysis_start] if analysis_start is not None else activity
+        closed_activity_in_period = activity_in_period[activity_in_period["event_kind"].isin(["exit_submitted", "broker_exit_detected"])]
+        period_closed_count = int(len(closed_activity_in_period))
     else:
-        overall_win_rate = 0.0
-        second.metric("Win rate", "0.0%")
-    third.metric("Capital deployment cap", f"{settings.max_capital_deployment:.0%}")
-    fourth.metric("Ledger events", int(len(activity)) if not activity.empty else int(len(orders) + len(trades)))
+        activity_in_period = activity
+        closed_activity_in_period = trades_in_period
+        period_closed_count = int(len(trades_in_period))
+    if period_closed_count:
+        period_wins = int((closed_activity_in_period["pnl"] > 0).sum())
+        period_win_rate = period_wins / period_closed_count
+    else:
+        period_win_rate = 0.0
 
     card_col, table_col = st.columns([1, 3])
-    card_col.metric("Overall success ratio", f"{overall_win_rate:.1%}", f"{closed_count} closed trades")
+    card_col.metric(f"{analysis_period} success ratio", f"{period_win_rate:.1%}", f"{period_closed_count} closed trades")
     with table_col:
         st.markdown("**Strategy vs success ratio**")
-        strategy_trades = trades.copy() if not trades.empty else pd.DataFrame(columns=["strategy_name", "pnl"])
+        strategy_trades = trades_in_period.copy() if not trades_in_period.empty else pd.DataFrame(columns=["strategy_name", "pnl"])
         if strategy_trades.empty:
             st.markdown('<div class="empty">No closed trades with strategy tracking yet.</div>', unsafe_allow_html=True)
         else:
@@ -5274,6 +5734,84 @@ def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, ac
                 hide_index=True,
                 column_config={"Net_PnL": st.column_config.NumberColumn("Net P&L", format="₹%.2f")},
             )
+
+    st.markdown("**Hour / Trade / P&L**")
+    if activity.empty or closed_activity_in_period.empty:
+        st.markdown('<div class="empty">No closed trades in this period yet.</div>', unsafe_allow_html=True)
+    else:
+        by_hour = closed_activity_in_period.assign(Hour=closed_activity_in_period["timestamp"].dt.strftime("%H:00")).groupby("Hour", as_index=False).agg(
+            Trades=("pnl", "size"),
+            Wins=("pnl", lambda values: int((values > 0).sum())),
+            Net_PnL=("pnl", "sum"),
+        )
+        by_hour["Win %"] = (by_hour["Wins"] / by_hour["Trades"] * 100).round(1)
+        by_hour["Loss %"] = (100 - by_hour["Win %"]).round(1)
+        by_hour = by_hour[["Hour", "Trades", "Win %", "Loss %", "Net_PnL"]]
+        st.dataframe(
+            style_win_loss_columns(by_hour),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Win %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Loss %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Net_PnL": st.column_config.NumberColumn(format="₹%.2f"),
+            },
+        )
+
+    st.markdown("**Daily ledger**")
+    if activity.empty:
+        st.markdown('<div class="empty">No activity recorded yet.</div>', unsafe_allow_html=True)
+    elif activity_in_period.empty:
+        st.markdown('<div class="empty">No activity in this period yet.</div>', unsafe_allow_html=True)
+    else:
+        daily = activity_in_period.assign(day=activity_in_period["timestamp"].dt.strftime("%Y-%m-%d"))
+        daily = daily.groupby("day", as_index=False).agg(
+            Events=("event_kind", "size"),
+            Submitted=("event_kind", lambda values: values.isin(["entry_submitted", "exit_submitted"]).sum()),
+            Rejected=("event_kind", lambda values: values.astype(str).str.endswith("_rejected").sum()),
+            Closed=("event_kind", lambda values: values.isin(["exit_submitted", "broker_exit_detected"]).sum()),
+            PnL=("pnl", "sum"),
+        ).sort_values("day", ascending=False)
+        # Win %/Loss % need to know, per day, how many of that day's CLOSED rows were profitable
+        # -- a plain column aggregation above can't see event_kind and pnl together, so this is
+        # computed from the closed-only subset and merged in by day instead.
+        closed_rows_in_period = activity_in_period[activity_in_period["event_kind"].isin(["exit_submitted", "broker_exit_detected"])].copy()
+        closed_rows_in_period["day"] = closed_rows_in_period["timestamp"].dt.strftime("%Y-%m-%d")
+        wins_by_day = closed_rows_in_period.groupby("day")["pnl"].apply(lambda values: int((values > 0).sum())).rename("Wins")
+        daily = daily.merge(wins_by_day, on="day", how="left")
+        daily["Wins"] = daily["Wins"].fillna(0)
+        daily["Win %"] = daily.apply(lambda row: round(row["Wins"] / row["Closed"] * 100, 1) if row["Closed"] else 0.0, axis=1)
+        daily["Loss %"] = daily.apply(lambda row: round(100 - row["Win %"], 1) if row["Closed"] else 0.0, axis=1)
+        daily = daily[["day", "Events", "Submitted", "Rejected", "Closed", "Win %", "Loss %", "PnL"]]
+        st.dataframe(
+            style_win_loss_columns(daily),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Win %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Loss %": st.column_config.NumberColumn(format="%.1f%%"),
+                "PnL": st.column_config.NumberColumn(format="₹%.2f"),
+            },
+        )
+    st.divider()
+
+    first, second, third, fourth = st.columns(4)
+    first.metric("Simulated equity", f"₹{settings.initial_capital + net_pnl:,.0f}", f"₹{net_pnl:,.0f} total")
+    second.metric("Today's P&L", f"₹{day_pnl:,.0f}")
+    third.metric("Orders submitted", submitted_count)
+    fourth.metric("Rejected", rejected_count)
+    first, second, third, fourth = st.columns(4)
+    first.metric("Closed trades", closed_count)
+    if closed_count:
+        wins = int((closed_activity["pnl"] > 0).sum()) if not activity.empty else int((trades["pnl"] > 0).sum())
+        overall_win_rate = wins / closed_count
+        second.metric("Win rate", f"{overall_win_rate:.1%}")
+    else:
+        overall_win_rate = 0.0
+        second.metric("Win rate", "0.0%")
+    third.metric("Capital deployment cap", f"{settings.max_capital_deployment:.0%}")
+    fourth.metric("Ledger events", int(len(activity)) if not activity.empty else int(len(orders) + len(trades)))
+
     render_control_center(st, settings, activity)
     st.subheader("Equity path")
     equity_source = activity[activity["event_kind"].isin(["exit_submitted", "broker_exit_detected"])] if not activity.empty else trades
@@ -5287,16 +5825,6 @@ def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, ac
         chart["equity"] = settings.initial_capital + chart["pnl"].cumsum()
         st.line_chart(chart["equity"], height=260)
     if not activity.empty:
-        st.subheader("Daily ledger")
-        daily = activity.assign(day=activity["timestamp"].dt.strftime("%Y-%m-%d"))
-        daily = daily.groupby("day", as_index=False).agg(
-            Events=("event_kind", "size"),
-            Submitted=("event_kind", lambda values: values.isin(["entry_submitted", "exit_submitted"]).sum()),
-            Rejected=("event_kind", lambda values: values.astype(str).str.endswith("_rejected").sum()),
-            Closed=("event_kind", lambda values: values.isin(["exit_submitted", "broker_exit_detected"]).sum()),
-            PnL=("pnl", "sum"),
-        ).sort_values("day", ascending=False)
-        st.dataframe(daily, width="stretch", hide_index=True, column_config={"PnL": st.column_config.NumberColumn(format="₹%.2f")})
         rejection_rows = activity[activity["event_kind"].str.endswith("_rejected")]
         if not rejection_rows.empty:
             st.subheader("Rejection reasons")
@@ -5317,9 +5845,7 @@ def render_overview(st, settings, orders: pd.DataFrame, trades: pd.DataFrame, ac
             metric_four.metric("Max drawdown", f"₹{drawdown.min():,.2f}")
             by_side = closed_activity.groupby("side", dropna=False).agg(Trades=("pnl", "size"), Net_PnL=("pnl", "sum"), Average_PnL=("pnl", "mean")).reset_index()
             by_side = by_side.rename(columns={"side": "Exit side"})
-            by_hour = closed_activity.assign(Hour=closed_activity["timestamp"].dt.strftime("%H:00")).groupby("Hour", as_index=False).agg(Trades=("pnl", "size"), Net_PnL=("pnl", "sum"))
             st.dataframe(by_side, width="stretch", hide_index=True, column_config={"Net_PnL": st.column_config.NumberColumn(format="₹%.2f"), "Average_PnL": st.column_config.NumberColumn(format="₹%.2f")})
-            st.dataframe(by_hour, width="stretch", hide_index=True, column_config={"Net_PnL": st.column_config.NumberColumn(format="₹%.2f")})
     st.subheader("Current orders")
     render_position_monitor(st, settings, runtime_access_token(st, settings))
     pipeline = st.session_state.get("dashboard_pipeline")
@@ -5360,7 +5886,6 @@ def render_dashboard_access_gate(st, settings) -> bool:
         return True
     if st.session_state.get("dashboard_unlocked"):
         return True
-    st.markdown('<div class="eyebrow">Garuda Trading</div>', unsafe_allow_html=True)
     st.title("Enter password")
     with st.form("dashboard_access_gate_form"):
         entered_password = st.text_input("Password", type="password", key="dashboard_access_password_input")

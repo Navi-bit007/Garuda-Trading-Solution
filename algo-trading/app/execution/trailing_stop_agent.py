@@ -19,6 +19,7 @@ from app.execution.swing_trailing import compute_ema_swing_stop, compute_trend_b
 from app.execution.trailing_stop import TrailingStop
 from app.market.candles import validate_ohlcv
 from app.market.indicators import atr as compute_atr
+from app.market.trading_calendar import is_trading_day, parse_market_holidays
 from app.monitoring.notifications import Notifier
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,35 @@ TERMINAL_INACTIVE_ORDER_STATUSES = {"CANCELLED", "REJECTED"}
 # new trigger price is. There's no way to reset that count on the same order_id, so once it's
 # hit, the only way to keep trailing is to cancel the capped order and place a fresh one.
 MODIFICATION_LIMIT_ERROR_TEXT = "maximum allowed order modification"
+# requests/urllib3 raise these with a raw exception repr as their message (e.g. "('Connection
+# aborted.', RemoteDisconnected('Remote end closed connection without response'))") -- meaningless
+# to anyone reading the dashboard's "Needs attention" banner. Kite's own exceptions (InputException,
+# TokenException, ...) already carry a clean, human-written message, so those are left untouched.
+_NETWORK_ERROR_TYPES = {
+    "ConnectionError", "ConnectionAbortedError", "ConnectionResetError", "ConnectionRefusedError",
+    "RemoteDisconnected", "ProtocolError", "MaxRetryError", "ReadTimeout", "ConnectTimeout",
+    "Timeout", "NetworkException", "SSLError", "NewConnectionError",
+}
+
+
+def _describe_broker_error(error: object) -> str:
+    """Translate a raw network/connection exception into a short, plain-language message.
+
+    Anything not recognised as a network failure (e.g. Kite's own InputException/TokenException
+    text) is returned unchanged, since those already read like a normal sentence.
+    """
+    if type(error).__name__ in _NETWORK_ERROR_TYPES:
+        return "Lost connection to Zerodha -- this usually clears up on its own within a minute or two."
+    text = str(error)
+    lowered = text.lower()
+    if any(
+        marker in lowered
+        for marker in ("remotedisconnected", "connection aborted", "connection reset", "read timed out", "max retries exceeded", "failed to establish a new connection")
+    ):
+        return "Lost connection to Zerodha -- this usually clears up on its own within a minute or two."
+    if "token" in lowered and ("expire" in lowered or "invalid" in lowered):
+        return "The broker session has expired -- log in to Kite again from the Broker connection page."
+    return text
 
 
 @dataclass
@@ -117,6 +147,7 @@ class TrailingStopAgent:
         # scales sensibly across a Rs.50 stock and a Rs.5,000 one.
         self.min_stop_improvement_pct = float(getattr(settings, "min_stop_improvement_pct", 0.25))
         self.shut_down_for_the_day = False
+        self.market_holidays = parse_market_holidays(getattr(settings, "market_holidays", ""))
 
     @property
     def running(self) -> bool:
@@ -148,6 +179,14 @@ class TrailingStopAgent:
 
     def run_once(self, now: datetime | None = None) -> None:
         timestamp = now or datetime.now()
+        if not is_trading_day(timestamp.date(), self.market_holidays):
+            # No exchange session at all today (weekend or a configured holiday) -- every broker
+            # call this cycle would otherwise do (reconcile, trail, re-arm) would just fail with
+            # "markets are closed"/"couldn't find that order_id" noise for no benefit, since
+            # nothing can fill or move until trading resumes. Same clean end-of-day exit as the
+            # shutdown-time case below.
+            self._exit_for_the_day(f"{timestamp.date()} is not a trading day (weekend or configured holiday)")
+            return
         if timestamp.time() >= self.shutdown_time:
             # There's nothing left to do once the trading day is over -- Zerodha's own SL-M
             # orders are day orders that expire at market close regardless of whether this
@@ -156,17 +195,7 @@ class TrailingStopAgent:
             # Rather than sit idle overnight burning an OS process and racing tomorrow's Kite
             # token expiry, exit for the day; the dashboard's auto-start-on-login relaunches a
             # fresh process the next time the user actually opens the app and signs in.
-            logger.info("Past today's shutdown time (%s); trailing stop agent is exiting for the day", self.shutdown_time)
-            self.shut_down_for_the_day = True
-            self._stop_event.set()
-            try:
-                # Clear rather than leave a stale heartbeat behind -- an aged-out heartbeat
-                # reads on the dashboard as "stalled: positions may not be protected, check the
-                # process", which is alarming for what is actually an intentional, clean
-                # end-of-day exit. No heartbeat at all reads as the calmer "not started yet".
-                self.repository.clear_agent_heartbeat("trailing_stop_agent")
-            except Exception:
-                logger.exception("Failed to clear the heartbeat on end-of-day shutdown")
+            self._exit_for_the_day(f"past today's shutdown time ({self.shutdown_time})")
             return
         last_error = ""
         try:
@@ -178,7 +207,7 @@ class TrailingStopAgent:
                 self._process_swing(timestamp)
                 self._last_swing_recompute_at = timestamp
         except Exception as error:
-            last_error = str(error)
+            last_error = _describe_broker_error(error)
             raise
         finally:
             # A broker call failing inside _process_intraday/_process_swing (e.g. an expired
@@ -192,6 +221,19 @@ class TrailingStopAgent:
                 self.repository.save_agent_heartbeat(AgentHeartbeat("trailing_stop_agent", timestamp, combined_error, timestamp))
             except Exception:
                 logger.exception("Failed to record trailing-stop agent heartbeat")
+
+    def _exit_for_the_day(self, reason: str) -> None:
+        logger.info("%s; trailing stop agent is exiting for the day", reason)
+        self.shut_down_for_the_day = True
+        self._stop_event.set()
+        try:
+            # Clear rather than leave a stale heartbeat behind -- an aged-out heartbeat reads on
+            # the dashboard as "stalled: positions may not be protected, check the process",
+            # which is alarming for what is actually an intentional, clean end-of-day exit. No
+            # heartbeat at all reads as the calmer "not started yet".
+            self.repository.clear_agent_heartbeat("trailing_stop_agent")
+        except Exception:
+            logger.exception("Failed to clear the heartbeat on end-of-day shutdown")
 
     def _refresh_broker_session(self) -> None:
         """Pick up a newly generated Kite access token without needing a process restart.
@@ -348,7 +390,7 @@ class TrailingStopAgent:
             self._reconcile_intraday_positions(positions, timestamp)
         except Exception as error:
             logger.exception("Intraday broker reconciliation failed")
-            self._intraday_broker_error = f"intraday reconciliation failed: {error}"
+            self._intraday_broker_error = f"intraday reconciliation failed: {_describe_broker_error(error)}"
         positions = [position for position in self.positions.values() if position.record.position_type == "INTRADAY"]
         if not positions:
             return
@@ -357,7 +399,7 @@ class TrailingStopAgent:
             quotes = self.market_data.ltp(keys)
         except Exception as error:
             logger.exception("LTP fetch failed for intraday positions")
-            self._intraday_broker_error = f"LTP fetch failed: {error}"
+            self._intraday_broker_error = f"LTP fetch failed: {_describe_broker_error(error)}"
             return
         force_exit_due = timestamp.time() >= self.force_exit_time
         for position, key in zip(positions, keys):
@@ -454,7 +496,7 @@ class TrailingStopAgent:
         )
         if not outcome.success:
             logger.error("Force-exit market order failed for %s: %s", record.symbol, outcome.error)
-            self._intraday_broker_error = f"force-exit order failed for {record.symbol}: {outcome.error}"
+            self._intraday_broker_error = f"force-exit order failed for {record.symbol}: {_describe_broker_error(outcome.error)}"
             return
         if outcome.cancel_error:
             logger.error(
@@ -487,7 +529,7 @@ class TrailingStopAgent:
             broker_positions = self.broker_client.positions().get("net", [])
         except Exception as error:
             logger.exception("Broker position lookup failed during intraday reconciliation")
-            self._intraday_broker_error = f"broker position lookup failed: {error}"
+            self._intraday_broker_error = f"broker position lookup failed: {_describe_broker_error(error)}"
             return
         broker_by_tradingsymbol = {str(entry.get("tradingsymbol", "")).strip().upper(): entry for entry in broker_positions}
         for position in positions:
@@ -621,13 +663,13 @@ class TrailingStopAgent:
             self._reconcile_swing_positions(timestamp)
         except Exception as error:
             logger.exception("Swing broker reconciliation failed")
-            self._swing_broker_error = f"swing reconciliation failed: {error}"
+            self._swing_broker_error = f"swing reconciliation failed: {_describe_broker_error(error)}"
         for position in [p for p in self.positions.values() if p.record.position_type == "SWING"]:
             try:
                 self._process_swing_position(position, timestamp)
             except Exception as error:
                 logger.exception("Swing trailing update failed for %s", position.record.symbol)
-                self._swing_broker_error = f"swing trailing update failed for {position.record.symbol}: {error}"
+                self._swing_broker_error = f"swing trailing update failed for {position.record.symbol}: {_describe_broker_error(error)}"
 
     def _reconcile_swing_positions(self, timestamp: datetime) -> None:
         """Detect an exchange-expired overnight SL-M and re-place it, and drop positions the
@@ -643,7 +685,7 @@ class TrailingStopAgent:
             broker_positions = self.broker_client.positions().get("net", [])
         except Exception as error:
             logger.exception("Broker position lookup failed during swing reconciliation")
-            self._swing_broker_error = f"broker position lookup failed: {error}"
+            self._swing_broker_error = f"broker position lookup failed: {_describe_broker_error(error)}"
             return
         broker_by_tradingsymbol = {str(entry.get("tradingsymbol")): entry for entry in broker_positions if int(entry.get("quantity", 0) or 0) != 0}
         held_tradingsymbols = self._broker_held_tradingsymbols()
@@ -835,7 +877,7 @@ class TrailingStopAgent:
             # A silently swallowed failure here means a position sits genuinely unprotected while
             # the dashboard keeps showing a healthy green "RUNNING" banner -- this needs to surface
             # as clearly as any other broker-call failure, not less, since the consequence is worse.
-            self._swing_broker_error = f"could not re-arm the protective stop for {record.symbol}: {error}"
+            self._swing_broker_error = f"could not re-arm the protective stop for {record.symbol}: {_describe_broker_error(error)}"
             return
         updated = replace(record, protective_order_id=new_order_id)
         self.repository.save_position(updated)
@@ -937,7 +979,7 @@ class TrailingStopAgent:
             # agent" banner kept reading as a healthy green RUNNING state while a position's stop
             # was silently stuck. Routing it into the same _intraday_broker_error/_swing_broker_error
             # fields the heartbeat already reports surfaces it there instead, with no new UI needed.
-            friendly = f"Could not update the broker-side stop for {record.symbol}: {error_message}"
+            friendly = f"Could not update the broker-side stop for {record.symbol}: {_describe_broker_error(error_message)}"
             if record.position_type == "SWING":
                 self._swing_broker_error = friendly
             else:

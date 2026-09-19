@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from app.database.database import Database
 from app.database.models import AgentHeartbeat
@@ -48,7 +48,7 @@ def test_autostart_skips_launch_when_heartbeat_is_fresh(tmp_path, monkeypatch):
         lambda *args, **kwargs: launched.append((args, kwargs)),
     )
 
-    result = maybe_autostart_trailing_agent(repository, "key", "secret", "token")
+    result = maybe_autostart_trailing_agent(repository, "key", "secret", "token", today=date(2026, 1, 1))
 
     assert result is None
     assert launched == []
@@ -63,10 +63,42 @@ def test_autostart_launches_when_heartbeat_is_stale_or_missing(tmp_path, monkeyp
         lambda api_key, api_secret, access_token, repository, **kwargs: launched.append((api_key, api_secret, access_token, repository, kwargs)) or "process",
     )
 
-    result = maybe_autostart_trailing_agent(repository, "key", "secret", "token")
+    result = maybe_autostart_trailing_agent(repository, "key", "secret", "token", today=date(2026, 1, 1))
 
     assert result == "process"
     assert launched == [("key", "secret", "token", repository, {"extra_env": None})]
+    database.close()
+
+
+def test_autostart_skips_launch_on_a_weekend_even_with_a_stale_heartbeat(tmp_path, monkeypatch):
+    database, repository = build_repository(tmp_path)
+    launched = []
+    monkeypatch.setattr(
+        "app.execution.agent_launcher.launch_trailing_stop_agent",
+        lambda *args, **kwargs: launched.append((args, kwargs)) or "process",
+    )
+
+    result = maybe_autostart_trailing_agent(repository, "key", "secret", "token", today=date(2026, 9, 19))  # Saturday
+
+    assert result is None
+    assert launched == []
+    database.close()
+
+
+def test_autostart_skips_launch_on_a_configured_holiday(tmp_path, monkeypatch):
+    database, repository = build_repository(tmp_path)
+    launched = []
+    monkeypatch.setattr(
+        "app.execution.agent_launcher.launch_trailing_stop_agent",
+        lambda *args, **kwargs: launched.append((args, kwargs)) or "process",
+    )
+
+    result = maybe_autostart_trailing_agent(
+        repository, "key", "secret", "token", market_holidays="2026-01-26", today=date(2026, 1, 26)
+    )
+
+    assert result is None
+    assert launched == []
     database.close()
 
 
@@ -83,7 +115,9 @@ def test_autostart_passes_extra_env_through_to_launch(tmp_path, monkeypatch):
         lambda api_key, api_secret, access_token, repository, **kwargs: captured.update(kwargs) or "process",
     )
 
-    maybe_autostart_trailing_agent(repository, "key", "secret", "token", extra_env={"MIN_STOP_IMPROVEMENT_PCT": "0.1"})
+    maybe_autostart_trailing_agent(
+        repository, "key", "secret", "token", extra_env={"MIN_STOP_IMPROVEMENT_PCT": "0.1"}, today=date(2026, 1, 1)
+    )
 
     assert captured == {"extra_env": {"MIN_STOP_IMPROVEMENT_PCT": "0.1"}}
     database.close()

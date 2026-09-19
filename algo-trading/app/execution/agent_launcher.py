@@ -5,12 +5,13 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from datetime import time as time_of_day
 from pathlib import Path
 from typing import Any
 
 from app.database.models import AgentHeartbeat
+from app.market.trading_calendar import is_trading_day, parse_market_holidays
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AGENT_SCRIPT_PATH = REPO_ROOT / "scripts" / "run_trailing_stop_agent.py"
@@ -130,14 +131,26 @@ def launch_trailing_stop_agent(
 
 
 def maybe_autostart_trailing_agent(
-    repository, api_key: str, api_secret: str, access_token: str, extra_env: dict[str, str] | None = None
+    repository,
+    api_key: str,
+    api_secret: str,
+    access_token: str,
+    extra_env: dict[str, str] | None = None,
+    market_holidays: str = "",
+    today: date | None = None,
 ) -> subprocess.Popen | None:
-    """Launch the agent unless a recent heartbeat shows one is already running.
+    """Launch the agent unless a recent heartbeat shows one is already running, or there's no
+    exchange session today at all (weekend or a configured holiday).
 
     Safe to call on every login/token-refresh -- the heartbeat check makes it idempotent, so it
-    never spawns a duplicate agent alongside one that's already active.
+    never spawns a duplicate agent alongside one that's already active. The trading-day check
+    additionally avoids spawning a process on a non-trading day only to have it immediately
+    exit for the day itself (TrailingStopAgent.run_once has the same check) -- login on a
+    weekend shouldn't launch-and-immediately-kill a process for no benefit.
     """
     if agent_heartbeat_is_fresh(repository):
+        return None
+    if not is_trading_day(today or datetime.now().date(), parse_market_holidays(market_holidays)):
         return None
     return launch_trailing_stop_agent(api_key, api_secret, access_token, repository, extra_env=extra_env)
 

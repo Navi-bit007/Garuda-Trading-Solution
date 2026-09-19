@@ -917,29 +917,51 @@ class Repository:
             self.database.connection.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
             self.database.connection.commit()
 
+    def claim_position_close(self, symbol: str) -> PositionRecord | None:
+        """Atomically delete `symbol`'s row from `positions` and return what was deleted, or
+        None if it was already gone.
+
+        The standalone trailing-stop agent and the dashboard's own pipelines (TradingPipeline,
+        SwingAutoTrader) each independently poll the broker and can notice the same closed
+        position at nearly the same moment -- both then racing to write a trade/activity record
+        for it. A plain "check if it's still in `positions`, then delete" is two separate steps
+        with a window between them where both processes can pass the check before either
+        deletes. Fusing the check and the delete into one SQL statement removes that window
+        entirely: SQLite serializes writes across processes, so only one caller's DELETE can
+        ever actually remove the row and get it back via RETURNING -- the other gets None and
+        knows immediately, with nothing left to race against.
+        """
+        with self.database.lock:
+            row = self.database.connection.execute(
+                "DELETE FROM positions WHERE symbol = ? RETURNING *", (symbol,)
+            ).fetchone()
+            self.database.connection.commit()
+        return self._position_from_row(row) if row is not None else None
+
     def load_positions(self) -> list[PositionRecord]:
         with self.database.lock:
             rows = self.database.connection.execute("SELECT * FROM positions ORDER BY entry_time").fetchall()
-        return [
-            PositionRecord(
-                symbol=row["symbol"],
-                side=row["side"],
-                quantity=int(row["quantity"]),
-                entry_price=float(row["entry_price"]),
-                stop_loss=float(row["stop_loss"]),
-                entry_time=datetime.fromisoformat(row["entry_time"]),
-                target_1=float(row["target_1"]) if row["target_1"] is not None else None,
-                target_2=float(row["target_2"]) if row["target_2"] is not None else None,
-                protective_order_id=row["protective_order_id"],
-                target_1_hit=bool(row["target_1_hit"]),
-                instrument_token=int(row["instrument_token"]) if row["instrument_token"] is not None else None,
-                position_type=row["position_type"] if row["position_type"] is not None else "INTRADAY",
-                atr_multiplier=float(row["atr_multiplier"]) if row["atr_multiplier"] is not None else None,
-                strategy_name=row["strategy_name"] if row["strategy_name"] is not None else "",
-                trading_mode=row["trading_mode"] if row["trading_mode"] is not None else "LIVE",
-            )
-            for row in rows
-        ]
+        return [self._position_from_row(row) for row in rows]
+
+    @staticmethod
+    def _position_from_row(row) -> PositionRecord:
+        return PositionRecord(
+            symbol=row["symbol"],
+            side=row["side"],
+            quantity=int(row["quantity"]),
+            entry_price=float(row["entry_price"]),
+            stop_loss=float(row["stop_loss"]),
+            entry_time=datetime.fromisoformat(row["entry_time"]),
+            target_1=float(row["target_1"]) if row["target_1"] is not None else None,
+            target_2=float(row["target_2"]) if row["target_2"] is not None else None,
+            protective_order_id=row["protective_order_id"],
+            target_1_hit=bool(row["target_1_hit"]),
+            instrument_token=int(row["instrument_token"]) if row["instrument_token"] is not None else None,
+            position_type=row["position_type"] if row["position_type"] is not None else "INTRADAY",
+            atr_multiplier=float(row["atr_multiplier"]) if row["atr_multiplier"] is not None else None,
+            strategy_name=row["strategy_name"] if row["strategy_name"] is not None else "",
+            trading_mode=row["trading_mode"] if row["trading_mode"] is not None else "LIVE",
+        )
 
     def has_submitted_signal(self, symbol: str, side: str, timestamp: datetime) -> bool:
         with self.database.lock:

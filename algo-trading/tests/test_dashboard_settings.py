@@ -161,6 +161,19 @@ def test_log_out_of_kite_clears_the_persisted_token(tmp_path):
     database.close()
 
 
+def test_log_out_of_kite_also_relocks_the_dashboard_password_gate(tmp_path):
+    database = Database(str(tmp_path / "trading.sqlite3"))
+    database.initialize()
+    repository = Repository(database)
+    session_state = _SessionState(kite_access_token="token", dashboard_unlocked=True)
+    streamlit = SimpleNamespace(session_state=session_state, query_params=SimpleNamespace(clear=lambda: None))
+
+    dashboard_app.log_out_of_kite(streamlit, repository, "alice")
+
+    assert "dashboard_unlocked" not in session_state
+    database.close()
+
+
 def test_dashboard_repository_rebuilds_stale_session_instance(monkeypatch, tmp_path):
     database = Database(str(tmp_path / "trading.sqlite3"))
     stale_repository = SimpleNamespace(database=SimpleNamespace(thread_safe=True))

@@ -38,11 +38,19 @@ class Settings(BaseSettings):
     entry_end: time = time(14, 45)
     force_exit: time = time(15, 15)
     agent_shutdown_time: time = time(15, 40)
+    # Comma-separated ISO dates (YYYY-MM-DD) for NSE trading holidays, e.g. "2026-01-26,2026-03-04".
+    # Weekends are always treated as non-trading days regardless of this list. Left empty by
+    # default rather than pre-populated with a guessed holiday calendar -- NSE's holiday list
+    # changes every year and getting even one date wrong here would silently skip a real trading
+    # day, which is worse than this being empty. Copy the current list from NSE's official
+    # published holiday calendar.
+    market_holidays: str = ""
     trailing_atr_multiplier: float = Field(default=1.5, gt=0)
     min_stop_improvement_pct: float = Field(default=0.25, ge=0)
     enable_telegram: bool = False
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""
+    dashboard_password: SecretStr = SecretStr("")
     user_id: str = "default"
     signal_timeframe: str = "5minute"
     signal_poll_seconds: int = Field(default=300, ge=5)

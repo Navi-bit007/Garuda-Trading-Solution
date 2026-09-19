@@ -264,17 +264,15 @@ class TradingPipeline:
             if broker_quantity != 0:
                 self._reconcile_entry_price(symbol, managed, broker_position)
                 continue
-            if self.activity_repository is not None and hasattr(self.activity_repository, "load_positions"):
+            if self.activity_repository is not None and hasattr(self.activity_repository, "claim_position_close"):
                 # The standalone trailing-stop agent reconciles every LIVE position in the same
-                # shared `positions` table independently of this dashboard session -- if it's
-                # already detected and recorded this exact close (deleting the row), doing so
-                # again here would write a second, duplicate trades/activity row for the same
-                # close (confirmed live: two near-simultaneous rows a second apart, same entry/
-                # exit price, different exit_reason text). Only clean up this session's own
-                # in-memory tracking in that case, so position/capital counts stay accurate
-                # without re-recording history someone else already recorded.
-                still_tracked = any(record.symbol == symbol for record in self.activity_repository.load_positions())
-                if not still_tracked:
+                # shared `positions` table independently of this dashboard session, and can
+                # notice this exact same broker-side close at nearly the same moment. Atomically
+                # claiming the close (a single DELETE ... RETURNING) rather than checking then
+                # deleting separately closes the race outright: only whichever caller's claim
+                # actually removes the row proceeds to write a trade/activity record; the loser
+                # (None) just drops its own in-memory tracking, with nothing left to race against.
+                if self.activity_repository.claim_position_close(symbol) is None:
                     self.positions.remove(symbol)
                     del self.managed_positions[symbol]
                     continue
@@ -284,8 +282,6 @@ class TradingPipeline:
             self.limits.record_trade(pnl)
             self.positions.remove(symbol)
             del self.managed_positions[symbol]
-            if self.activity_repository is not None and hasattr(self.activity_repository, "delete_position"):
-                self.activity_repository.delete_position(symbol)
             closed = ClosedPosition(
                 symbol,
                 managed.position.side,
